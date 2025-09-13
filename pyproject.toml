@@ -14,4 +14,4 @@ dependencies = []
 where = ["src"]
 
 [project.scripts]
-Recursive-TimesNet = "timesnet_forecast.cli:main"
+timesnet-forecast = "timesnet_forecast.cli:main"
