@@ -1,0 +1,11 @@
+torch>=2.1
+torchvision>=0.16
+torchaudio>=2.1
+numpy>=1.26
+pandas>=2.0
+scipy>=1.11
+pyyaml>=6.0
+tqdm>=4.66
+rich>=13.7
+optuna>=3.6
+scikit-learn>=1.4
