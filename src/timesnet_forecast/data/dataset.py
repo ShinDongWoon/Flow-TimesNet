@@ -25,9 +25,10 @@ class SlidingWindowDataset(Dataset):
         self.L = int(input_len)
         self.H = int(pred_len if mode == "direct" else 1)
         self.mode = mode
-        # Indices where a full (L,H) window fits
-        self.idxs = np.arange(self.T - self.L - (pred_len - 1))  # last valid start inclusive
-        # When pred_len=H, last usable start is T-L-H
+        # Indices where a full (L,H) window fits. self.H is the mode-specific
+        # output length, so the last valid start index is T - L - H.
+        self.idxs = np.arange(self.T - self.L - self.H + 1)
+        # In recursive mode self.H=1, so only the last H steps are excluded.
 
     def __len__(self) -> int:
         return int(len(self.idxs))
