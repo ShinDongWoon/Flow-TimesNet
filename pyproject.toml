@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Recursive-TimesNet"
+version = "0.1.0"
+description = "TimesNet-based multi-series 'Recursive' forecasting with SMAPE and row_key submission"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+Recursive-TimesNet = "timesnet_forecast.cli:main"
