@@ -206,7 +206,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
 
     # --- optimizer / loss
     optim = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"]["lr"]), weight_decay=float(cfg["train"]["weight_decay"]))
-    scaler = torch.cuda.amp.GradScaler(enabled=(cfg["train"]["amp"] and device.type == "cuda"))
+    grad_scaler = torch.cuda.amp.GradScaler(enabled=(cfg["train"]["amp"] and device.type == "cuda"))
     loss_fn = nn.MSELoss()
 
     # --- training loop
@@ -226,12 +226,12 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                 out = model(xb)  # [B, H, N] or [B,1,N]
                 loss = loss_fn(out, yb)
-            scaler.scale(loss).backward()
+            grad_scaler.scale(loss).backward()
             if grad_clip and grad_clip > 0:
-                scaler.unscale_(optim)
+                grad_scaler.unscale_(optim)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optim)
-            scaler.update()
+            grad_scaler.step(optim)
+            grad_scaler.update()
             losses.append(loss.item())
 
         val_smape = _eval_smape(model, dl_val, device, mode, ids, pred_len)
@@ -251,10 +251,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     schema_path = os.path.join(art_dir, cfg["artifacts"]["schema_file"])
     cfg_path = os.path.join(art_dir, cfg["artifacts"]["config_file"])
     io_utils.save_pickle(
-        {"scaler": io_utils.fit_series_scaler(wide, cfg["preprocess"]["normalize"],
-                                              cfg["preprocess"]["normalize_per_series"], cfg["preprocess"]["eps"])[0],
-         "method": cfg["preprocess"]["normalize"],
-         "ids": ids},
+        {"scaler": scaler, "method": cfg["preprocess"]["normalize"], "ids": ids},
         scaler_path,
     )
     io_utils.save_json({"date": schema["date"], "target": schema["target"], "id": schema["id"]}, schema_path)
