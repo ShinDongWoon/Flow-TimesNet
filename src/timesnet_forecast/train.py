@@ -19,6 +19,7 @@ from .utils import io as io_utils
 from .data.split import make_holdout_slices, make_rolling_slices
 from .data.dataset import SlidingWindowDataset
 from .models.timesnet import TimesNet
+from .predict import forecast_recursive_batch
 
 
 def _select_device(req: str) -> torch.device:
@@ -57,7 +58,14 @@ def _build_dataloader(
     )
 
 
-def _eval_smape(model: nn.Module, loader: DataLoader, device: torch.device, mode: str, ids: List[str]) -> float:
+def _eval_smape(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    mode: str,
+    ids: List[str],
+    pred_len: int,
+) -> float:
     model.eval()
     ys: List[np.ndarray] = []
     ps: List[np.ndarray] = []
@@ -68,8 +76,9 @@ def _eval_smape(model: nn.Module, loader: DataLoader, device: torch.device, mode
             if mode == "direct":
                 out = model(xb)  # [B, H, N]
             else:
-                # recursive 1-step inside validation to match dataset Y length=1
-                out = model(xb)  # [B, 1, N]
+                # recursive multi-step forecast during validation
+                out = forecast_recursive_batch(model, xb, pred_len)  # [B, H, N]
+                out = out[:, : yb.shape[1], :]  # align horizon with provided targets
             ys.append(yb.detach().float().cpu().numpy())
             ps.append(out.detach().float().cpu().numpy())
     Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
@@ -220,7 +229,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             scaler.update()
             losses.append(loss.item())
 
-        val_smape = _eval_smape(model, dl_val, device, mode, ids)
+        val_smape = _eval_smape(model, dl_val, device, mode, ids, pred_len)
         console().print(f"[bold]Epoch {ep}[/bold] loss={np.mean(losses):.6f}  val_smape={val_smape:.6f}")
         if val_smape < best_smape:
             best_smape = val_smape
