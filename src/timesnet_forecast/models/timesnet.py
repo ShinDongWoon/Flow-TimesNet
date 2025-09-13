@@ -96,6 +96,11 @@ class InceptionBlock(nn.Module):
             pad = k // 2
             self.paths.append(nn.Conv1d(in_ch, out_ch, kernel_size=k, padding=pad))
         self.proj = nn.Conv1d(out_ch * len(kernel_set), out_ch, kernel_size=1)
+        # Residual projection if channel dims differ
+        if in_ch != out_ch:
+            self.res_proj = nn.Conv1d(in_ch, out_ch, kernel_size=1)
+        else:
+            self.res_proj = nn.Identity()
         self.dropout = nn.Dropout(dropout)
         if act.lower() == "gelu":
             self.act = nn.GELU()
@@ -108,12 +113,13 @@ class InceptionBlock(nn.Module):
         """
         x: [B, C, L]
         """
+        res = self.res_proj(x)
         feats = [p(x) for p in self.paths]  # list of [B, out_ch, L]
         z = torch.cat(feats, dim=1)         # [B, out_ch*P, L]
         z = self.proj(z)
         z = self.act(z)
         z = self.dropout(z)
-        return z
+        return z + res
 
 
 class TimesNet(nn.Module):
