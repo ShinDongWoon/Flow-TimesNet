@@ -1,0 +1,68 @@
+data:
+  train_csv: "data/train.csv"
+  test_dir: "data/test"
+  sample_submission: "data/sample_submission.csv"
+  date_col: "영업일자"
+  target_col: "매출수량"
+  id_col: "영업장명_메뉴명"
+  min_context_days: 28
+  horizon: 7
+  fill_missing_dates: true
+  encoding: "utf-8-sig"
+
+preprocess:
+  to_wide: true
+  normalize: "zscore"         # zscore|minmax|none
+  normalize_per_series: true
+  eps: 1.0e-8
+
+train:
+  device: "cuda"              # "cuda"|"cpu" 자동 선택 코드에서 처리
+  epochs: 50
+  batch_size: 256
+  lr: 2.0e-3
+  weight_decay: 1.0e-6
+  grad_clip_norm: 1.0
+  amp: true
+  compile: true
+  matmul_precision: "medium"
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  channels_last: true
+  val:
+    strategy: "holdout"       # "holdout"|"rolling"
+    holdout_days: 28
+    rolling_folds: 3
+    rolling_step_days: 14
+
+model:
+  mode: "direct"              # "direct"|"recursive"
+  input_len: 28
+  pred_len: 7
+  d_model: 256
+  n_layers: 3
+  dropout: 0.1
+  k_periods: 4
+  inception_kernel_set: [3, 5, 7]
+  activation: "gelu"
+
+tuning:
+  enabled: true
+  n_trials: 30
+  sampler: "tpe_multivariate"
+  pruner: "median"
+  timeout_min: null
+  seed: 2025
+
+artifacts:
+  dir: "outputs/artifacts"
+  model_file: "timesnet.pth"
+  scaler_file: "scaler.pkl"
+  schema_file: "schema.json"
+  config_file: "config_used.yaml"
+
+submission:
+  out_path: "outputs/submissions/submission.csv"
+  format: "row_key_menu"
