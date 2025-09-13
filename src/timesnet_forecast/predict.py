@@ -46,17 +46,26 @@ def forecast_recursive_batch(model: TimesNet, last_seq: torch.Tensor, H: int) ->
 
 
 def predict_once(cfg: Dict) -> str:
-    device = _select_device(cfg["train"]["device"])
+    art_dir = cfg["artifacts"]["dir"]
+    cfg_used = io_utils.load_yaml(os.path.join(art_dir, cfg["artifacts"]["config_file"]))
+    cfg_used.setdefault("artifacts", {}).update(cfg["artifacts"])
+    for k, v in cfg.items():
+        if k in {"model", "artifacts"}:
+            continue
+        if isinstance(v, dict):
+            cfg_used.setdefault(k, {}).update(v)
+        else:
+            cfg_used[k] = v
+
+    device = _select_device(cfg_used["train"]["device"])
     torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision(cfg["train"]["matmul_precision"])
+    torch.set_float32_matmul_precision(cfg_used["train"]["matmul_precision"])
     console().print(f"[bold green]Predict device:[/bold green] {device}")
 
-    # Load artifacts
-    art_dir = cfg["artifacts"]["dir"]
-    model_file = os.path.join(art_dir, cfg["artifacts"]["model_file"])
-    scaler_meta = io_utils.load_pickle(os.path.join(art_dir, cfg["artifacts"]["scaler_file"]))
-    schema = io_utils.load_json(os.path.join(art_dir, cfg["artifacts"]["schema_file"]))
-    cfg_used = cfg  # use current cfg; train saved copy also available
+    art_dir = cfg_used["artifacts"]["dir"]
+    model_file = os.path.join(art_dir, cfg_used["artifacts"]["model_file"])
+    scaler_meta = io_utils.load_pickle(os.path.join(art_dir, cfg_used["artifacts"]["scaler_file"]))
+    schema = io_utils.load_json(os.path.join(art_dir, cfg_used["artifacts"]["schema_file"]))
 
     ids: List[str] = list(scaler_meta["ids"])
     method = scaler_meta["method"]
@@ -77,13 +86,13 @@ def predict_once(cfg: Dict) -> str:
     state = torch.load(model_file, map_location="cpu")
     model.load_state_dict(state)
     model.eval()
-    if cfg["train"]["channels_last"]:
+    if cfg_used["train"]["channels_last"]:
         model = maybe_channels_last(model, True)
 
     # Iterate test parts
-    test_dir = cfg["data"]["test_dir"]
-    enc = cfg["data"]["encoding"]
-    sample = pd.read_csv(cfg["data"]["sample_submission"], encoding=enc)
+    test_dir = cfg_used["data"]["test_dir"]
+    enc = cfg_used["data"]["encoding"]
+    sample = pd.read_csv(cfg_used["data"]["sample_submission"], encoding=enc)
     preds_by_test: Dict[str, pd.DataFrame] = {}
 
     test_files = sorted(glob(os.path.join(test_dir, "TEST_*.csv")))
@@ -92,7 +101,7 @@ def predict_once(cfg: Dict) -> str:
         df = pd.read_csv(fp, encoding=enc)
         wide = io_utils.pivot_long_to_wide(
             df, date_col=schema["date"], id_col=schema["id"], target_col=schema["target"],
-            fill_missing_dates=cfg["data"]["fill_missing_dates"], fillna0=True
+            fill_missing_dates=cfg_used["data"]["fill_missing_dates"], fillna0=True
         )
         # align columns to training ids
         wide = wide.reindex(columns=ids).fillna(0.0)
@@ -116,7 +125,7 @@ def predict_once(cfg: Dict) -> str:
         last_seq = _pad_left_zeros(Xn, need_len=L)  # [L, N]
         xb = torch.from_numpy(last_seq).unsqueeze(0).to(device, non_blocking=True)  # [1, L, N]
 
-        with torch.inference_mode(), amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
+        with torch.inference_mode(), amp_autocast(cfg_used["train"]["amp"] and device.type == "cuda"):
             if cfg_used["model"]["mode"] == "direct":
                 out = forecast_direct_batch(model, xb)  # [1, H, N]
             else:
@@ -132,10 +141,10 @@ def predict_once(cfg: Dict) -> str:
 
     # Format submission
     sub = io_utils.format_submission(sample, preds_by_test)
-    os.makedirs(os.path.dirname(cfg["submission"]["out_path"]), exist_ok=True)
-    sub.to_csv(cfg["submission"]["out_path"], index=False, encoding="utf-8-sig")
-    console().print(f"[bold green]Saved submission:[/bold green] {cfg['submission']['out_path']}")
-    return cfg["submission"]["out_path"]
+    os.makedirs(os.path.dirname(cfg_used["submission"]["out_path"]), exist_ok=True)
+    sub.to_csv(cfg_used["submission"]["out_path"], index=False, encoding="utf-8-sig")
+    console().print(f"[bold green]Saved submission:[/bold green] {cfg_used['submission']['out_path']}")
+    return cfg_used["submission"]["out_path"]
 
 
 def main() -> None:

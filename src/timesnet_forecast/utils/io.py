@@ -4,6 +4,7 @@ from typing import Dict, List, Tuple, Literal
 import os
 import json
 import pickle
+import yaml
 import numpy as np
 import pandas as pd
 
@@ -21,6 +22,12 @@ def normalize_id(s: str) -> str:
     s2 = " ".join(str(s).split())  # collapse inner spaces
     s2 = s2.strip().replace(" ", "_")
     return s2
+
+
+def load_yaml(path: str) -> dict:
+    """Load YAML file into a dictionary."""
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
 def build_id_col(df: pd.DataFrame, id_col: str) -> pd.Series:
