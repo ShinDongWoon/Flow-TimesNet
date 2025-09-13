@@ -1,0 +1,6 @@
+model.d_model: {low: 128, high: 512, step: 64, type: "int"}
+model.n_layers: {low: 2, high: 6, step: 1, type: "int"}
+model.dropout: {low: 0.0, high: 0.5, type: "float"}
+model.k_periods: {low: 2, high: 8, step: 1, type: "int"}
+train.lr: {low: 1.0e-4, high: 5.0e-3, log: true, type: "float"}
+train.batch_size: {choices: [128, 256, 384, 512], type: "categorical"}
