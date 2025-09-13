@@ -9,7 +9,8 @@ from torch.utils.data import Dataset
 class SlidingWindowDataset(Dataset):
     """
     Produce (X, Y) windows from wide-format [T, N] series.
-    direct mode: Y length = H; recursive mode: Y length = 1
+    direct mode: Y length = ``pred_len``
+    recursive mode: Y length = 1 by default, but can be overridden.
     """
     def __init__(
         self,
@@ -17,18 +18,25 @@ class SlidingWindowDataset(Dataset):
         input_len: int,
         pred_len: int,
         mode: str,  # "direct"|"recursive"
+        recursive_pred_len: int | None = None,
     ) -> None:
         super().__init__()
         assert mode in ("direct", "recursive")
         self.X = wide_values.astype(np.float32)
         self.T, self.N = self.X.shape
         self.L = int(input_len)
-        self.H = int(pred_len if mode == "direct" else 1)
+        if mode == "direct":
+            self.H = int(pred_len)
+        else:
+            # In recursive mode training windows normally have one-step targets.
+            # ``recursive_pred_len`` can override this to produce multi-step
+            # targets (e.g. for validation).
+            self.H = int(recursive_pred_len if recursive_pred_len is not None else 1)
         self.mode = mode
-        # Indices where a full (L,H) window fits. self.H is the mode-specific
-        # output length, so the last valid start index is T - L - H.
+        # Indices where a full (L,H) window fits. ``self.H`` is the mode-specific
+        # output length, so the last valid start index is ``T - L - H``.
         self.idxs = np.arange(self.T - self.L - self.H + 1)
-        # In recursive mode self.H=1, so only the last H steps are excluded.
+        # In recursive mode ``self.H`` may be 1 (training) or >1 (validation).
 
     def __len__(self) -> int:
         return int(len(self.idxs))

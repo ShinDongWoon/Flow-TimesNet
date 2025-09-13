@@ -40,8 +40,12 @@ def _build_dataloader(
     prefetch_factor: int,
     shuffle: bool,
     drop_last: bool,
+    recursive_pred_len: int | None = None,
 ) -> DataLoader:
-    datasets = [SlidingWindowDataset(a, input_len, pred_len, mode) for a in arrays]
+    datasets = [
+        SlidingWindowDataset(a, input_len, pred_len, mode, recursive_pred_len)
+        for a in arrays
+    ]
     if len(datasets) == 1:
         ds = datasets[0]
     else:
@@ -179,7 +183,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         val_arrays, input_len, pred_len, mode, batch_size=cfg["train"]["batch_size"],
         num_workers=cfg["train"]["num_workers"], pin_memory=cfg["train"]["pin_memory"],
         persistent_workers=cfg["train"]["persistent_workers"], prefetch_factor=cfg["train"]["prefetch_factor"],
-        shuffle=False, drop_last=False
+        shuffle=False, drop_last=False,
+        recursive_pred_len=(pred_len if mode == "recursive" else None)
     )
 
     # --- model
