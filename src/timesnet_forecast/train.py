@@ -212,7 +212,17 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
 
     # --- optimizer / loss
     optim = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"]["lr"]), weight_decay=float(cfg["train"]["weight_decay"]))
-    grad_scaler = torch.cuda.amp.GradScaler(enabled=(cfg["train"]["amp"] and device.type == "cuda"))
+    try:
+        grad_scaler = torch.amp.GradScaler(
+            device_type=device.type,
+            enabled=cfg["train"]["amp"] and device.type == "cuda",
+        )
+    except TypeError:
+        # For older PyTorch versions where ``device_type`` is unsupported.
+        grad_scaler = torch.amp.GradScaler(
+            device=device.type,
+            enabled=cfg["train"]["amp"] and device.type == "cuda",
+        )
     loss_fn = nn.MSELoss()
 
     # --- training loop
