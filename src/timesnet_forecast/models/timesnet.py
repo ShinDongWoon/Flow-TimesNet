@@ -154,16 +154,18 @@ class TimesNet(nn.Module):
         self.incept: List[InceptionBlock] = []
         self.act = activation
         # Conv will see channels = N (series), length = K*P
-        # We don't know P at build time; use a small stem first to map N->d_model,
-        # then apply inception blocks on feature channels
-        self.stem = nn.Conv1d(in_channels=0, out_channels=0, kernel_size=1)  # placeholder, replaced in forward
+        # We don't know P at build time; use lightweight identity modules that will
+        # be replaced lazily with proper layers on the first forward pass.
+        self.stem: nn.Module = nn.Identity()
+        self.blocks: nn.Module = nn.Identity()
+        self.pool: nn.Module = nn.Identity()
+        self.head: nn.Module = nn.Identity()
         # We'll lazily init convs on first forward when N and P are known
         self._lazy_built = False
         self.kernel_set = kernel_set
         self.dropout = float(dropout)
         self.d_model = int(d_model)
         self.n_layers = int(n_layers)
-        self.head: nn.Module | None = None
 
     def _build_lazy(self, N: int, L: int, x: torch.Tensor) -> None:
         # N known (channels), L known (length=K*P)
