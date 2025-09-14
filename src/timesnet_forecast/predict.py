@@ -143,24 +143,17 @@ def predict_once(cfg: Dict) -> str:
         # inverse transform & clip
         P = io_utils.inverse_transform(Pn, ids, scaler, method=method)
         P = np.clip(P, 0.0, None)
-        last_date = wide.index.max()
-        forecast_idx = pd.date_range(last_date + pd.Timedelta(days=1), periods=H, freq="D")
-        pred_df = pd.DataFrame(P, index=forecast_idx, columns=ids)
 
+        pred_df = pd.DataFrame(P, columns=ids)
         test_name = os.path.splitext(os.path.basename(fp))[0]
         # Attach row keys for later concatenation
-        pred_df["date"] = pred_df.index
         pred_df["row_key"] = [f"{test_name}+D{i+1}" for i in range(len(pred_df))]
         pred_df = pred_df.set_index("row_key")
         pred_list.append(pred_df)
 
     # Format submission
     preds = pd.concat(pred_list, ignore_index=False)
-    sub = io_utils.format_submission(
-        sample,
-        preds,
-        cfg_used["submission"].get("date_col", schema["date"]),
-    )
+    sub = io_utils.format_submission(sample, preds)
     os.makedirs(os.path.dirname(cfg_used["submission"]["out_path"]), exist_ok=True)
     sub.to_csv(cfg_used["submission"]["out_path"], index=False, encoding="utf-8-sig")
     console().print(f"[bold green]Saved submission:[/bold green] {cfg_used['submission']['out_path']}")

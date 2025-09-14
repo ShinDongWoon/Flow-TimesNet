@@ -26,6 +26,15 @@ def normalize_id(s: str) -> str:
     return s2
 
 
+def normalize_series_name(s: str) -> str:
+    """
+    Normalize a series/menu name so that it matches the identifiers used
+    throughout the codebase. Currently this simply reuses :func:`normalize_id`
+    which collapses whitespace and replaces spaces with underscores.
+    """
+    return normalize_id(s)
+
+
 def load_yaml(path: str) -> dict:
     """Load YAML file into a dictionary."""
     with open(path, "r", encoding="utf-8") as f:
@@ -194,29 +203,49 @@ def parse_row_key(row_key: str) -> Tuple[str, int]:
     return part, day_num
 
 
-def format_submission(
-    sample_df: pd.DataFrame,
-    preds: pd.DataFrame,
-    date_col: str,
-) -> pd.DataFrame:
+def format_submission(sample_df: pd.DataFrame, preds: pd.DataFrame) -> pd.DataFrame:
+    """
+    Populate a sample submission DataFrame with predictions.
+
+    Parameters
+    ----------
+    sample_df : pd.DataFrame
+        The sample submission template. The first column is assumed to contain
+        the row key (e.g. ``TEST_00+1일``) while the remaining columns are menu
+        names.
+    preds : pd.DataFrame
+        DataFrame containing predictions indexed by ``row_key``. Its columns are
+        expected to be normalized menu names.
+
+    Returns
+    -------
+    pd.DataFrame
+        Filled submission DataFrame with the same column order and names as
+        ``sample_df``.
+    """
+
     out = sample_df.copy()
-    menu_cols = [c for c in out.columns if c != date_col]
+    row_col = out.columns[0]
+    menu_cols = [c for c in out.columns if c != row_col]
+    norm_cols = [normalize_series_name(c) for c in menu_cols]
+
     for i, row in out.iterrows():
-        rk = row[date_col]
+        rk = row[row_col]
         try:
             test_part, day_num = parse_row_key(rk)
         except ValueError:
             logging.warning(f"Invalid row key encountered: {rk}")
             out.loc[i, menu_cols] = 0.0
-            out.loc[i, date_col] = pd.NaT
             continue
+
         lookup_key = f"{test_part}+D{day_num}"
         if lookup_key not in preds.index:
             out.loc[i, menu_cols] = 0.0
-            out.loc[i, date_col] = pd.NaT
             continue
-        out.loc[i, date_col] = preds.loc[lookup_key, "date"]
-        vals = preds.loc[lookup_key, menu_cols]
-        out.loc[i, menu_cols] = vals.reindex(menu_cols).fillna(0.0).values
-    out[date_col] = pd.to_datetime(out[date_col])
+
+        vals = preds.loc[lookup_key, norm_cols]
+        vals = vals.reindex(norm_cols).fillna(0.0).values
+        out.loc[i, menu_cols] = vals
+
+    assert list(out.columns) == list(sample_df.columns)
     return out
