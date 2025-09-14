@@ -4,6 +4,7 @@ from typing import Dict, List, Tuple, Literal
 import os
 import json
 import pickle
+import re
 import yaml
 import numpy as np
 import pandas as pd
@@ -158,12 +159,37 @@ def load_json(path: str) -> dict:
 
 
 def parse_row_key(row_key: str) -> Tuple[str, int]:
+    """Parse a submission row key into its test part and day number.
+
+    Supports patterns like:
+
+    - ``"TEST_00+Day 1"``
+    - ``"TEST_00+1일"``
+
+    Parameters
+    ----------
+    row_key : str
+        Row identifier of the form ``<part>+Day <n>`` or variants such as
+        ``<part>+<n>일``.
+
+    Returns
+    -------
+    Tuple[str, int]
+        ``(part, day_number)``
+
+    Raises
+    ------
+    ValueError
+        If the row key does not match the supported pattern.
     """
-    "TEST_00+Day 1" -> ("TEST_00", 1)
-    """
-    part, day = row_key.split("+Day")
-    part = part.strip()
-    day_num = int(day.strip())
+
+    pattern = r"^(.*)\+(?:Day\s*)?(\d+)\D*$"
+    m = re.match(pattern, row_key.strip())
+    if not m:
+        raise ValueError(f"Unsupported row key format: {row_key}")
+
+    part = m.group(1).strip()
+    day_num = int(m.group(2))
     return part, day_num
 
 
