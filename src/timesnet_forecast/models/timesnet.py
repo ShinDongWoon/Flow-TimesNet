@@ -165,19 +165,25 @@ class TimesNet(nn.Module):
         self.n_layers = int(n_layers)
         self.head: nn.Module | None = None
 
-    def _build_lazy(self, N: int, L: int) -> None:
+    def _build_lazy(self, N: int, L: int, x: torch.Tensor) -> None:
         # N known (channels), L known (length=K*P)
-        self.stem = nn.Conv1d(in_channels=N, out_channels=self.d_model, kernel_size=1)
+        self.stem = nn.Conv1d(in_channels=N, out_channels=self.d_model, kernel_size=1).to(
+            device=x.device, dtype=x.dtype
+        )
         blocks = []
         for _ in range(self.n_layers):
-            blocks.append(InceptionBlock(self.d_model, self.d_model, self.kernel_set, self.dropout, self.act))
+            blocks.append(
+                InceptionBlock(
+                    self.d_model, self.d_model, self.kernel_set, self.dropout, self.act
+                ).to(device=x.device, dtype=x.dtype)
+            )
         self.blocks = nn.Sequential(*blocks)
         # Global pooling over length
         self.pool = nn.AdaptiveAvgPool1d(1)
         # Head: map d_model -> pred_len or 1 per channel N, but we pooled length only.
         # We'll predict for each series independently by a linear over features then expand to N.
         out_steps = self.pred_len if self.mode == "direct" else 1
-        self.head = nn.Linear(self.d_model, out_steps)
+        self.head = nn.Linear(self.d_model, out_steps).to(device=x.device, dtype=x.dtype)
         self._lazy_built = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -194,7 +200,7 @@ class TimesNet(nn.Module):
         # Rearrange to conv-friendly: [B, N, K*P]
         z = z.permute(0, 3, 1, 2).contiguous().view(B, N, K * P)
         if not self._lazy_built:
-            self._build_lazy(N=N, L=K * P)
+            self._build_lazy(N=N, L=K * P, x=z)
         # Shared conv along "length" axis (time-like)
         z = self.stem(z)            # [B, d_model, K*P]
         z = self.blocks(z)          # [B, d_model, K*P]
