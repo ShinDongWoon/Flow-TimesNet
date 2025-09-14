@@ -134,7 +134,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     df = pd.read_csv(train_path, encoding=enc)
     # compute store-level weights based on total target value
     df["_id_norm"] = io_utils.build_id_col(df, schema["id"])
-    df["_store"] = df["_id_norm"].str.split("_", 1).str[0]
+    df["_store"] = df["_id_norm"].str.split("_", n=1).str[0]
     store_weights = df.groupby("_store")[schema["target"]].sum().to_dict()
     wide = io_utils.pivot_long_to_wide(
         df, date_col=schema["date"], id_col=schema["id"], target_col=schema["target"],
