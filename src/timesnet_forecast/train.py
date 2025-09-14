@@ -199,6 +199,12 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         activation=str(cfg["model"]["activation"]),
         mode=mode,
     ).to(device)
+
+    # Lazily build model parameters so that downstream utilities see them
+    with torch.no_grad():
+        dummy = torch.zeros(1, input_len, len(ids), device=device)
+        model(dummy)
+
     if cfg["train"]["channels_last"]:
         model = maybe_channels_last(model, True)
     if cfg["train"]["compile"]:
