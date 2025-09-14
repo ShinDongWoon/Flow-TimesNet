@@ -83,6 +83,9 @@ def predict_once(cfg: Dict) -> str:
         activation=str(cfg_used["model"]["activation"]),
         mode=str(cfg_used["model"]["mode"]),
     ).to(device)
+    # Lazily constructed layers depend on number of series (channels).
+    dummy = torch.zeros(1, len(ids), 1, device=device)
+    model._build_lazy(N=len(ids), L=1, x=dummy)
     state = clean_state_dict(torch.load(model_file, map_location="cpu"))
     model.load_state_dict(state)
     model.eval()
