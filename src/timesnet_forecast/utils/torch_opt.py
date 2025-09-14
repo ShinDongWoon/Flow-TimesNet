@@ -11,7 +11,7 @@ def amp_autocast(enabled: bool):
     autocast context for float16 mixed precision on CUDA.
     """
     if enabled and torch.cuda.is_available():
-        return torch.cuda.amp.autocast(dtype=torch.float16)
+        return torch.amp.autocast("cuda", dtype=torch.float16)
     return contextlib.nullcontext()
 
 
