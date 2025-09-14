@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Tuple, List
+from typing import Tuple, Dict
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -19,6 +19,7 @@ class SlidingWindowDataset(Dataset):
         pred_len: int,
         mode: str,  # "direct"|"recursive"
         recursive_pred_len: int | None = None,
+        augment: Dict | None = None,
     ) -> None:
         super().__init__()
         assert mode in ("direct", "recursive")
@@ -33,6 +34,9 @@ class SlidingWindowDataset(Dataset):
             # targets (e.g. for validation).
             self.H = int(recursive_pred_len if recursive_pred_len is not None else 1)
         self.mode = mode
+        augment = augment or {}
+        self.add_noise_std = float(augment.get("add_noise_std", 0.0))
+        self.time_shift = int(augment.get("time_shift", 0))
         # Indices where a full (L,H) window fits. ``self.H`` is the mode-specific
         # output length, so the last valid start index is ``T - L - H``.
         self.idxs = np.arange(self.T - self.L - self.H + 1)
@@ -43,7 +47,12 @@ class SlidingWindowDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         s = int(self.idxs[idx])
+        if self.time_shift > 0:
+            delta = np.random.randint(-self.time_shift, self.time_shift + 1)
+            s = int(np.clip(s + delta, 0, self.T - self.L - self.H))
         e = s + self.L
         x = self.X[s:e, :]  # [L, N]
         y = self.X[e : e + self.H, :]  # [H, N] or [1, N]
+        if self.add_noise_std > 0:
+            x = x + np.random.normal(scale=self.add_noise_std, size=x.shape)
         return torch.from_numpy(x), torch.from_numpy(y)

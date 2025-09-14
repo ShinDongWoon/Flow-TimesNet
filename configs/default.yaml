@@ -9,6 +9,9 @@ data:
   horizon: 7
   fill_missing_dates: true
   encoding: "utf-8-sig"
+  augment:
+    add_noise_std: 0.0       # 표준편차; 0이면 사용 안 함
+    time_shift: 0            # 입력 시퀀스 시작 위치 랜덤 시프트 범위
 
 preprocess:
   to_wide: true
