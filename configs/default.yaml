@@ -26,6 +26,11 @@ train:
   grad_clip_norm: 1.0
   amp: true
   compile: true
+  lr_scheduler:
+    type: null               # "StepLR" | "ReduceLROnPlateau" | null
+    step_size: 10            # for StepLR
+    gamma: 0.1               # for StepLR
+    patience: 5              # for ReduceLROnPlateau
   matmul_precision: "medium"
   num_workers: 4
   pin_memory: true
