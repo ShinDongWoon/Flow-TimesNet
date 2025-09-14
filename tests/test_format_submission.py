@@ -22,9 +22,11 @@ def test_format_submission_invalid_row_key():
         index=pd.date_range("2023-01-01", periods=2, freq="D"),
         columns=["MENU_1", "MENU_2"],
     )
-    preds_by_test = {"TEST_A": pred_df}
+    pred_df["date"] = pred_df.index
+    pred_df["row_key"] = ["TEST_A+D1", "TEST_A+D2"]
+    preds = pred_df.set_index("row_key")
 
-    out = format_submission(sample_df, preds_by_test, date_col="date")
+    out = format_submission(sample_df, preds, date_col="date")
 
     # First row parsed successfully
     assert out.loc[0, "date"] == pd.Timestamp("2023-01-01")
