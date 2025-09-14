@@ -111,6 +111,8 @@ def predict_once(cfg: Dict) -> str:
             df, date_col=schema["date"], id_col=schema["id"], target_col=schema["target"],
             fill_missing_dates=cfg_used["data"]["fill_missing_dates"], fillna0=True
         )
+        if cfg_used.get("preprocess", {}).get("clip_negative", False):
+            wide = wide.clip(lower=0.0)
         # align columns to training ids
         wide = wide.reindex(columns=ids).fillna(0.0)
         X = wide.values.astype(np.float32)
