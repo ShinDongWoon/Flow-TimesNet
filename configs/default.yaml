@@ -65,4 +65,5 @@ artifacts:
 
 submission:
   out_path: "outputs/submissions/submission.csv"
-  format: "row_key_menu"
+  format: "date_menu"          # predictions keyed by date instead of row_key
+  date_col: "영업일자"
