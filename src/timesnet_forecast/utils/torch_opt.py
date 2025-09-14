@@ -28,6 +28,7 @@ def maybe_compile(module: nn.Module, enabled: bool) -> nn.Module:
     if not enabled:
         return module
     try:
+        torch._dynamo.config.capture_scalar_outputs = True
         module = torch.compile(module, fullgraph=False)
     except Exception as e:
         # graceful fallback
