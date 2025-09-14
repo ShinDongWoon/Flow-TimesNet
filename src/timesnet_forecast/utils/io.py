@@ -8,6 +8,7 @@ import re
 import yaml
 import numpy as np
 import pandas as pd
+import logging
 
 
 def resolve_schema(cfg: dict) -> Dict[str, str]:
@@ -202,7 +203,13 @@ def format_submission(
     menu_cols = [c for c in out.columns if c != date_col]
     for i, row in out.iterrows():
         rk = row[date_col]
-        test_part, day_num = parse_row_key(rk)
+        try:
+            test_part, day_num = parse_row_key(rk)
+        except ValueError:
+            logging.warning(f"Invalid row key encountered: {rk}")
+            out.loc[i, menu_cols] = 0.0
+            out.loc[i, date_col] = pd.NaT
+            continue
         P = preds_by_test.get(test_part)
         if P is None or (day_num - 1) not in range(len(P)):
             out.loc[i, menu_cols] = 0.0
