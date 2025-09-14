@@ -51,14 +51,18 @@ class PeriodicityTransform(nn.Module):
             kidx = self._topk_freq(xn, self.k)  # [B, K]
             # build [B, K, P_max]
             rows: List[torch.Tensor] = []
-            Pmax = 1
+            # track max period length in tensor form
+            Pmax_t = torch.tensor(1, device=x.device)
             per_k_data: List[torch.Tensor] = []
             for ki in range(kidx.size(1)):
                 f = kidx[:, ki]  # [B]
                 # period_len = floor(T / f)
                 P = torch.clamp(T // torch.clamp(f, min=1), min=1)
-                Pmax = int(max(Pmax, int(P.max().item())))
+                # accumulate max as tensor operation
+                Pmax_t = torch.maximum(Pmax_t, P.max())
                 per_k_data.append(P)
+            # convert to python int once after loop
+            Pmax = int(Pmax_t.item())
             # Second pass: fold and pad per batch (vectorized where possible)
             # For simplicity, do batch loop (B typically moderate).
             mats: List[torch.Tensor] = []
@@ -66,15 +70,16 @@ class PeriodicityTransform(nn.Module):
                 seq = xn[b]  # [T]
                 cols: List[torch.Tensor] = []
                 for ki in range(kidx.size(1)):
-                    f = int(kidx[b, ki].item())
-                    P = max(1, T // max(1, f))
-                    if P <= 0:
-                        P = 1
-                    cycles = max(1, T // P)
+                    f = torch.clamp(kidx[b, ki], min=1)
+                    P = torch.clamp(T // f, min=1)
+                    cycles = torch.clamp(T // P, min=1)
                     take = cycles * P
-                    seg = seq[-take:].reshape(cycles, P).mean(dim=0)  # [P]
-                    if P < Pmax:
-                        pad = torch.zeros(Pmax - P, dtype=seq.dtype, device=seq.device)
+                    P_int = int(P.item())
+                    cycles_int = int(cycles.item())
+                    take_int = int(take.item())
+                    seg = seq[-take_int:].reshape(cycles_int, P_int).mean(dim=0)  # [P]
+                    if P_int < Pmax:
+                        pad = torch.zeros(Pmax - P_int, dtype=seq.dtype, device=seq.device)
                         seg = torch.cat([seg, pad], dim=0)
                     cols.append(seg)
                 if len(cols) == 0:
