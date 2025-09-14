@@ -152,7 +152,7 @@ def predict_once(cfg: Dict) -> str:
         pred_list.append(pred_df)
 
     # Format submission
-    preds = pd.concat(pred_list, ignore_index=False)
+    preds = io_utils.merge_forecasts(pred_list)
     sub = io_utils.format_submission(sample, preds)
     os.makedirs(os.path.dirname(cfg_used["submission"]["out_path"]), exist_ok=True)
     sub.to_csv(cfg_used["submission"]["out_path"], index=False, encoding="utf-8-sig")
