@@ -5,3 +5,6 @@
 - Optional early stopping: set `train.early_stopping_patience` to an integer to stop training
   when validation WSMAPE does not improve for that many consecutive epochs. Leave it unset or
   `null` to disable early stopping.
+- Simple data augmentation can be enabled via the `data.augment` section of the config.
+  - `add_noise_std`: standard deviation of Gaussian noise added to input windows.
+  - `time_shift`: maximum number of time steps to randomly shift each window's start index.

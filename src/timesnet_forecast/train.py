@@ -69,9 +69,10 @@ def _build_dataloader(
     shuffle: bool,
     drop_last: bool,
     recursive_pred_len: int | None = None,
+    augment: Dict | None = None,
 ) -> DataLoader:
     datasets = [
-        SlidingWindowDataset(a, input_len, pred_len, mode, recursive_pred_len)
+        SlidingWindowDataset(a, input_len, pred_len, mode, recursive_pred_len, augment)
         for a in arrays
     ]
     if len(datasets) == 1:
@@ -210,14 +211,16 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     dl_train = _build_dataloader(
         train_arrays, input_len, pred_len, mode, cfg["train"]["batch_size"],
         cfg["train"]["num_workers"], cfg["train"]["pin_memory"], cfg["train"]["persistent_workers"],
-        cfg["train"]["prefetch_factor"], shuffle=True, drop_last=True
+        cfg["train"]["prefetch_factor"], shuffle=True, drop_last=True,
+        augment=cfg["data"].get("augment"),
     )
     dl_val = _build_dataloader(
         val_arrays, input_len, pred_len, mode, batch_size=cfg["train"]["batch_size"],
         num_workers=cfg["train"]["num_workers"], pin_memory=cfg["train"]["pin_memory"],
         persistent_workers=cfg["train"]["persistent_workers"], prefetch_factor=cfg["train"]["prefetch_factor"],
         shuffle=False, drop_last=False,
-        recursive_pred_len=(pred_len if mode == "recursive" else None)
+        recursive_pred_len=(pred_len if mode == "recursive" else None),
+        augment=None,
     )
     if len(dl_val.dataset) == 0:
         raise ValueError("Validation split has no windows; increase train.val.holdout_days or adjust model.input_len/pred_len.")
