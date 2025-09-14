@@ -196,7 +196,7 @@ def parse_row_key(row_key: str) -> Tuple[str, int]:
 
 def format_submission(
     sample_df: pd.DataFrame,
-    preds_by_test: Dict[str, pd.DataFrame],
+    preds: pd.DataFrame,
     date_col: str,
 ) -> pd.DataFrame:
     out = sample_df.copy()
@@ -210,13 +210,13 @@ def format_submission(
             out.loc[i, menu_cols] = 0.0
             out.loc[i, date_col] = pd.NaT
             continue
-        P = preds_by_test.get(test_part)
-        if P is None or (day_num - 1) not in range(len(P)):
+        lookup_key = f"{test_part}+D{day_num}"
+        if lookup_key not in preds.index:
             out.loc[i, menu_cols] = 0.0
             out.loc[i, date_col] = pd.NaT
             continue
-        out.loc[i, date_col] = P.index[day_num - 1]
-        vals = P.iloc[day_num - 1]
+        out.loc[i, date_col] = preds.loc[lookup_key, "date"]
+        vals = preds.loc[lookup_key, menu_cols]
         out.loc[i, menu_cols] = vals.reindex(menu_cols).fillna(0.0).values
     out[date_col] = pd.to_datetime(out[date_col])
     return out

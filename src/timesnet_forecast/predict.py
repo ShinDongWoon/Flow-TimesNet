@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from glob import glob
-from typing import Dict, List
+from typing import List
 import numpy as np
 import pandas as pd
 import torch
@@ -102,7 +102,7 @@ def predict_once(cfg: Dict) -> str:
     sample = pd.read_csv(
         cfg_used["data"]["sample_submission"], encoding="utf-8-sig"
     )
-    preds_by_test: Dict[str, pd.DataFrame] = {}
+    pred_list: List[pd.DataFrame] = []
 
     test_files = sorted(glob(os.path.join(test_dir, "TEST_*.csv")))
     for fp in test_files:
@@ -148,12 +148,17 @@ def predict_once(cfg: Dict) -> str:
         pred_df = pd.DataFrame(P, index=forecast_idx, columns=ids)
 
         test_name = os.path.splitext(os.path.basename(fp))[0]
-        preds_by_test[test_name] = pred_df
+        # Attach row keys for later concatenation
+        pred_df["date"] = pred_df.index
+        pred_df["row_key"] = [f"{test_name}+D{i+1}" for i in range(len(pred_df))]
+        pred_df = pred_df.set_index("row_key")
+        pred_list.append(pred_df)
 
     # Format submission
+    preds = pd.concat(pred_list, ignore_index=False)
     sub = io_utils.format_submission(
         sample,
-        preds_by_test,
+        preds,
         cfg_used["submission"].get("date_col", schema["date"]),
     )
     os.makedirs(os.path.dirname(cfg_used["submission"]["out_path"]), exist_ok=True)
