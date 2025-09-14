@@ -193,8 +193,8 @@ def parse_row_key(row_key: str) -> Tuple[str, int]:
         If the row key does not match the supported pattern.
     """
 
-    pattern = r"^(.*)\+(?:Day\s*)?(\d+)\D*$"
-    m = re.match(pattern, row_key.strip())
+    pattern = r"^(.*)\+(?:D(?:ay)?\s*)?(\d+)\D*$"
+    m = re.match(pattern, row_key.strip(), flags=re.IGNORECASE)
     if not m:
         raise ValueError(f"Unsupported row key format: {row_key}")
 

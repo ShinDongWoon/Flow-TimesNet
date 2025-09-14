@@ -13,3 +13,7 @@ def test_parse_row_key_day():
 
 def test_parse_row_key_korean():
     assert parse_row_key("TEST_00+1일") == ("TEST_00", 1)
+
+
+def test_parse_row_key_d_prefix():
+    assert parse_row_key("TEST_00+D1") == ("TEST_00", 1)
