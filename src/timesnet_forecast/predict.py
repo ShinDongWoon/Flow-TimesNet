@@ -9,7 +9,7 @@ import torch
 
 from .config import Config
 from .utils.logging import console
-from .utils.torch_opt import amp_autocast, move_to_device, maybe_channels_last
+from .utils.torch_opt import amp_autocast, move_to_device, maybe_channels_last, clean_state_dict
 from .utils import io as io_utils
 from .models.timesnet import TimesNet
 
@@ -83,7 +83,7 @@ def predict_once(cfg: Dict) -> str:
         activation=str(cfg_used["model"]["activation"]),
         mode=str(cfg_used["model"]["mode"]),
     ).to(device)
-    state = torch.load(model_file, map_location="cpu")
+    state = clean_state_dict(torch.load(model_file, map_location="cpu"))
     model.load_state_dict(state)
     model.eval()
     if cfg_used["train"]["channels_last"]:
