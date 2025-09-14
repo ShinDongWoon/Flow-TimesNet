@@ -18,7 +18,7 @@ def amp_autocast(enabled: bool):
 def maybe_channels_last(module: nn.Module, enabled: bool) -> nn.Module:
     if enabled:
         for p in module.parameters():
-            if p.is_floating_point():
+            if p.is_floating_point() and p.dim() == 4:
                 p.data = p.data.contiguous(memory_format=torch.channels_last)
         return module.to(memory_format=torch.channels_last)
     return module
