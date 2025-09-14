@@ -78,7 +78,7 @@ def predict_once(cfg: Dict) -> str:
         d_model=int(cfg_used["model"]["d_model"]),
         n_layers=int(cfg_used["model"]["n_layers"]),
         k_periods=int(cfg_used["model"]["k_periods"]),
-        kernel_set=list(cfg_used["model"]["inception_kernel_set"]),
+        kernel_set=list(cfg_used["model"]["kernel_set"]),
         dropout=float(cfg_used["model"]["dropout"]),
         activation=str(cfg_used["model"]["activation"]),
         mode=str(cfg_used["model"]["mode"]),

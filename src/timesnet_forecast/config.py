@@ -67,6 +67,11 @@ class Config:
         base = load_yaml(config_path)
         if overrides:
             base = apply_overrides(base, overrides)
+        # Backward compatibility: rename inception_kernel_set -> kernel_set
+        model_cfg = base.get("model", {})
+        if "inception_kernel_set" in model_cfg and "kernel_set" not in model_cfg:
+            model_cfg["kernel_set"] = model_cfg.pop("inception_kernel_set")
+            base["model"] = model_cfg
         return Config(raw=base)
 
     def get(self, path: str, default: Any = None) -> Any:
