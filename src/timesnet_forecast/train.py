@@ -20,7 +20,7 @@ from .utils.torch_opt import (
     move_to_device,
     clean_state_dict,
 )
-from .utils.metrics import smape_grouped
+from .utils.metrics import wsmape_grouped
 from .utils import io as io_utils
 from .data.split import make_holdout_slices, make_rolling_slices
 from .data.dataset import SlidingWindowDataset
@@ -68,13 +68,14 @@ def _build_dataloader(
     )
 
 
-def _eval_smape(
+def _eval_wsmape(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
     mode: str,
     ids: List[str],
     pred_len: int,
+    weights: Dict[str, float],
 ) -> float:
     model.eval()
     ys: List[np.ndarray] = []
@@ -93,7 +94,7 @@ def _eval_smape(
             ps.append(out.detach().float().cpu().numpy())
     Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
     P = np.concatenate(ps, axis=0).reshape(-1, len(ids))
-    return smape_grouped(Y, P, ids=ids)
+    return wsmape_grouped(Y, P, ids=ids, weights=weights)
 
 
 def train_once(cfg: Dict) -> Tuple[float, Dict]:
@@ -109,6 +110,10 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     enc = cfg["data"]["encoding"]
     train_path = cfg["data"]["train_csv"]
     df = pd.read_csv(train_path, encoding=enc)
+    # compute store-level weights based on total target value
+    df["_id_norm"] = io_utils.build_id_col(df, schema["id"])
+    df["_store"] = df["_id_norm"].str.split("_", 1).str[0]
+    store_weights = df.groupby("_store")[schema["target"]].sum().to_dict()
     wide = io_utils.pivot_long_to_wide(
         df, date_col=schema["date"], id_col=schema["id"], target_col=schema["target"],
         fill_missing_dates=cfg["data"]["fill_missing_dates"], fillna0=True
@@ -234,7 +239,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     loss_fn = nn.MSELoss()
 
     # --- training loop
-    best_smape = float("inf")
+    best_wsmape = float("inf")
     best_state = None
     epochs = int(cfg["train"]["epochs"])
     grad_clip = float(cfg["train"]["grad_clip_norm"]) if cfg["train"]["grad_clip_norm"] else 0.0
@@ -258,10 +263,10 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             grad_scaler.update()
             losses.append(loss.item())
 
-        val_smape = _eval_smape(model, dl_val, device, mode, ids, pred_len)
-        console().print(f"[bold]Epoch {ep}[/bold] loss={np.mean(losses):.6f}  val_smape={val_smape:.6f}")
-        if val_smape < best_smape:
-            best_smape = val_smape
+        val_wsmape = _eval_wsmape(model, dl_val, device, mode, ids, pred_len, store_weights)
+        console().print(f"[bold]Epoch {ep}[/bold] loss={np.mean(losses):.6f}  val_wsmape={val_wsmape:.6f}")
+        if val_wsmape < best_wsmape:
+            best_wsmape = val_wsmape
             best_state = clean_state_dict(
                 {k: v.detach().cpu() for k, v in model.state_dict().items()}
             )
@@ -286,7 +291,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     io_utils.save_json({"date": schema["date"], "target": schema["target"], "id": schema["id"]}, schema_path)
     save_yaml(cfg, cfg_path)
     console().print(f"[green]Saved:[/green] {model_path}, {scaler_path}, {schema_path}, {cfg_path}")
-    return best_smape, {"model": model_path, "scaler": scaler_path, "schema": schema_path, "config": cfg_path}
+    return best_wsmape, {"model": model_path, "scaler": scaler_path, "schema": schema_path, "config": cfg_path}
 
 
 def main() -> None:
@@ -297,8 +302,8 @@ def main() -> None:
     parser.add_argument("--override", nargs="*", default=[])
     args = parser.parse_args()
     cfg = Config.from_files(args.config, overrides=args.override).to_dict()
-    best_smape, paths = train_once(cfg)
-    console().print(f"[bold magenta]Final best SMAPE: {best_smape:.6f}[/bold magenta]")
+    best_wsmape, paths = train_once(cfg)
+    console().print(f"[bold magenta]Final best WSMAPE: {best_wsmape:.6f}[/bold magenta]")
 
 
 if __name__ == "__main__":

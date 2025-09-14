@@ -4,15 +4,16 @@ from typing import Dict, List, Optional
 import numpy as np
 
 
-def smape_grouped(
+def wsmape_grouped(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     ids: List[str],
     weights: Optional[Dict[str, float]] = None,
     eps: float = 1e-8,
 ) -> float:
-    """
-    Grouped SMAPE by store. Each id is "store_menu", store = split('_',1)[0].
+    """Weighted SMAPE grouped by store.
+
+    Each id is "store_menu", store = split('_',1)[0].
     Only dates with A_{t,i} != 0 included for item-level mean.
     If denom |A|+|P| == 0 at a timepoint, that point is skipped.
     If an item has no valid points, its SMAPE is 0 by definition here.
