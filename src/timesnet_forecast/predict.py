@@ -9,7 +9,7 @@ import torch
 
 from .config import Config
 from .utils.logging import console
-from .utils.torch_opt import amp_autocast, move_to_device, maybe_channels_last, clean_state_dict
+from .utils.torch_opt import amp_autocast, maybe_channels_last
 from .utils import io as io_utils
 from .models.timesnet import TimesNet
 
@@ -86,8 +86,13 @@ def predict_once(cfg: Dict) -> str:
     # Lazily constructed layers depend on number of series (channels).
     dummy = torch.zeros(1, len(ids), 1, device=device)
     model._build_lazy(N=len(ids), L=1, x=dummy)
-    state = clean_state_dict(torch.load(model_file, map_location="cpu"))
-    model.load_state_dict(state)
+    state = torch.load(model_file, map_location="cpu")
+    # Checkpoints saved with torch.compile or DataParallel may prefix parameter names.
+    clean_state = {
+        k.replace("_orig_mod.", "").replace("module.", ""): v
+        for k, v in state.items()
+    }
+    model.load_state_dict(clean_state)
     model.eval()
     if cfg_used["train"]["channels_last"]:
         model = maybe_channels_last(model, True)
