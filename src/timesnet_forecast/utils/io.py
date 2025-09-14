@@ -26,13 +26,15 @@ def normalize_id(s: str) -> str:
     return s2
 
 
-def normalize_series_name(s: str) -> str:
+def normalize_series_name(name: str) -> str:
+    """Normalize a series/menu name using :func:`normalize_id`.
+
+    This helper mirrors :func:`normalize_id` but is provided for clarity when
+    dealing specifically with series (menu) names. It collapses multiple spaces
+    into a single underscore and strips leading/trailing whitespace while
+    preserving any non-ASCII characters.
     """
-    Normalize a series/menu name so that it matches the identifiers used
-    throughout the codebase. Currently this simply reuses :func:`normalize_id`
-    which collapses whitespace and replaces spaces with underscores.
-    """
-    return normalize_id(s)
+    return normalize_id(name)
 
 
 def load_yaml(path: str) -> dict:
@@ -166,6 +168,32 @@ def save_json(obj: dict, path: str) -> None:
 def load_json(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def merge_forecasts(pred_list: List[pd.DataFrame]) -> pd.DataFrame:
+    """Merge a list of forecast DataFrames.
+
+    Parameters
+    ----------
+    pred_list : List[pd.DataFrame]
+        Each DataFrame should contain predictions for a set of ``row_key``
+        values. Menu columns may have arbitrary spacing or capitalization.
+
+    Returns
+    -------
+    pd.DataFrame
+        Concatenated DataFrame whose column names are normalized via
+        :func:`normalize_series_name` and indexed by ``row_key``.
+    """
+
+    normed: List[pd.DataFrame] = []
+    for df in pred_list:
+        df2 = df.copy()
+        if "row_key" in df2.columns:
+            df2 = df2.set_index("row_key")
+        df2.columns = [normalize_series_name(c) for c in df2.columns]
+        normed.append(df2)
+    return pd.concat(normed, ignore_index=False)
 
 
 def parse_row_key(row_key: str) -> Tuple[str, int]:
