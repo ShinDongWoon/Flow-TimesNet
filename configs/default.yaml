@@ -23,7 +23,7 @@ preprocess:
 train:
   device: "cuda"              # "cuda"|"cpu" 자동 선택 코드에서 처리
   epochs: 70
-  early_stopping_patience: null
+  early_stopping_patience: 5
   batch_size: 256
   lr: 2.0e-3
   weight_decay: 1.0e-6
