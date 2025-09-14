@@ -265,6 +265,9 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     best_state = None
     epochs = int(cfg["train"]["epochs"])
     grad_clip = float(cfg["train"]["grad_clip_norm"]) if cfg["train"]["grad_clip_norm"] else 0.0
+    patience_limit = cfg["train"].get("early_stopping_patience")
+    patience = 0
+    best_epoch = 0
 
     print_config(cfg)
     for ep in range(1, epochs + 1):
@@ -292,6 +295,19 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             best_state = clean_state_dict(
                 {k: v.detach().cpu() for k, v in model.state_dict().items()}
             )
+            best_epoch = ep
+            patience = 0
+        else:
+            patience += 1
+            if patience_limit is not None and patience > patience_limit:
+                console().print(
+                    f"[yellow]Early stopping at epoch {ep}; best epoch was {best_epoch} with val_wsmape={best_wsmape:.6f}[/yellow]"
+                )
+                break
+
+    console().print(
+        f"[bold]Best epoch {best_epoch} with val_wsmape={best_wsmape:.6f}[/bold]"
+    )
 
     # --- save artifacts
     art_dir = cfg["artifacts"]["dir"]
