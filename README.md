@@ -8,3 +8,4 @@
 - Simple data augmentation can be enabled via the `data.augment` section of the config.
   - `add_noise_std`: standard deviation of Gaussian noise added to input windows.
   - `time_shift`: maximum number of time steps to randomly shift each window's start index.
+- Configuration option `model.inception_kernel_set` has been renamed to `model.kernel_set`. The previous name is still accepted for backward compatibility.

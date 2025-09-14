@@ -232,7 +232,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         d_model=int(cfg["model"]["d_model"]),
         n_layers=int(cfg["model"]["n_layers"]),
         k_periods=int(cfg["model"]["k_periods"]),
-        kernel_set=list(cfg["model"]["inception_kernel_set"]),
+        kernel_set=list(cfg["model"]["kernel_set"]),
         dropout=float(cfg["model"]["dropout"]),
         activation=str(cfg["model"]["activation"]),
         mode=mode,

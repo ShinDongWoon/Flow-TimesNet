@@ -54,7 +54,7 @@ model:
   n_layers: 3
   dropout: 0.1
   k_periods: 4
-  inception_kernel_set: [3, 5, 7]
+  kernel_set: [3, 5, 7]
   activation: "gelu"
 
 tuning:
