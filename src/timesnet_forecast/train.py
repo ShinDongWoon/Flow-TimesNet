@@ -186,6 +186,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         shuffle=False, drop_last=False,
         recursive_pred_len=(pred_len if mode == "recursive" else None)
     )
+    if len(dl_val.dataset) == 0:
+        raise ValueError("Validation split has no windows; increase train.val.holdout_days or adjust model.input_len/pred_len.")
 
     # --- model
     model = TimesNet(

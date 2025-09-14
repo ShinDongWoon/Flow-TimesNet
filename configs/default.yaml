@@ -33,7 +33,7 @@ train:
   channels_last: false
   val:
     strategy: "holdout"       # "holdout"|"rolling"
-    holdout_days: 28
+    holdout_days: 35          # must be >= model.input_len + model.pred_len
     rolling_folds: 3
     rolling_step_days: 14
 
