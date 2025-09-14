@@ -167,8 +167,26 @@ def parse_row_key(row_key: str) -> Tuple[str, int]:
     return part, day_num
 
 
-def format_submission(sample_df: pd.DataFrame, preds_by_test: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+def format_submission(
+    sample_df: pd.DataFrame,
+    preds_by_date,
+    date_col: str | None = None,
+) -> pd.DataFrame:
     out = sample_df.copy()
+    if date_col:
+        menu_cols = [c for c in out.columns if c != date_col]
+        out[date_col] = pd.to_datetime(out[date_col])
+        for i, row in out.iterrows():
+            current_date = row[date_col]
+            if current_date in preds_by_date.index:
+                vals = preds_by_date.loc[current_date]
+                out.loc[i, menu_cols] = vals.reindex(menu_cols).fillna(0.0).values
+            else:
+                out.loc[i, menu_cols] = 0.0
+        return out
+
+    # Fallback to legacy row_key based lookup
+    preds_by_test = preds_by_date
     menu_cols = [c for c in out.columns if c != "row_key"]
     for i, row in out.iterrows():
         rk = row["row_key"]
