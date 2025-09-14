@@ -70,13 +70,14 @@ class PeriodicityTransform(nn.Module):
         idx_c = torch.arange(Cmax, device=x.device)
         idx_p = torch.arange(Pmax, device=x.device)
 
-        base = (T - take)[..., None, None]  # [BN, K, 1, 1]
+        base = torch.clamp(T - take, min=0)[..., None, None]
         P_exp = P[..., None, None]
         indices = base + idx_c.view(1, 1, -1, 1) * P_exp + idx_p.view(1, 1, 1, -1)
+        indices = indices.clamp(min=0, max=T - 1)
 
         # Gather segments for all sequences
         seqs_exp = seqs.unsqueeze(1).unsqueeze(2).expand(-1, K, Cmax, -1)
-        gathered = torch.gather(seqs_exp, dim=-1, index=indices.clamp(max=T - 1))
+        gathered = torch.gather(seqs_exp, dim=-1, index=indices)
 
         mask_c = idx_c.view(1, 1, -1, 1) < cycles[..., None, None]
         mask_p = idx_p.view(1, 1, 1, -1) < P[..., None, None]

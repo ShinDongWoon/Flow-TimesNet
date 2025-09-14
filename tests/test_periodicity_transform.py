@@ -81,3 +81,48 @@ def test_periodicity_transform_matches_naive():
     out_ref = _periodicity_transform_naive(x, k)
     assert torch.allclose(out_vec, out_ref, atol=1e-6)
 
+
+def test_periodicity_transform_take_gt_T_with_compile():
+    """Regression test for take > T with torch.compile."""
+    torch.manual_seed(0)
+    B, T, N = 1, 5, 1
+    x = torch.randn(B, T, N)
+
+    class DegenerateTransform(PeriodicityTransform):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+            B, T, N = x.shape
+            seqs = x.permute(0, 2, 1).reshape(B * N, T)
+            kidx = torch.ones(B * N, self.k, dtype=torch.long, device=x.device)
+            K = kidx.size(1)
+            # Force P larger than T so that take > T
+            P = torch.full_like(kidx, T + 2)
+            cycles = torch.ones_like(kidx)
+            take = cycles * P
+
+            Pmax = int(P.max().item())
+            Cmax = int(cycles.max().item())
+            idx_c = torch.arange(Cmax, device=x.device)
+            idx_p = torch.arange(Pmax, device=x.device)
+
+            base = torch.clamp(T - take, min=0)[..., None, None]
+            P_exp = P[..., None, None]
+            indices = base + idx_c.view(1, 1, -1, 1) * P_exp + idx_p.view(1, 1, 1, -1)
+            indices = indices.clamp(min=0, max=T - 1)
+
+            seqs_exp = seqs.unsqueeze(1).unsqueeze(2).expand(-1, K, Cmax, -1)
+            gathered = torch.gather(seqs_exp, dim=-1, index=indices)
+
+            mask_c = idx_c.view(1, 1, -1, 1) < cycles[..., None, None]
+            mask_p = idx_p.view(1, 1, 1, -1) < P[..., None, None]
+            mask = mask_c & mask_p
+            gathered = gathered * mask
+
+            seg = gathered.sum(dim=2) / torch.clamp(cycles[..., None], min=1)
+            seg = seg.view(B, N, K, Pmax).permute(0, 2, 3, 1)
+            return seg
+
+    transform = DegenerateTransform(k_periods=1)
+    compiled = torch.compile(transform)
+    out = compiled(x)
+    assert out.shape[2] == T + 2
+
