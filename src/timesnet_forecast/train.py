@@ -245,8 +245,32 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     if cfg["train"]["compile"]:
         model = maybe_compile(model, True)
 
-    # --- optimizer / loss
-    optim = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"]["lr"]), weight_decay=float(cfg["train"]["weight_decay"]))
+    # --- optimizer / scheduler / loss
+    optim = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(cfg["train"]["lr"]),
+        weight_decay=float(cfg["train"]["weight_decay"]),
+    )
+
+    sched_cfg = cfg["train"].get("lr_scheduler", {})
+    scheduler: torch.optim.lr_scheduler._LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None
+    sched_type = sched_cfg.get("type")
+    if sched_type == "ReduceLROnPlateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optim,
+            mode="min",
+            factor=float(sched_cfg.get("factor", 0.1)),
+            patience=int(sched_cfg.get("patience", 10)),
+            threshold=float(sched_cfg.get("threshold", 1e-4)),
+            min_lr=float(sched_cfg.get("min_lr", 0.0)),
+        )
+    elif sched_type == "StepLR":
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optim,
+            step_size=int(sched_cfg.get("step_size", 10)),
+            gamma=float(sched_cfg.get("gamma", 0.1)),
+        )
+
     try:
         grad_scaler = torch.amp.GradScaler(
             device_type=device.type,
@@ -290,6 +314,11 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
 
         val_wsmape = _eval_wsmape(model, dl_val, device, mode, ids, pred_len, store_weights)
         console().print(f"[bold]Epoch {ep}[/bold] loss={np.mean(losses):.6f}  val_wsmape={val_wsmape:.6f}")
+        if scheduler is not None:
+            if sched_type == "ReduceLROnPlateau":
+                scheduler.step(val_wsmape)
+            else:
+                scheduler.step()
         if val_wsmape < best_wsmape:
             best_wsmape = val_wsmape
             best_state = clean_state_dict(
