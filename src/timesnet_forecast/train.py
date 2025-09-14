@@ -13,7 +13,13 @@ from tqdm import tqdm
 from .config import Config, save_yaml
 from .utils.logging import console, print_config
 from .utils.seed import seed_everything
-from .utils.torch_opt import amp_autocast, maybe_channels_last, maybe_compile, move_to_device
+from .utils.torch_opt import (
+    amp_autocast,
+    maybe_channels_last,
+    maybe_compile,
+    move_to_device,
+    clean_state_dict,
+)
 from .utils.metrics import smape_grouped
 from .utils import io as io_utils
 from .data.split import make_holdout_slices, make_rolling_slices
@@ -256,13 +262,18 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         console().print(f"[bold]Epoch {ep}[/bold] loss={np.mean(losses):.6f}  val_smape={val_smape:.6f}")
         if val_smape < best_smape:
             best_smape = val_smape
-            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            best_state = clean_state_dict(
+                {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            )
 
     # --- save artifacts
     art_dir = cfg["artifacts"]["dir"]
     os.makedirs(art_dir, exist_ok=True)
     model_path = os.path.join(art_dir, cfg["artifacts"]["model_file"])
-    torch.save(best_state if best_state is not None else model.state_dict(), model_path)
+    torch.save(
+        best_state if best_state is not None else clean_state_dict(model.state_dict()),
+        model_path,
+    )
 
     # Save scaler/schema/config
     scaler_path = os.path.join(art_dir, cfg["artifacts"]["scaler_file"])

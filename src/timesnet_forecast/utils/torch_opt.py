@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Dict, Optional
 import contextlib
 import torch
-from torch import nn
+from torch import nn, Tensor
 
 
 def amp_autocast(enabled: bool):
@@ -34,6 +34,13 @@ def maybe_compile(module: nn.Module, enabled: bool) -> nn.Module:
         # graceful fallback
         print(f"[WARN] torch.compile failed: {e}. Fallback to eager.")
     return module
+
+
+def clean_state_dict(state: Dict[str, Tensor]) -> Dict[str, Tensor]:
+    return {
+        k.replace("_orig_mod.", "", 1) if k.startswith("_orig_mod.") else k: v
+        for k, v in state.items()
+    }
 
 
 def move_to_device(x: torch.Tensor, device: torch.device) -> torch.Tensor:
