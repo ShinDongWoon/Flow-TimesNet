@@ -99,13 +99,14 @@ def predict_once(cfg: Dict) -> str:
 
     # Iterate test parts
     test_dir = cfg_used["data"]["test_dir"]
-    enc = cfg_used["data"]["encoding"]
-    sample = pd.read_csv(cfg_used["data"]["sample_submission"], encoding=enc)
+    sample = pd.read_csv(
+        cfg_used["data"]["sample_submission"], encoding="utf-8-sig"
+    )
     preds_by_test: Dict[str, pd.DataFrame] = {}
 
     test_files = sorted(glob(os.path.join(test_dir, "TEST_*.csv")))
     for fp in test_files:
-        df = pd.read_csv(fp, encoding=enc)
+        df = pd.read_csv(fp)
         wide = io_utils.pivot_long_to_wide(
             df, date_col=schema["date"], id_col=schema["id"], target_col=schema["target"],
             fill_missing_dates=cfg_used["data"]["fill_missing_dates"], fillna0=True
