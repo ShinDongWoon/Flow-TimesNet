@@ -28,6 +28,28 @@ from .models.timesnet import TimesNet
 from .predict import forecast_recursive_batch
 
 
+class WSMAPELoss(nn.Module):
+    """Differentiable approximation of weighted SMAPE.
+
+    Computes ``2 * |y_pred - y_true| / (|y_true| + |y_pred| + eps)`` and
+    averages across all elements. Points where the actual value is exactly
+    zero contribute a zero weight to avoid unstable gradients.
+    """
+
+    def __init__(self, eps: float = 1e-8) -> None:
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        denom = torch.abs(y_true) + torch.abs(y_pred) + self.eps
+        diff = torch.abs(y_pred - y_true)
+        loss = 2.0 * diff / denom
+        mask = (torch.abs(y_true) > self.eps).float()
+        if mask.sum() == 0:
+            return torch.zeros((), device=y_pred.device, dtype=y_pred.dtype)
+        return (loss * mask).sum() / mask.sum()
+
+
 def _select_device(req: str) -> torch.device:
     if req == "cuda" and torch.cuda.is_available():
         return torch.device("cuda:0")
@@ -236,7 +258,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             device=device.type,
             enabled=cfg["train"]["amp"] and device.type == "cuda",
         )
-    loss_fn = nn.MSELoss()
+    loss_fn = WSMAPELoss()
 
     # --- training loop
     best_wsmape = float("inf")
