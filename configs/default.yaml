@@ -18,6 +18,7 @@ preprocess:
   normalize: "zscore"         # zscore|minmax|none
   normalize_per_series: true
   eps: 1.0e-8
+  clip_negative: true
 
 train:
   device: "cuda"              # "cuda"|"cpu" 자동 선택 코드에서 처리

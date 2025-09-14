@@ -141,6 +141,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         df, date_col=schema["date"], id_col=schema["id"], target_col=schema["target"],
         fill_missing_dates=cfg["data"]["fill_missing_dates"], fillna0=True
     )
+    if cfg.get("preprocess", {}).get("clip_negative", False):
+        wide = wide.clip(lower=0.0)
     ids = list(wide.columns)
 
     # --- normalization (FIT ONLY ON TRAIN PART to avoid leakage)
