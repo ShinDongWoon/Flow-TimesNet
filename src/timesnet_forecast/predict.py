@@ -96,7 +96,7 @@ def predict_once(cfg: Dict) -> str:
     test_dir = cfg_used["data"]["test_dir"]
     enc = cfg_used["data"]["encoding"]
     sample = pd.read_csv(cfg_used["data"]["sample_submission"], encoding=enc)
-    pred_frames: List[pd.DataFrame] = []
+    preds_by_test: Dict[str, pd.DataFrame] = {}
 
     test_files = sorted(glob(os.path.join(test_dir, "TEST_*.csv")))
     for fp in test_files:
@@ -140,13 +140,14 @@ def predict_once(cfg: Dict) -> str:
         last_date = wide.index.max()
         forecast_idx = pd.date_range(last_date + pd.Timedelta(days=1), periods=H, freq="D")
         pred_df = pd.DataFrame(P, index=forecast_idx, columns=ids)
-        pred_frames.append(pred_df)
 
-    preds_by_date = pd.concat(pred_frames)
+        test_name = os.path.splitext(os.path.basename(fp))[0]
+        preds_by_test[test_name] = pred_df
+
     # Format submission
     sub = io_utils.format_submission(
         sample,
-        preds_by_date,
+        preds_by_test,
         cfg_used["submission"].get("date_col", schema["date"]),
     )
     os.makedirs(os.path.dirname(cfg_used["submission"]["out_path"]), exist_ok=True)

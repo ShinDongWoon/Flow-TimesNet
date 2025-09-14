@@ -169,36 +169,21 @@ def parse_row_key(row_key: str) -> Tuple[str, int]:
 
 def format_submission(
     sample_df: pd.DataFrame,
-    preds_by_date,
-    date_col: str | None = None,
+    preds_by_test: Dict[str, pd.DataFrame],
+    date_col: str,
 ) -> pd.DataFrame:
     out = sample_df.copy()
-    if date_col:
-        menu_cols = [c for c in out.columns if c != date_col]
-        out[date_col] = pd.to_datetime(out[date_col])
-        for i, row in out.iterrows():
-            current_date = row[date_col]
-            if current_date in preds_by_date.index:
-                vals = preds_by_date.loc[current_date]
-                out.loc[i, menu_cols] = vals.reindex(menu_cols).fillna(0.0).values
-            else:
-                out.loc[i, menu_cols] = 0.0
-        return out
-
-    # Fallback to legacy row_key based lookup
-    preds_by_test = preds_by_date
-    menu_cols = [c for c in out.columns if c != "row_key"]
+    menu_cols = [c for c in out.columns if c != date_col]
     for i, row in out.iterrows():
-        rk = row["row_key"]
+        rk = row[date_col]
         test_part, day_num = parse_row_key(rk)
         P = preds_by_test.get(test_part)
-        if P is None:
+        if P is None or (day_num - 1) not in range(len(P)):
             out.loc[i, menu_cols] = 0.0
+            out.loc[i, date_col] = pd.NaT
             continue
-        drow = f"D{day_num}"
-        if drow not in P.index:
-            out.loc[i, menu_cols] = 0.0
-            continue
-        vals = P.loc[drow]
+        out.loc[i, date_col] = P.index[day_num - 1]
+        vals = P.iloc[day_num - 1]
         out.loc[i, menu_cols] = vals.reindex(menu_cols).fillna(0.0).values
+    out[date_col] = pd.to_datetime(out[date_col])
     return out
