@@ -56,16 +56,21 @@ class PeriodicityTransform(nn.Module):
         # Flatten batch & channel for joint processing
         seqs = x.permute(0, 2, 1).reshape(B * N, T)  # [BN, T]
 
+        if self.k <= 0:
+            return x.new_zeros(B, 0, 1, N)
+
         kidx = self._topk_freq(seqs, self.k)  # [BN, K]
         K = kidx.size(1)
+        if K == 0 or kidx.numel() == 0:
+            return x.new_zeros(B, 0, 1, N)
 
         # Compute period lengths and cycles
         P = torch.clamp(T // torch.clamp(kidx, min=1), min=1)  # [BN, K]
         cycles = torch.clamp(T // P, min=1)  # [BN, K]
         take = cycles * P
 
-        Pmax = int(P.max().item())
-        Cmax = int(cycles.max().item())
+        Pmax = max(1, int(P.max().item()))
+        Cmax = max(1, int(cycles.max().item()))
 
         idx_c = torch.arange(Cmax, device=x.device)
         idx_p = torch.arange(Pmax, device=x.device)
