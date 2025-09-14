@@ -74,6 +74,8 @@ def cmd_tune(args: argparse.Namespace) -> None:
         # train_once returns best val_smape
         val_smape, _ = train_once(cfg)
         trial.report(val_smape, step=1)
+        if trial.should_prune():
+            raise optuna.TrialPruned()
         return val_smape
 
     study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
