@@ -56,7 +56,6 @@ model:
   k_periods: 4
   kernel_set: [3, 5, 7]
   activation: "gelu"
-  series_chunk: 128
 
 tuning:
   enabled: true
