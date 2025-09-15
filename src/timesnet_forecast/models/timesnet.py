@@ -8,18 +8,12 @@ from torch.utils.checkpoint import checkpoint
 
 
 class PeriodicityTransform(nn.Module):
-    """
-    FFT 기반으로 상위 k 주파수를 골라 2D로 접는 근사 구현.
-    아이디어:
-      - 배치/채널을 한 번에 처리하여 rFFT 스펙트럼에서 에너지가 큰 순서대로 k개 빈도를 선택
-      - 각 선택된 빈도 f에 대해 period_len = max(1, T // f)
-      - 마지막 (cycles * period_len) 구간을 [cycles, period_len]로 접어 평균(축=0)해 [period_len] 시퀀스를 얻음
-      - 모든 채널에서 가장 긴 period_len을 찾아 전 채널이 공유하는 P_max까지 pad하여 [B, K, P_max, N] 텐서 구성
-    """
+    """Approximate period folding via FFT."""
 
-    def __init__(self, k_periods: int) -> None:
+    def __init__(self, k_periods: int, pmax: int) -> None:
         super().__init__()
         self.k = int(k_periods)
+        self.pmax = int(max(1, pmax))
 
     @staticmethod
     def _topk_freq(x: torch.Tensor, k: int) -> torch.Tensor:
@@ -66,11 +60,12 @@ class PeriodicityTransform(nn.Module):
             return x.new_zeros(B, 0, 1, N)
 
         # Compute period lengths and cycles
-        P = torch.clamp(T // torch.clamp(kidx, min=1), min=1)  # [BN, K]
+        P = torch.clamp(T // torch.clamp(kidx, min=1), min=1)
+        P = torch.clamp(P, max=self.pmax)  # [BN, K]
         cycles = torch.clamp(T // P, min=1)  # [BN, K]
         take = cycles * P
 
-        Pmax = max(1, int(P.max().item()))
+        Pmax = self.pmax
         Cmax = max(1, int(cycles.max().item()))
 
         idx_c = torch.arange(Cmax, device=x.device)
@@ -165,6 +160,7 @@ class TimesNet(nn.Module):
         d_model: int,
         n_layers: int,
         k_periods: int,
+        pmax: int,
         kernel_set: List[int],
         dropout: float,
         activation: str,
@@ -175,7 +171,7 @@ class TimesNet(nn.Module):
         assert mode in ("direct", "recursive")
         self.mode = mode
         self.pred_len = int(pred_len)
-        self.period = PeriodicityTransform(k_periods=k_periods)
+        self.period = PeriodicityTransform(k_periods=k_periods, pmax=pmax)
         self.k = int(k_periods)
         self.act = activation
         # We don't know the period-length ``P`` at build time, so layers are built lazily
