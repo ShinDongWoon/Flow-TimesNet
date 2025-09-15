@@ -25,6 +25,7 @@ train:
   epochs: 70
   early_stopping_patience: 10
   batch_size: 64
+  accumulation_steps: 1
   lr: 1.0e-3
   weight_decay: 1.0e-6
   grad_clip_norm: 1.0
