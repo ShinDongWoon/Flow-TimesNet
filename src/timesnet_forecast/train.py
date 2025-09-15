@@ -405,6 +405,40 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     best_epoch = 0
     accum_steps = int(cfg["train"].get("accumulation_steps", 1))
 
+    use_graphs = bool(cfg["train"].get("cuda_graphs", False) and device.type == "cuda")
+    if use_graphs:
+        if accum_steps != 1:
+            raise ValueError("accumulation_steps must be 1 when using CUDA graphs")
+        xb0, yb0 = next(iter(dl_train))
+        xb0 = xb0.to(device, non_blocking=True)
+        yb0 = yb0.to(device, non_blocking=True)
+        if cfg["train"]["channels_last"] and xb0.dim() == 4:
+            xb0 = xb0.to(memory_format=torch.channels_last)
+        static_x = torch.empty_like(xb0)
+        static_y = torch.empty_like(yb0)
+        graph = torch.cuda.CUDAGraph()
+        optim.zero_grad(set_to_none=True)
+        model.eval()  # freeze dropout during capture
+        graph.capture_begin()
+        with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
+            static_out = model(static_x)
+            static_loss = loss_fn(static_out, static_y)
+        grad_scaler.scale(static_loss).backward()
+        graph.capture_end()
+        model.train()  # restore training mode for non-captured ops
+
+        def graph_step(xb: torch.Tensor, yb: torch.Tensor) -> float:
+            static_x.copy_(xb)
+            static_y.copy_(yb)
+            graph.replay()
+            if grad_clip and grad_clip > 0:
+                grad_scaler.unscale_(optim)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            grad_scaler.step(optim)
+            grad_scaler.update()
+            optim.zero_grad(set_to_none=True)
+            return static_loss.detach().item()
+
     print_config(cfg)
     for ep in range(1, epochs + 1):
         model.train()
@@ -416,19 +450,23 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             yb = yb.to(device, non_blocking=True)
             if cfg["train"]["channels_last"] and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
-            with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
-                out = model(xb)  # [B, H, N] or [B,1,N]
-                loss_val = loss_fn(out, yb)
-                loss = loss_val / accum_steps
-            grad_scaler.scale(loss).backward()
-            if (i + 1) % accum_steps == 0 or (i + 1) == num_batches:
-                if grad_clip and grad_clip > 0:
-                    grad_scaler.unscale_(optim)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                grad_scaler.step(optim)
-                grad_scaler.update()
-                optim.zero_grad(set_to_none=True)
-            losses.append(loss_val.item())
+            if use_graphs:
+                loss_val = graph_step(xb, yb)
+            else:
+                with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
+                    out = model(xb)  # [B, H, N] or [B,1,N]
+                    loss_val = loss_fn(out, yb)
+                    loss = loss_val / accum_steps
+                grad_scaler.scale(loss).backward()
+                if (i + 1) % accum_steps == 0 or (i + 1) == num_batches:
+                    if grad_clip and grad_clip > 0:
+                        grad_scaler.unscale_(optim)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    grad_scaler.step(optim)
+                    grad_scaler.update()
+                    optim.zero_grad(set_to_none=True)
+                loss_val = float(loss_val.item())
+            losses.append(loss_val)
 
         val_smape = _eval_smape(
             model,
