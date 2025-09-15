@@ -57,6 +57,16 @@ def _select_device(req: str) -> torch.device:
     return torch.device("cpu")
 
 
+def _should_use_cuda_graphs(train_cfg: Dict, device: torch.device) -> bool:
+    """Determine whether manual CUDA graph capture should be enabled."""
+
+    return bool(
+        train_cfg.get("cuda_graphs", False)
+        and device.type == "cuda"
+        and not train_cfg.get("compile", False)
+    )
+
+
 def _build_dataloader(
     arrays: List[np.ndarray],
     input_len: int,
@@ -418,7 +428,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     best_epoch = 0
     accum_steps = int(cfg["train"].get("accumulation_steps", 1))
 
-    use_graphs = bool(cfg["train"].get("cuda_graphs", False) and device.type == "cuda")
+    use_graphs = _should_use_cuda_graphs(cfg["train"], device)
     if use_graphs:
         warmup_iters = 3
         train_iter = iter(dl_train)
