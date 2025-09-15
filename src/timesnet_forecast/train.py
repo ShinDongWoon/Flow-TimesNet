@@ -261,6 +261,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         dropout=float(cfg["model"]["dropout"]),
         activation=str(cfg["model"]["activation"]),
         mode=mode,
+        series_chunk=int(cfg["model"].get("series_chunk", 128)),
     ).to(device)
 
     # Lazily build model parameters so that downstream utilities see them

@@ -145,6 +145,7 @@ class TimesNet(nn.Module):
         dropout: float,
         activation: str,
         mode: str,
+        series_chunk: int = 128,
     ) -> None:
         super().__init__()
         assert mode in ("direct", "recursive")
@@ -166,6 +167,7 @@ class TimesNet(nn.Module):
         self.dropout = float(dropout)
         self.d_model = int(d_model)
         self.n_layers = int(n_layers)
+        self.series_chunk = int(series_chunk)
 
     def _build_lazy(self, L: int, x: torch.Tensor) -> None:
         """Instantiate convolutional blocks once input length is known.
@@ -202,16 +204,23 @@ class TimesNet(nn.Module):
         """
         B, T, N = x.shape
         # Periodicity folding -> [B, K, P, N]
-        z = self.period(x)
-        _, K, P, _ = z.shape
-        # Treat each series independently: [B*N, 1, K*P]
-        z = z.permute(0, 3, 1, 2).contiguous().view(B * N, 1, K * P)
-        if not self._lazy_built:
-            self._build_lazy(L=K * P, x=z)
-        # Convolutional stack over temporal dimension
-        z = self.stem(z)            # [B*N, d_model, K*P]
-        z = self.blocks(z)          # [B*N, d_model, K*P]
-        z = self.pool(z).squeeze(-1)  # [B*N, d_model]
-        z = z.view(B, N, self.d_model)  # [B, N, d_model]
-        y = self.head(z)            # [B, N, out_steps]
-        return y.permute(0, 2, 1)   # [B, out_steps, N]
+        z_all = self.period(x)
+        _, K, P, _ = z_all.shape
+
+        outs = []
+        chunk = int(self.series_chunk) if self.series_chunk > 0 else N
+        for s in range(0, N, chunk):
+            e = min(s + chunk, N)
+            z = z_all[..., s:e]  # [B, K, P, n_chunk]
+            n = e - s
+            z = z.permute(0, 3, 1, 2).contiguous().view(B * n, 1, K * P)
+            if not self._lazy_built:
+                self._build_lazy(L=K * P, x=z)
+            z = self.stem(z)  # [B*n, d_model, K*P]
+            z = self.blocks(z)  # [B*n, d_model, K*P]
+            z = self.pool(z).squeeze(-1)  # [B*n, d_model]
+            z = z.view(B, n, self.d_model)  # [B, n, d_model]
+            y = self.head(z)  # [B, n, out_steps]
+            outs.append(y)
+        y_all = torch.cat(outs, dim=1)  # [B, N, out_steps]
+        return y_all.permute(0, 2, 1)  # [B, out_steps, N]

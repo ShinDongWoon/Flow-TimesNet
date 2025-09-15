@@ -82,6 +82,7 @@ def predict_once(cfg: Dict) -> str:
         dropout=float(cfg_used["model"]["dropout"]),
         activation=str(cfg_used["model"]["activation"]),
         mode=str(cfg_used["model"]["mode"]),
+        series_chunk=int(cfg_used["model"].get("series_chunk", 128)),
     ).to(device)
     # Lazily construct layers (independent of number of series now).
     dummy = torch.zeros(1, 1, 1, device=device)
