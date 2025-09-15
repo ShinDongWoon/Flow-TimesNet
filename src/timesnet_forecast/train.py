@@ -24,7 +24,7 @@ from .utils.metrics import wsmape_grouped, smape_mean
 from .utils import io as io_utils
 from .data.split import make_holdout_slices, make_rolling_slices
 from .data.dataset import SlidingWindowDataset
-from .models.timesnet import TimesNet
+from .models.timesnet import TimesNet, PeriodicityTransform
 from .predict import forecast_recursive_batch
 
 
@@ -89,6 +89,35 @@ def _build_dataloader(
         prefetch_factor=prefetch_factor if num_workers > 0 else 2,
         drop_last=drop_last,
     )
+
+
+def _compute_pmax_global(arrays: List[np.ndarray], k: int) -> int:
+    """Compute global maximum period length across training arrays.
+
+    Uses :meth:`PeriodicityTransform._topk_freq` to determine dominant
+    frequencies for each series and derives the corresponding period lengths.
+
+    Args:
+        arrays: List of training arrays shaped ``[T, N]``.
+        k: Number of top frequencies to consider.
+
+    Returns:
+        Maximum period length observed across all arrays.
+    """
+
+    pmax = 1
+    if k <= 0:
+        return pmax
+    for arr in arrays:
+        if arr.size == 0:
+            continue
+        x = torch.from_numpy(arr.T.astype(np.float32))  # [N, T]
+        kidx = PeriodicityTransform._topk_freq(x, k)
+        if kidx.numel() == 0:
+            continue
+        periods = torch.clamp(x.shape[-1] // torch.clamp(kidx, min=1), min=1)
+        pmax = max(pmax, int(periods.max().item()))
+    return pmax
 
 
 def _eval_wsmape(
@@ -242,6 +271,12 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         ):
             train_arrays.append(tr_df.to_numpy(copy=False))
             val_arrays.append(va_df.to_numpy(copy=False))
+
+    # --- compute global period length
+    k_periods = int(cfg["model"].get("k_periods", 0))
+    pmax_global = _compute_pmax_global(train_arrays, k_periods)
+    cfg.setdefault("model", {})
+    cfg["model"]["pmax"] = int(pmax_global)
 
     # --- dataloaders
     input_len = int(cfg["model"]["input_len"])
