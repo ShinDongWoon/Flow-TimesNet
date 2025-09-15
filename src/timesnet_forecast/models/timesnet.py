@@ -4,6 +4,7 @@ from typing import List
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class PeriodicityTransform(nn.Module):
@@ -16,14 +17,9 @@ class PeriodicityTransform(nn.Module):
       - 모든 채널에서 가장 긴 period_len을 찾아 전 채널이 공유하는 P_max까지 pad하여 [B, K, P_max, N] 텐서 구성
     """
 
-    def __init__(self, k_periods: int, series_chunk: int = 0) -> None:
+    def __init__(self, k_periods: int) -> None:
         super().__init__()
         self.k = int(k_periods)
-        # Process at most ``series_chunk`` sequences at a time in ``forward`` to
-        # avoid constructing large [BN, K, Cmax, Pmax] tensors.  A value of 0
-        # disables chunking and preserves the previous fully-vectorised
-        # behaviour.
-        self.series_chunk = int(series_chunk)
 
     @staticmethod
     def _topk_freq(x: torch.Tensor, k: int) -> torch.Tensor:
@@ -81,32 +77,20 @@ class PeriodicityTransform(nn.Module):
         idx_p = torch.arange(Pmax, device=x.device)
 
         BN = B * N
-        chunk = self.series_chunk if self.series_chunk > 0 else BN
-        seg_all = x.new_zeros(BN, K, Pmax)
+        base = torch.clamp(T - take, min=0)[..., None, None]
+        P_exp = P[..., None, None]
+        indices = base + idx_c.view(1, 1, -1, 1) * P_exp + idx_p.view(1, 1, 1, -1)
+        indices = indices.clamp(min=0, max=T - 1)
 
-        for s in range(0, BN, chunk):
-            e = min(s + chunk, BN)
-            seq_chunk = seqs[s:e]
-            P_chunk = P[s:e]
-            cycles_chunk = cycles[s:e]
-            take_chunk = take[s:e]
+        seqs_exp = seqs.unsqueeze(1).unsqueeze(2).expand(BN, K, Cmax, -1)
+        gathered = torch.gather(seqs_exp, dim=-1, index=indices)
 
-            base = torch.clamp(T - take_chunk, min=0)[..., None, None]
-            P_exp = P_chunk[..., None, None]
-            indices = base + idx_c.view(1, 1, -1, 1) * P_exp + idx_p.view(1, 1, 1, -1)
-            indices = indices.clamp(min=0, max=T - 1)
+        mask_c = idx_c.view(1, 1, -1, 1) < cycles[..., None, None]
+        mask_p = idx_p.view(1, 1, 1, -1) < P[..., None, None]
+        mask = mask_c & mask_p
+        gathered = gathered * mask
 
-            seqs_exp = seq_chunk.unsqueeze(1).unsqueeze(2).expand(-1, K, Cmax, -1)
-            gathered = torch.gather(seqs_exp, dim=-1, index=indices)
-
-            mask_c = idx_c.view(1, 1, -1, 1) < cycles_chunk[..., None, None]
-            mask_p = idx_p.view(1, 1, 1, -1) < P_chunk[..., None, None]
-            mask = mask_c & mask_p
-            gathered = gathered * mask
-
-            seg = gathered.sum(dim=2) / torch.clamp(cycles_chunk[..., None], min=1)
-            seg_all[s:e] = seg
-
+        seg_all = gathered.sum(dim=2) / torch.clamp(cycles[..., None], min=1)
         seg_all = seg_all.view(B, N, K, Pmax).permute(0, 2, 3, 1)  # [B, K, Pmax, N]
         return seg_all
 
@@ -162,22 +146,17 @@ class TimesNet(nn.Module):
         dropout: float,
         activation: str,
         mode: str,
-        series_chunk: int = 128,
     ) -> None:
         super().__init__()
         assert mode in ("direct", "recursive")
         self.mode = mode
         self.pred_len = int(pred_len)
-        # Share the ``series_chunk`` value with the periodicity transform so that
-        # both stages limit memory usage when processing many series.
-        self.period = PeriodicityTransform(k_periods=k_periods, series_chunk=series_chunk)
+        self.period = PeriodicityTransform(k_periods=k_periods)
         self.k = int(k_periods)
         self.act = activation
-        # Conv will process each series independently along the temporal dimension.
         # We don't know the period-length ``P`` at build time, so layers are built lazily
         # during the first forward pass once the flattened length ``K*P`` is known.
-        self.stem: nn.Module = nn.Identity()
-        self.blocks: nn.Module = nn.Identity()
+        self.blocks: nn.ModuleList = nn.ModuleList()
         self.pool: nn.Module = nn.Identity()
         self.head: nn.Module = nn.Identity()
         self._lazy_built = False
@@ -185,7 +164,6 @@ class TimesNet(nn.Module):
         self.dropout = float(dropout)
         self.d_model = int(d_model)
         self.n_layers = int(n_layers)
-        self.series_chunk = int(series_chunk)
 
     def _build_lazy(self, x: torch.Tensor) -> None:
         """Instantiate convolutional blocks on first use.
@@ -193,18 +171,18 @@ class TimesNet(nn.Module):
         Args:
             x: reference tensor for device/dtype placement
         """
-        # Stem that maps each series (treated as a separate "batch" item) from 1 → d_model channels.
-        self.stem = nn.Conv1d(in_channels=1, out_channels=self.d_model, kernel_size=1).to(
-            device=x.device, dtype=x.dtype
-        )
-        blocks = []
+        blocks = [
+            nn.Conv1d(in_channels=1, out_channels=self.d_model, kernel_size=1).to(
+                device=x.device, dtype=x.dtype
+            )
+        ]
         for _ in range(self.n_layers):
             blocks.append(
                 InceptionBlock(
                     self.d_model, self.d_model, self.kernel_set, self.dropout, self.act
                 ).to(device=x.device, dtype=x.dtype)
             )
-        self.blocks = nn.Sequential(*blocks)
+        self.blocks = nn.ModuleList(blocks)
         # Pool only over the temporal dimension; series dimension is preserved.
         self.pool = nn.AdaptiveAvgPool1d(1)
         out_steps = self.pred_len if self.mode == "direct" else 1
@@ -220,24 +198,15 @@ class TimesNet(nn.Module):
           recursive: [B, 1, N]
         """
         B, T, N = x.shape
-        # Periodicity folding -> [B, K, P, N]
         z_all = self.period(x)
         _, K, P, _ = z_all.shape
 
-        outs = []
-        chunk = int(self.series_chunk) if self.series_chunk > 0 else N
-        for s in range(0, N, chunk):
-            e = min(s + chunk, N)
-            z = z_all[..., s:e]  # [B, K, P, n_chunk]
-            n = e - s
-            z = z.permute(0, 3, 1, 2).contiguous().view(B * n, 1, K * P)
-            if not self._lazy_built:
-                self._build_lazy(x=z)
-            z = self.stem(z)  # [B*n, d_model, K*P]
-            z = self.blocks(z)  # [B*n, d_model, K*P]
-            z = self.pool(z).squeeze(-1)  # [B*n, d_model]
-            z = z.view(B, n, self.d_model)  # [B, n, d_model]
-            y = self.head(z)  # [B, n, out_steps]
-            outs.append(y)
-        y_all = torch.cat(outs, dim=1)  # [B, N, out_steps]
-        return y_all.permute(0, 2, 1)  # [B, out_steps, N]
+        z = z_all.permute(0, 3, 1, 2).reshape(B * N, 1, K * P)
+        if not self._lazy_built:
+            self._build_lazy(x=z)
+        for blk in self.blocks:
+            z = checkpoint(blk, z, use_reentrant=False)
+        z = self.pool(z).squeeze(-1)
+        z = z.view(B, N, self.d_model)
+        y_all = self.head(z)
+        return y_all.permute(0, 2, 1)
