@@ -83,9 +83,9 @@ def predict_once(cfg: Dict) -> str:
         activation=str(cfg_used["model"]["activation"]),
         mode=str(cfg_used["model"]["mode"]),
     ).to(device)
-    # Lazily constructed layers depend on number of series (channels).
-    dummy = torch.zeros(1, len(ids), 1, device=device)
-    model._build_lazy(N=len(ids), L=1, x=dummy)
+    # Lazily construct layers (independent of number of series now).
+    dummy = torch.zeros(1, 1, 1, device=device)
+    model._build_lazy(L=1, x=dummy)
     state = torch.load(model_file, map_location="cpu")
     # Checkpoints saved with torch.compile or DataParallel may prefix parameter names.
     clean_state = {

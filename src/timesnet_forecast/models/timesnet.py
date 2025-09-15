@@ -154,23 +154,28 @@ class TimesNet(nn.Module):
         self.k = int(k_periods)
         self.incept: List[InceptionBlock] = []
         self.act = activation
-        # Conv will see channels = N (series), length = K*P
-        # We don't know P at build time; use lightweight identity modules that will
-        # be replaced lazily with proper layers on the first forward pass.
+        # Conv will process each series independently along the temporal dimension.
+        # We don't know the period-length ``P`` at build time, so layers are built lazily
+        # during the first forward pass once the flattened length ``K*P`` is known.
         self.stem: nn.Module = nn.Identity()
         self.blocks: nn.Module = nn.Identity()
         self.pool: nn.Module = nn.Identity()
         self.head: nn.Module = nn.Identity()
-        # We'll lazily init convs on first forward when N and P are known
         self._lazy_built = False
         self.kernel_set = kernel_set
         self.dropout = float(dropout)
         self.d_model = int(d_model)
         self.n_layers = int(n_layers)
 
-    def _build_lazy(self, N: int, L: int, x: torch.Tensor) -> None:
-        # N known (channels), L known (length=K*P)
-        self.stem = nn.Conv1d(in_channels=N, out_channels=self.d_model, kernel_size=1).to(
+    def _build_lazy(self, L: int, x: torch.Tensor) -> None:
+        """Instantiate convolutional blocks once input length is known.
+
+        Args:
+            L: flattened temporal length (``K*P``)
+            x: reference tensor for device/dtype placement
+        """
+        # Stem that maps each series (treated as a separate "batch" item) from 1 → d_model channels.
+        self.stem = nn.Conv1d(in_channels=1, out_channels=self.d_model, kernel_size=1).to(
             device=x.device, dtype=x.dtype
         )
         blocks = []
@@ -181,11 +186,10 @@ class TimesNet(nn.Module):
                 ).to(device=x.device, dtype=x.dtype)
             )
         self.blocks = nn.Sequential(*blocks)
-        # Global pooling over length
+        # Pool only over the temporal dimension; series dimension is preserved.
         self.pool = nn.AdaptiveAvgPool1d(1)
-        # Head: map d_model -> pred_len or 1 per channel N, but we pooled length only.
-        # We'll predict for each series independently by a linear over features then expand to N.
         out_steps = self.pred_len if self.mode == "direct" else 1
+        # Linear head operates independently for each series on the feature dimension.
         self.head = nn.Linear(self.d_model, out_steps).to(device=x.device, dtype=x.dtype)
         self._lazy_built = True
 
@@ -200,15 +204,14 @@ class TimesNet(nn.Module):
         # Periodicity folding -> [B, K, P, N]
         z = self.period(x)
         _, K, P, _ = z.shape
-        # Rearrange to conv-friendly: [B, N, K*P]
-        z = z.permute(0, 3, 1, 2).contiguous().view(B, N, K * P)
+        # Treat each series independently: [B*N, 1, K*P]
+        z = z.permute(0, 3, 1, 2).contiguous().view(B * N, 1, K * P)
         if not self._lazy_built:
-            self._build_lazy(N=N, L=K * P, x=z)
-        # Shared conv along "length" axis (time-like)
-        z = self.stem(z)            # [B, d_model, K*P]
-        z = self.blocks(z)          # [B, d_model, K*P]
-        z = self.pool(z).squeeze(-1)  # [B, d_model]
-        y = self.head(z)            # [B, H]
-        # expand to all N channels (shared head per series)
-        y = y.unsqueeze(-1).expand(B, y.size(1), N)  # [B, H, N]
-        return y
+            self._build_lazy(L=K * P, x=z)
+        # Convolutional stack over temporal dimension
+        z = self.stem(z)            # [B*N, d_model, K*P]
+        z = self.blocks(z)          # [B*N, d_model, K*P]
+        z = self.pool(z).squeeze(-1)  # [B*N, d_model]
+        z = z.view(B, N, self.d_model)  # [B, N, d_model]
+        y = self.head(z)            # [B, N, out_steps]
+        return y.permute(0, 2, 1)   # [B, out_steps, N]
