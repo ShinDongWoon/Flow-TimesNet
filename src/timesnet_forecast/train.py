@@ -8,7 +8,6 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, ConcatDataset
-import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
@@ -81,33 +80,24 @@ def _build_dataloader(
     drop_last: bool,
     recursive_pred_len: int | None = None,
     augment: Dict | None = None,
-    pad_to: int | None = None,
+    pmax_global: int | None = None,
 ) -> DataLoader:
     datasets = [
-        SlidingWindowDataset(a, input_len, pred_len, mode, recursive_pred_len, augment)
+        SlidingWindowDataset(
+            a,
+            input_len,
+            pred_len,
+            mode,
+            recursive_pred_len,
+            augment,
+            pmax_global=pmax_global,
+        )
         for a in arrays
     ]
     if len(datasets) == 1:
         ds = datasets[0]
     else:
         ds = ConcatDataset(datasets)
-    def _collate(batch):
-        xs, ys = zip(*batch)
-        if pad_to is not None:
-            xs_pad = []
-            for x in xs:
-                if x.size(0) < pad_to:
-                    pad_len = pad_to - x.size(0)
-                    xs_pad.append(F.pad(x, (0, 0, pad_len, 0)))
-                elif x.size(0) > pad_to:
-                    xs_pad.append(x[-pad_to:, :])
-                else:
-                    xs_pad.append(x)
-            xs = xs_pad
-        xb = torch.stack(xs, dim=0)
-        yb = torch.stack(ys, dim=0)
-        return xb, yb
-
     return DataLoader(
         ds,
         batch_size=batch_size,
@@ -117,7 +107,6 @@ def _build_dataloader(
         persistent_workers=(persistent_workers and num_workers > 0),
         prefetch_factor=prefetch_factor if num_workers > 0 else 2,
         drop_last=drop_last,
-        collate_fn=_collate if pad_to is not None else None,
     )
 
 
@@ -328,7 +317,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         train_arrays, input_len, pred_len, mode, cfg["train"]["batch_size"],
         cfg["train"]["num_workers"], cfg["train"]["pin_memory"], cfg["train"]["persistent_workers"],
         cfg["train"]["prefetch_factor"], shuffle=True, drop_last=True,
-        augment=cfg["data"].get("augment"), pad_to=pmax_global,
+        augment=cfg["data"].get("augment"), pmax_global=pmax_global,
     )
     dl_val = _build_dataloader(
         val_arrays, input_len, pred_len, mode, batch_size=cfg["train"]["batch_size"],
@@ -336,7 +325,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         persistent_workers=cfg["train"]["persistent_workers"], prefetch_factor=cfg["train"]["prefetch_factor"],
         shuffle=False, drop_last=False,
         recursive_pred_len=(pred_len if mode == "recursive" else None),
-        augment=None, pad_to=pmax_global,
+        augment=None, pmax_global=pmax_global,
     )
     if len(dl_val.dataset) == 0:
         raise ValueError("Validation split has no windows; increase train.val.holdout_days or adjust model.input_len/pred_len.")
