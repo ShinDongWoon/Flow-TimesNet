@@ -153,7 +153,6 @@ class TimesNet(nn.Module):
         self.pred_len = int(pred_len)
         self.period = PeriodicityTransform(k_periods=k_periods)
         self.k = int(k_periods)
-        self.incept: List[InceptionBlock] = []
         self.act = activation
         # Conv will process each series independently along the temporal dimension.
         # We don't know the period-length ``P`` at build time, so layers are built lazily
