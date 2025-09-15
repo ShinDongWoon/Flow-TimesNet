@@ -341,25 +341,30 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     patience_limit = cfg["train"].get("early_stopping_patience")
     patience = 0
     best_epoch = 0
+    accum_steps = int(cfg["train"].get("accumulation_steps", 1))
 
     print_config(cfg)
     for ep in range(1, epochs + 1):
         model.train()
         losses: List[float] = []
-        for xb, yb in tqdm(dl_train, desc=f"Epoch {ep}/{epochs}", leave=False):
+        optim.zero_grad(set_to_none=True)
+        num_batches = len(dl_train)
+        for i, (xb, yb) in enumerate(tqdm(dl_train, desc=f"Epoch {ep}/{epochs}", leave=False)):
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
-            optim.zero_grad(set_to_none=True)
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                 out = model(xb)  # [B, H, N] or [B,1,N]
-                loss = loss_fn(out, yb)
+                loss_val = loss_fn(out, yb)
+                loss = loss_val / accum_steps
             grad_scaler.scale(loss).backward()
-            if grad_clip and grad_clip > 0:
-                grad_scaler.unscale_(optim)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            grad_scaler.step(optim)
-            grad_scaler.update()
-            losses.append(loss.item())
+            if (i + 1) % accum_steps == 0 or (i + 1) == num_batches:
+                if grad_clip and grad_clip > 0:
+                    grad_scaler.unscale_(optim)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                grad_scaler.step(optim)
+                grad_scaler.update()
+                optim.zero_grad(set_to_none=True)
+            losses.append(loss_val.item())
 
         val_smape = _eval_smape(model, dl_val, device, mode, ids, pred_len)
         console().print(f"[bold]Epoch {ep}[/bold] loss={np.mean(losses):.6f}  val_smape={val_smape:.6f}")
