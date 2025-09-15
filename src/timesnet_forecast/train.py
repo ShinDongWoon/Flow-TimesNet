@@ -16,7 +16,6 @@ from .utils.logging import console, print_config
 from .utils.seed import seed_everything
 from .utils.torch_opt import (
     amp_autocast,
-    maybe_channels_last,
     maybe_compile,
     move_to_device,
     clean_state_dict,
@@ -100,6 +99,7 @@ def _eval_wsmape(
     ids: List[str],
     pred_len: int,
     weights: Dict[str, float] | None = None,
+    channels_last: bool = False,
 ) -> float:
     model.eval()
     ys: List[np.ndarray] = []
@@ -108,6 +108,8 @@ def _eval_wsmape(
         for xb, yb in loader:
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
+            if channels_last and xb.dim() == 4:
+                xb = xb.to(memory_format=torch.channels_last)
             if mode == "direct":
                 out = model(xb)  # [B, H, N]
             else:
@@ -128,6 +130,7 @@ def _eval_smape(
     mode: str,
     ids: List[str],
     pred_len: int,
+    channels_last: bool = False,
 ) -> float:
     model.eval()
     ys: List[np.ndarray] = []
@@ -136,6 +139,8 @@ def _eval_smape(
         for xb, yb in loader:
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
+            if channels_last and xb.dim() == 4:
+                xb = xb.to(memory_format=torch.channels_last)
             if mode == "direct":
                 out = model(xb)  # [B, H, N]
             else:
@@ -270,15 +275,15 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         dropout=float(cfg["model"]["dropout"]),
         activation=str(cfg["model"]["activation"]),
         mode=mode,
+        channels_last=cfg["train"]["channels_last"],
     ).to(device)
 
     # Lazily build model parameters so that downstream utilities see them
     with torch.no_grad():
         dummy = torch.zeros(1, input_len, len(ids), device=device)
         model(dummy)
-
-    if cfg["train"]["channels_last"]:
-        model = maybe_channels_last(model, True)
+        if cfg["train"]["channels_last"]:
+            model.to(memory_format=torch.channels_last)
     if cfg["train"]["compile"]:
         model = maybe_compile(model, True)
 
@@ -352,6 +357,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         for i, (xb, yb) in enumerate(tqdm(dl_train, desc=f"Epoch {ep}/{epochs}", leave=False)):
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
+            if cfg["train"]["channels_last"] and xb.dim() == 4:
+                xb = xb.to(memory_format=torch.channels_last)
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                 out = model(xb)  # [B, H, N] or [B,1,N]
                 loss_val = loss_fn(out, yb)
@@ -366,7 +373,15 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 optim.zero_grad(set_to_none=True)
             losses.append(loss_val.item())
 
-        val_smape = _eval_smape(model, dl_val, device, mode, ids, pred_len)
+        val_smape = _eval_smape(
+            model,
+            dl_val,
+            device,
+            mode,
+            ids,
+            pred_len,
+            cfg["train"]["channels_last"],
+        )
         console().print(f"[bold]Epoch {ep}[/bold] loss={np.mean(losses):.6f}  val_smape={val_smape:.6f}")
         if scheduler is not None:
             if sched_type == "ReduceLROnPlateau":
