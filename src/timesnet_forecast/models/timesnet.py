@@ -66,9 +66,9 @@ class PeriodicityTransform(nn.Module):
         take = cycles * P
 
         Pmax = self.pmax
-        Cmax = max(1, int(cycles.max().item()))
-
-        idx_c = torch.arange(Cmax, device=x.device)
+        # Keep ``Cmax`` as a tensor to avoid ``.item()`` which breaks GPU capture
+        Cmax_t = torch.clamp(cycles.max(), min=1)
+        idx_c = torch.arange(Cmax_t, device=x.device)
         idx_p = torch.arange(Pmax, device=x.device)
 
         BN = B * N
@@ -77,7 +77,9 @@ class PeriodicityTransform(nn.Module):
         indices = base + idx_c.view(1, 1, -1, 1) * P_exp + idx_p.view(1, 1, 1, -1)
         indices = indices.clamp(min=0, max=T - 1)
 
-        seqs_exp = seqs.unsqueeze(1).unsqueeze(2).expand(BN, K, Cmax, -1)
+        seqs_exp = (
+            seqs.unsqueeze(1).unsqueeze(2).expand(BN, K, idx_c.size(0), -1)
+        )
         gathered = torch.gather(seqs_exp, dim=-1, index=indices)
 
         mask_c = idx_c.view(1, 1, -1, 1) < cycles[..., None, None]
