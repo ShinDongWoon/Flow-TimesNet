@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Iterator, Tuple
 import pandas as pd
 
 
@@ -13,18 +13,21 @@ def make_holdout_slices(wide_df: pd.DataFrame, holdout_days: int) -> Tuple[pd.Da
 
 def make_rolling_slices(
     wide_df: pd.DataFrame, folds: int, step_days: int, val_len: int
-) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
+) -> Iterator[Tuple[pd.DataFrame, pd.DataFrame]]:
+    """Yield rolling train/validation slices from the tail.
+
+    Each fold shifts the validation window back by ``step_days``. Slices are
+    returned as views into ``wide_df`` without copying so that downstream code
+    can process one fold at a time without holding multiple copies of the data
+    in memory.
     """
-    Build rolling folds from the tail. Each fold shifts back by step_days.
-    """
-    out: List[Tuple[pd.DataFrame, pd.DataFrame]] = []
+
     end = len(wide_df)
     for k in range(folds):
         val_end = end - k * step_days
         val_start = max(0, val_end - val_len)
-        trn = wide_df.iloc[:val_start].copy()
-        val = wide_df.iloc[val_start:val_end].copy()
+        trn = wide_df.iloc[:val_start]
+        val = wide_df.iloc[val_start:val_end]
         if len(val) == 0 or len(trn) == 0:
             break
-        out.append((trn, val))
-    return out
+        yield trn, val
