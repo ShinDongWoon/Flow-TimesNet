@@ -231,10 +231,11 @@ class TimesNet(nn.Module):
           recursive: [B, 1, N]
         """
         B, T, N = x.shape
-        z_all = self.period(x)
+        x_tail = x[:, -self.input_len:, :]
+        z_all = self.period(x_tail)
         if z_all.size(1) == 0:
             out_steps = self.pred_len if self.mode == "direct" else 1
-            return x.new_zeros(B, out_steps, N)
+            return x_tail.new_zeros(B, out_steps, N)
 
         z = z_all[:, :, -self.input_len:, :]  # [B, K, input_len, N]
         K = z.size(1)
