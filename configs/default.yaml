@@ -23,18 +23,17 @@ preprocess:
 train:
   device: "cuda"              # "cuda"|"cpu" 자동 선택 코드에서 처리
   epochs: 70
-  early_stopping_patience: 3
+  early_stopping_patience: 10
   batch_size: 64
-  lr: 2.0e-3
+  lr: 1.0e-3
   weight_decay: 1.0e-6
   grad_clip_norm: 1.0
   amp: true
   compile: true
   lr_scheduler:
-    type: null               # "StepLR" | "ReduceLROnPlateau" | null
-    step_size: 10            # for StepLR
-    gamma: 0.1               # for StepLR
-    patience: 5              # for ReduceLROnPlateau
+    type: "cosine"
+    T_max: ${train.epochs}   # or explicit integer
+    eta_min: 1.0e-5
   matmul_precision: "medium"
   num_workers: 4
   pin_memory: true
