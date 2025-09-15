@@ -200,18 +200,21 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         train_arrays = [trn_norm.values.astype(np.float32)]
         val_arrays = [val_norm.values.astype(np.float32)]
     else:
-        folds = make_rolling_slices(
-            wide, cfg["train"]["val"]["rolling_folds"], cfg["train"]["val"]["rolling_step_days"], cfg["train"]["val"]["holdout_days"]
+        val_cfg = cfg["train"]["val"]
+        fold_iter = make_rolling_slices(
+            wide, val_cfg["rolling_folds"], val_cfg["rolling_step_days"], val_cfg["holdout_days"]
         )
-        train_arrays, val_arrays = [], []
-        # Fit scaler on full concatenated train parts (union) to avoid leakage into their val
-        trn_concat = pd.concat([tr for tr, _ in folds], axis=0)
-        scaler, trn_concat_norm = io_utils.fit_series_scaler(
-            trn_concat, cfg["preprocess"]["normalize"], cfg["preprocess"]["normalize_per_series"], cfg["preprocess"]["eps"]
+        try:
+            first_tr, _ = next(fold_iter)
+        except StopIteration:
+            raise ValueError("No folds produced; check rolling validation configuration")
+
+        scaler, _ = io_utils.fit_series_scaler(
+            first_tr, cfg["preprocess"]["normalize"], cfg["preprocess"]["normalize_per_series"], cfg["preprocess"]["eps"]
         )
-        # Recompute per fold using fitted scaler:
+
         def _transform_df(df_: pd.DataFrame) -> pd.DataFrame:
-            X = df_.values.astype(np.float32)
+            X = df_.to_numpy(dtype=np.float32, copy=True)
             out = np.zeros_like(X, dtype=np.float32)
             for j, c in enumerate(ids):
                 if cfg["preprocess"]["normalize"] == "zscore":
@@ -225,9 +228,14 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                     out[:, j] = X[:, j]
             return pd.DataFrame(out, index=df_.index, columns=ids)
 
-        for tr, va in folds:
-            train_arrays.append(_transform_df(tr).values.astype(np.float32))
-            val_arrays.append(_transform_df(va).values.astype(np.float32))
+        wide_norm = _transform_df(wide)
+        train_arrays: List[np.ndarray] = []
+        val_arrays: List[np.ndarray] = []
+        for tr_df, va_df in make_rolling_slices(
+            wide_norm, val_cfg["rolling_folds"], val_cfg["rolling_step_days"], val_cfg["holdout_days"]
+        ):
+            train_arrays.append(tr_df.to_numpy(copy=False))
+            val_arrays.append(va_df.to_numpy(copy=False))
 
     # --- dataloaders
     input_len = int(cfg["model"]["input_len"])
