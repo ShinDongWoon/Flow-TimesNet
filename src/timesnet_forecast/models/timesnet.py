@@ -166,6 +166,7 @@ class TimesNet(nn.Module):
         activation: str,
         mode: str,
         channels_last: bool = False,
+        use_checkpoint: bool = True,
     ) -> None:
         super().__init__()
         assert mode in ("direct", "recursive")
@@ -185,6 +186,7 @@ class TimesNet(nn.Module):
         self.d_model = int(d_model)
         self.n_layers = int(n_layers)
         self.channels_last = bool(channels_last)
+        self.use_checkpoint = bool(use_checkpoint)
 
     def _build_lazy(self, x: torch.Tensor) -> None:
         """Instantiate convolutional blocks on first use.
@@ -237,7 +239,7 @@ class TimesNet(nn.Module):
         if self.channels_last:
             z = z.unsqueeze(-1).contiguous(memory_format=torch.channels_last)
         for blk in self.blocks:
-            z = checkpoint(blk, z, use_reentrant=False)
+            z = checkpoint(blk, z, use_reentrant=False) if self.use_checkpoint else blk(z)
         if self.channels_last:
             z = z.squeeze(-1)
         z = self.pool(z).squeeze(-1)

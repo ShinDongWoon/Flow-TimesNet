@@ -84,6 +84,7 @@ def predict_once(cfg: Dict) -> str:
         activation=str(cfg_used["model"]["activation"]),
         mode=str(cfg_used["model"]["mode"]),
         channels_last=cfg_used["train"]["channels_last"],
+        use_checkpoint=not cfg_used["train"].get("cuda_graphs", False),
     ).to(device)
     # Lazily construct layers (independent of number of series now).
     dummy = torch.zeros(1, 1, 1, device=device)

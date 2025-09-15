@@ -31,6 +31,7 @@ train:
   grad_clip_norm: 1.0
   amp: true
   compile: true
+  cuda_graphs: false
   lr_scheduler:
     type: "cosine"
     T_max: ${train.epochs}   # or explicit integer
