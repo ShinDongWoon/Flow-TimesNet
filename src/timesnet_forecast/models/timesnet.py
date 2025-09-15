@@ -168,11 +168,10 @@ class TimesNet(nn.Module):
         self.n_layers = int(n_layers)
         self.series_chunk = int(series_chunk)
 
-    def _build_lazy(self, L: int, x: torch.Tensor) -> None:
-        """Instantiate convolutional blocks once input length is known.
+    def _build_lazy(self, x: torch.Tensor) -> None:
+        """Instantiate convolutional blocks on first use.
 
         Args:
-            L: flattened temporal length (``K*P``)
             x: reference tensor for device/dtype placement
         """
         # Stem that maps each series (treated as a separate "batch" item) from 1 → d_model channels.
@@ -214,7 +213,7 @@ class TimesNet(nn.Module):
             n = e - s
             z = z.permute(0, 3, 1, 2).contiguous().view(B * n, 1, K * P)
             if not self._lazy_built:
-                self._build_lazy(L=K * P, x=z)
+                self._build_lazy(x=z)
             z = self.stem(z)  # [B*n, d_model, K*P]
             z = self.blocks(z)  # [B*n, d_model, K*P]
             z = self.pool(z).squeeze(-1)  # [B*n, d_model]

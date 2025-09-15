@@ -86,7 +86,7 @@ def predict_once(cfg: Dict) -> str:
     ).to(device)
     # Lazily construct layers (independent of number of series now).
     dummy = torch.zeros(1, 1, 1, device=device)
-    model._build_lazy(L=1, x=dummy)
+    model._build_lazy(x=dummy)
     state = torch.load(model_file, map_location="cpu")
     # Checkpoints saved with torch.compile or DataParallel may prefix parameter names.
     clean_state = {
