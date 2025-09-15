@@ -174,6 +174,7 @@ class TimesNet(nn.Module):
         self.pred_len = int(pred_len)
         self.period = PeriodicityTransform(k_periods=k_periods, pmax=pmax)
         self.k = int(k_periods)
+        self.input_len = int(input_len)
         self.act = activation
         # We don't know the period-length ``P`` at build time, so layers are built lazily
         # during the first forward pass once the flattened length ``K*P`` is known.
@@ -195,11 +196,11 @@ class TimesNet(nn.Module):
             x: reference tensor for device/dtype placement
         """
         if self.channels_last:
-            first = nn.Conv2d(1, self.d_model, kernel_size=(1, 1)).to(
+            first = nn.Conv2d(self.k, self.d_model, kernel_size=(1, 1)).to(
                 device=x.device, dtype=x.dtype
             )
         else:
-            first = nn.Conv1d(1, self.d_model, kernel_size=1).to(
+            first = nn.Conv1d(self.k, self.d_model, kernel_size=1).to(
                 device=x.device, dtype=x.dtype
             )
         blocks = [first]
@@ -231,10 +232,15 @@ class TimesNet(nn.Module):
         """
         B, T, N = x.shape
         z_all = self.period(x)
-        _, K, P, _ = z_all.shape
+        if z_all.size(1) == 0:
+            out_steps = self.pred_len if self.mode == "direct" else 1
+            return x.new_zeros(B, out_steps, N)
 
-        z = z_all.permute(0, 3, 1, 2).reshape(B * N, 1, K * P)
+        z = z_all[:, :, -self.input_len:, :]  # [B, K, input_len, N]
+        K = z.size(1)
+        z = z.permute(0, 3, 1, 2).reshape(B * N, K, self.input_len)
         if not self._lazy_built:
+            self.k = K
             self._build_lazy(x=z)
         if self.channels_last:
             z = z.unsqueeze(-1).contiguous(memory_format=torch.channels_last)
