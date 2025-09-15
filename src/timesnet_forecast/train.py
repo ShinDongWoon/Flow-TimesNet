@@ -294,7 +294,10 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
 
     # --- compute global period length
     k_periods = int(cfg["model"].get("k_periods", 0))
-    pmax_global = _compute_pmax_global(train_arrays, k_periods)
+    pmax_global = min(
+        _compute_pmax_global(train_arrays, k_periods),
+        cfg["model"].get("pmax_cap", 730),
+    )
     cfg.setdefault("model", {})
     cfg["model"]["pmax"] = int(pmax_global)
 

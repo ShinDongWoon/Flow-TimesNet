@@ -56,6 +56,7 @@ model:
   n_layers: 3
   dropout: 0.1
   k_periods: 4
+  pmax_cap: 730            # 2-year cap
   kernel_set: [3, 5, 7]
   activation: "gelu"
 
