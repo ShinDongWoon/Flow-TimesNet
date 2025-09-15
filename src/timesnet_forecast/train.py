@@ -20,7 +20,7 @@ from .utils.torch_opt import (
     move_to_device,
     clean_state_dict,
 )
-from .utils.metrics import wsmape_grouped
+from .utils.metrics import wsmape_grouped, smape_mean
 from .utils import io as io_utils
 from .data.split import make_holdout_slices, make_rolling_slices
 from .data.dataset import SlidingWindowDataset
@@ -98,7 +98,7 @@ def _eval_wsmape(
     mode: str,
     ids: List[str],
     pred_len: int,
-    weights: Dict[str, float],
+    weights: Dict[str, float] | None = None,
 ) -> float:
     model.eval()
     ys: List[np.ndarray] = []
@@ -117,7 +117,34 @@ def _eval_wsmape(
             ps.append(out.detach().float().cpu().numpy())
     Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
     P = np.concatenate(ps, axis=0).reshape(-1, len(ids))
-    return wsmape_grouped(Y, P, ids=ids, weights=weights)
+    return wsmape_grouped(Y, P, ids=ids, weights=None)
+
+
+def _eval_smape(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    mode: str,
+    ids: List[str],
+    pred_len: int,
+) -> float:
+    model.eval()
+    ys: List[np.ndarray] = []
+    ps: List[np.ndarray] = []
+    with torch.inference_mode(), amp_autocast(True if device.type == "cuda" else False):
+        for xb, yb in loader:
+            xb = move_to_device(xb, device)  # [B, L, N]
+            yb = move_to_device(yb, device)  # [B, H_or_1, N]
+            if mode == "direct":
+                out = model(xb)  # [B, H, N]
+            else:
+                out = forecast_recursive_batch(model, xb, pred_len)
+                out = out[:, : yb.shape[1], :]
+            ys.append(yb.detach().float().cpu().numpy())
+            ps.append(out.detach().float().cpu().numpy())
+    Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
+    P = np.concatenate(ps, axis=0).reshape(-1, len(ids))
+    return smape_mean(Y, P)
 
 
 def train_once(cfg: Dict) -> Tuple[float, Dict]:
@@ -133,10 +160,6 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     enc = cfg["data"]["encoding"]
     train_path = cfg["data"]["train_csv"]
     df = pd.read_csv(train_path, encoding=enc)
-    # compute store-level weights based on total target value
-    df["_id_norm"] = io_utils.build_id_col(df, schema["id"])
-    df["_store"] = df["_id_norm"].str.split("_", n=1).str[0]
-    store_weights = df.groupby("_store")[schema["target"]].sum().to_dict()
     wide = io_utils.pivot_long_to_wide(
         df, date_col=schema["date"], id_col=schema["id"], target_col=schema["target"],
         fill_missing_dates=cfg["data"]["fill_missing_dates"], fillna0=True
@@ -290,7 +313,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     loss_fn = WSMAPELoss()
 
     # --- training loop
-    best_wsmape = float("inf")
+    best_smape = float("inf")
     best_state = None
     epochs = int(cfg["train"]["epochs"])
     grad_clip = float(cfg["train"]["grad_clip_norm"]) if cfg["train"]["grad_clip_norm"] else 0.0
@@ -317,15 +340,15 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             grad_scaler.update()
             losses.append(loss.item())
 
-        val_wsmape = _eval_wsmape(model, dl_val, device, mode, ids, pred_len, store_weights)
-        console().print(f"[bold]Epoch {ep}[/bold] loss={np.mean(losses):.6f}  val_wsmape={val_wsmape:.6f}")
+        val_smape = _eval_smape(model, dl_val, device, mode, ids, pred_len)
+        console().print(f"[bold]Epoch {ep}[/bold] loss={np.mean(losses):.6f}  val_smape={val_smape:.6f}")
         if scheduler is not None:
             if sched_type == "ReduceLROnPlateau":
-                scheduler.step(val_wsmape)
+                scheduler.step(val_smape)
             else:
                 scheduler.step()
-        if val_wsmape < best_wsmape:
-            best_wsmape = val_wsmape
+        if val_smape < best_smape:
+            best_smape = val_smape
             best_state = clean_state_dict(
                 {k: v.detach().cpu() for k, v in model.state_dict().items()}
             )
@@ -335,12 +358,12 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             patience += 1
             if patience_limit is not None and patience > patience_limit:
                 console().print(
-                    f"[yellow]Early stopping at epoch {ep}; best epoch was {best_epoch} with val_wsmape={best_wsmape:.6f}[/yellow]"
+                    f"[yellow]Early stopping at epoch {ep}; best epoch was {best_epoch} with val_smape={best_smape:.6f}[/yellow]"
                 )
                 break
 
     console().print(
-        f"[bold]Best epoch {best_epoch} with val_wsmape={best_wsmape:.6f}[/bold]"
+        f"[bold]Best epoch {best_epoch} with val_smape={best_smape:.6f}[/bold]"
     )
 
     # --- save artifacts
@@ -363,7 +386,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     io_utils.save_json({"date": schema["date"], "target": schema["target"], "id": schema["id"]}, schema_path)
     save_yaml(cfg, cfg_path)
     console().print(f"[green]Saved:[/green] {model_path}, {scaler_path}, {schema_path}, {cfg_path}")
-    return best_wsmape, {"model": model_path, "scaler": scaler_path, "schema": schema_path, "config": cfg_path}
+    return best_smape, {"model": model_path, "scaler": scaler_path, "schema": schema_path, "config": cfg_path}
 
 
 def main() -> None:
@@ -374,8 +397,8 @@ def main() -> None:
     parser.add_argument("--override", nargs="*", default=[])
     args = parser.parse_args()
     cfg = Config.from_files(args.config, overrides=args.override).to_dict()
-    best_wsmape, paths = train_once(cfg)
-    console().print(f"[bold magenta]Final best WSMAPE: {best_wsmape:.6f}[/bold magenta]")
+    best_smape, paths = train_once(cfg)
+    console().print(f"[bold magenta]Final best SMAPE: {best_smape:.6f}[/bold magenta]")
 
 
 if __name__ == "__main__":
