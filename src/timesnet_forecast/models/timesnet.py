@@ -16,9 +16,14 @@ class PeriodicityTransform(nn.Module):
       - 모든 채널에서 가장 긴 period_len을 찾아 전 채널이 공유하는 P_max까지 pad하여 [B, K, P_max, N] 텐서 구성
     """
 
-    def __init__(self, k_periods: int) -> None:
+    def __init__(self, k_periods: int, series_chunk: int = 0) -> None:
         super().__init__()
         self.k = int(k_periods)
+        # Process at most ``series_chunk`` sequences at a time in ``forward`` to
+        # avoid constructing large [BN, K, Cmax, Pmax] tensors.  A value of 0
+        # disables chunking and preserves the previous fully-vectorised
+        # behaviour.
+        self.series_chunk = int(series_chunk)
 
     @staticmethod
     def _topk_freq(x: torch.Tensor, k: int) -> torch.Tensor:
@@ -75,23 +80,35 @@ class PeriodicityTransform(nn.Module):
         idx_c = torch.arange(Cmax, device=x.device)
         idx_p = torch.arange(Pmax, device=x.device)
 
-        base = torch.clamp(T - take, min=0)[..., None, None]
-        P_exp = P[..., None, None]
-        indices = base + idx_c.view(1, 1, -1, 1) * P_exp + idx_p.view(1, 1, 1, -1)
-        indices = indices.clamp(min=0, max=T - 1)
+        BN = B * N
+        chunk = self.series_chunk if self.series_chunk > 0 else BN
+        seg_all = x.new_zeros(BN, K, Pmax)
 
-        # Gather segments for all sequences
-        seqs_exp = seqs.unsqueeze(1).unsqueeze(2).expand(-1, K, Cmax, -1)
-        gathered = torch.gather(seqs_exp, dim=-1, index=indices)
+        for s in range(0, BN, chunk):
+            e = min(s + chunk, BN)
+            seq_chunk = seqs[s:e]
+            P_chunk = P[s:e]
+            cycles_chunk = cycles[s:e]
+            take_chunk = take[s:e]
 
-        mask_c = idx_c.view(1, 1, -1, 1) < cycles[..., None, None]
-        mask_p = idx_p.view(1, 1, 1, -1) < P[..., None, None]
-        mask = mask_c & mask_p
-        gathered = gathered * mask
+            base = torch.clamp(T - take_chunk, min=0)[..., None, None]
+            P_exp = P_chunk[..., None, None]
+            indices = base + idx_c.view(1, 1, -1, 1) * P_exp + idx_p.view(1, 1, 1, -1)
+            indices = indices.clamp(min=0, max=T - 1)
 
-        seg = gathered.sum(dim=2) / torch.clamp(cycles[..., None], min=1)
-        seg = seg.view(B, N, K, Pmax).permute(0, 2, 3, 1)  # [B, K, Pmax, N]
-        return seg
+            seqs_exp = seq_chunk.unsqueeze(1).unsqueeze(2).expand(-1, K, Cmax, -1)
+            gathered = torch.gather(seqs_exp, dim=-1, index=indices)
+
+            mask_c = idx_c.view(1, 1, -1, 1) < cycles_chunk[..., None, None]
+            mask_p = idx_p.view(1, 1, 1, -1) < P_chunk[..., None, None]
+            mask = mask_c & mask_p
+            gathered = gathered * mask
+
+            seg = gathered.sum(dim=2) / torch.clamp(cycles_chunk[..., None], min=1)
+            seg_all[s:e] = seg
+
+        seg_all = seg_all.view(B, N, K, Pmax).permute(0, 2, 3, 1)  # [B, K, Pmax, N]
+        return seg_all
 
 
 class InceptionBlock(nn.Module):
@@ -151,7 +168,9 @@ class TimesNet(nn.Module):
         assert mode in ("direct", "recursive")
         self.mode = mode
         self.pred_len = int(pred_len)
-        self.period = PeriodicityTransform(k_periods=k_periods)
+        # Share the ``series_chunk`` value with the periodicity transform so that
+        # both stages limit memory usage when processing many series.
+        self.period = PeriodicityTransform(k_periods=k_periods, series_chunk=series_chunk)
         self.k = int(k_periods)
         self.act = activation
         # Conv will process each series independently along the temporal dimension.
