@@ -9,3 +9,4 @@
   - `add_noise_std`: standard deviation of Gaussian noise added to input windows.
   - `time_shift`: maximum number of time steps to randomly shift each window's start index.
 - Configuration option `model.inception_kernel_set` has been renamed to `model.kernel_set`. The previous name is still accepted for backward compatibility.
+- Using CUDA Graphs (`train.cuda_graphs: true`) disables dropout because the model is placed in evaluation mode during graph capture. This trades regularization for faster execution.
