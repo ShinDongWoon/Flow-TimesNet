@@ -332,6 +332,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         activation=str(cfg["model"]["activation"]),
         mode=mode,
         channels_last=cfg["train"]["channels_last"],
+        use_checkpoint=not cfg["train"].get("cuda_graphs", False),
     ).to(device)
 
     # Lazily build model parameters so that downstream utilities see them
