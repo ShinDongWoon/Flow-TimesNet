@@ -100,8 +100,9 @@ def test_periodicity_transform_take_gt_T_with_compile():
             take = cycles * P
 
             Pmax = self.pmax
-            Cmax = int(cycles.max().item())
-            idx_c = torch.arange(Cmax, device=x.device)
+            # Keep ``Cmax`` tensor-based to avoid `.item()` for GPU capture
+            Cmax_t = torch.clamp(cycles.max(), min=1)
+            idx_c = torch.arange(Cmax_t, device=x.device)
             idx_p = torch.arange(Pmax, device=x.device)
 
             base = torch.clamp(T - take, min=0)[..., None, None]
@@ -109,7 +110,9 @@ def test_periodicity_transform_take_gt_T_with_compile():
             indices = base + idx_c.view(1, 1, -1, 1) * P_exp + idx_p.view(1, 1, 1, -1)
             indices = indices.clamp(min=0, max=T - 1)
 
-            seqs_exp = seqs.unsqueeze(1).unsqueeze(2).expand(-1, K, Cmax, -1)
+            seqs_exp = (
+                seqs.unsqueeze(1).unsqueeze(2).expand(-1, K, idx_c.size(0), -1)
+            )
             gathered = torch.gather(seqs_exp, dim=-1, index=indices)
 
             mask_c = idx_c.view(1, 1, -1, 1) < cycles[..., None, None]
