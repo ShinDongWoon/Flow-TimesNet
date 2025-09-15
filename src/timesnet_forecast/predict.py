@@ -9,7 +9,7 @@ import torch
 
 from .config import Config
 from .utils.logging import console
-from .utils.torch_opt import amp_autocast, maybe_channels_last
+from .utils.torch_opt import amp_autocast
 from .utils import io as io_utils
 from .models.timesnet import TimesNet
 
@@ -82,6 +82,7 @@ def predict_once(cfg: Dict) -> str:
         dropout=float(cfg_used["model"]["dropout"]),
         activation=str(cfg_used["model"]["activation"]),
         mode=str(cfg_used["model"]["mode"]),
+        channels_last=cfg_used["train"]["channels_last"],
     ).to(device)
     # Lazily construct layers (independent of number of series now).
     dummy = torch.zeros(1, 1, 1, device=device)
@@ -93,9 +94,9 @@ def predict_once(cfg: Dict) -> str:
         for k, v in state.items()
     }
     model.load_state_dict(clean_state)
-    model.eval()
     if cfg_used["train"]["channels_last"]:
-        model = maybe_channels_last(model, True)
+        model.to(memory_format=torch.channels_last)
+    model.eval()
 
     # Iterate test parts
     test_dir = cfg_used["data"]["test_dir"]
@@ -133,7 +134,15 @@ def predict_once(cfg: Dict) -> str:
         L = int(cfg_used["model"]["input_len"])
         H = int(cfg_used["model"]["pred_len"])
         last_seq = _pad_left_zeros(Xn, need_len=L)  # [L, N]
-        xb = torch.from_numpy(last_seq).unsqueeze(0).to(device, non_blocking=True)  # [1, L, N]
+        xb = torch.from_numpy(last_seq).unsqueeze(0)
+        if cfg_used["train"]["channels_last"]:
+            xb = xb.unsqueeze(-1).to(
+                device=device,
+                memory_format=torch.channels_last,
+                non_blocking=True,
+            ).squeeze(-1)
+        else:
+            xb = xb.to(device, non_blocking=True)
 
         with torch.inference_mode(), amp_autocast(cfg_used["train"]["amp"] and device.type == "cuda"):
             if cfg_used["model"]["mode"] == "direct":
