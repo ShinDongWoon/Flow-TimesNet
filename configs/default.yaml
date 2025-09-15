@@ -48,7 +48,7 @@ train:
     rolling_step_days: 14
 
 model:
-  mode: "direct"              # "direct"|"recursive"
+  mode: "recursive"              # "direct"|"recursive"
   input_len: 28
   pred_len: 7
   d_model: 256
