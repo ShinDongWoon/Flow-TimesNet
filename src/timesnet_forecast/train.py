@@ -8,6 +8,7 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, ConcatDataset
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 from .config import Config, save_yaml
@@ -289,6 +290,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         weight_decay=float(cfg["train"]["weight_decay"]),
     )
 
+    epochs = int(cfg["train"]["epochs"])
+
     sched_cfg = cfg["train"].get("lr_scheduler", {})
     scheduler: torch.optim.lr_scheduler._LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None
     sched_type = sched_cfg.get("type")
@@ -307,6 +310,17 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             step_size=int(sched_cfg.get("step_size", 10)),
             gamma=float(sched_cfg.get("gamma", 0.1)),
         )
+    elif sched_type == "cosine":
+        t_max_val = sched_cfg.get("T_max", epochs)
+        try:
+            t_max = int(t_max_val)
+        except (TypeError, ValueError):
+            t_max = epochs
+        scheduler = CosineAnnealingLR(
+            optim,
+            T_max=t_max,
+            eta_min=float(sched_cfg.get("eta_min", 1e-5)),
+        )
 
     try:
         grad_scaler = torch.amp.GradScaler(
@@ -324,7 +338,6 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     # --- training loop
     best_smape = float("inf")
     best_state = None
-    epochs = int(cfg["train"]["epochs"])
     grad_clip = float(cfg["train"]["grad_clip_norm"]) if cfg["train"]["grad_clip_norm"] else 0.0
     patience_limit = cfg["train"].get("early_stopping_patience")
     patience = 0
