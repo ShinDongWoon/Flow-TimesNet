@@ -62,7 +62,7 @@ def test_periodicity_transform_period_length_consistency():
     x += 0.01 * torch.randn_like(x)
 
     k = 1
-    transform = PeriodicityTransform(k)
+    transform = PeriodicityTransform(k, pmax=T)
     out = transform(x)
 
     assert out.shape[-1] == N
@@ -76,9 +76,9 @@ def test_periodicity_transform_matches_naive():
     torch.manual_seed(0)
     B, T, N, k = 3, 64, 4, 3
     x = torch.randn(B, T, N)
-    transform = PeriodicityTransform(k)
-    out_vec = transform(x)
     out_ref = _periodicity_transform_naive(x, k)
+    transform = PeriodicityTransform(k, pmax=out_ref.shape[2])
+    out_vec = transform(x)
     assert torch.allclose(out_vec, out_ref, atol=1e-6)
 
 
@@ -95,11 +95,11 @@ def test_periodicity_transform_take_gt_T_with_compile():
             kidx = torch.ones(B * N, self.k, dtype=torch.long, device=x.device)
             K = kidx.size(1)
             # Force P larger than T so that take > T
-            P = torch.full_like(kidx, T + 2)
+            P = torch.full_like(kidx, self.pmax)
             cycles = torch.ones_like(kidx)
             take = cycles * P
 
-            Pmax = int(P.max().item())
+            Pmax = self.pmax
             Cmax = int(cycles.max().item())
             idx_c = torch.arange(Cmax, device=x.device)
             idx_p = torch.arange(Pmax, device=x.device)
@@ -121,7 +121,7 @@ def test_periodicity_transform_take_gt_T_with_compile():
             seg = seg.view(B, N, K, Pmax).permute(0, 2, 3, 1)
             return seg
 
-    transform = DegenerateTransform(k_periods=1)
+    transform = DegenerateTransform(k_periods=1, pmax=T + 2)
     compiled = torch.compile(transform)
     out = compiled(x)
     assert out.shape[2] == T + 2

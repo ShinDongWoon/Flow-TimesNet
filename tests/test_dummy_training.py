@@ -35,6 +35,7 @@ def test_dummy_training_smape_wsmape():
         d_model=16,
         n_layers=2,
         k_periods=2,
+        pmax=input_len,
         kernel_set=[3],
         dropout=0.0,
         activation="gelu",
