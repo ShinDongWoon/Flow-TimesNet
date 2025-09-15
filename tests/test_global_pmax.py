@@ -19,8 +19,9 @@ def test_compute_pmax_global():
     s1 = np.sin(2 * math.pi * 5 * t / T)  # period 20
     s2 = np.sin(2 * math.pi * 2 * t / T)  # period 50
     arr = np.stack([s1, s2], axis=1)
-    pmax = _compute_pmax_global([arr], k=1)
+    pmax = _compute_pmax_global([arr], k=1, cap=100)
     assert pmax == 50
+    assert _compute_pmax_global([arr], k=1, cap=30) == 30
 
 
 def test_pmax_cap_applied(tmp_path, monkeypatch):
@@ -76,7 +77,11 @@ def test_pmax_cap_applied(tmp_path, monkeypatch):
     ]
     cfg = Config.from_files("configs/default.yaml", overrides=overrides).to_dict()
 
-    monkeypatch.setattr(train, "_compute_pmax_global", lambda arrays, k: 50)
+    def _fake_compute(arrays, k, cap):
+        assert cap == 5
+        return min(50, cap)
+
+    monkeypatch.setattr(train, "_compute_pmax_global", _fake_compute)
     train.train_once(cfg)
     assert cfg["model"]["pmax"] == 5
 

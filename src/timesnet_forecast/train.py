@@ -129,7 +129,7 @@ def _assert_min_len(x: torch.Tensor, pmax: int) -> None:
         )
 
 
-def _compute_pmax_global(arrays: List[np.ndarray], k: int) -> int:
+def _compute_pmax_global(arrays: List[np.ndarray], k: int, cap: int) -> int:
     """Compute global maximum period length across training arrays.
 
     Uses :meth:`PeriodicityTransform._topk_freq` to determine dominant
@@ -138,14 +138,15 @@ def _compute_pmax_global(arrays: List[np.ndarray], k: int) -> int:
     Args:
         arrays: List of training arrays shaped ``[T, N]``.
         k: Number of top frequencies to consider.
+        cap: Maximum allowed value for the inferred period length.
 
     Returns:
-        Maximum period length observed across all arrays.
+        Maximum period length observed across all arrays clipped to ``cap``.
     """
 
     pmax = 1
     if k <= 0:
-        return pmax
+        return min(pmax, cap)
     for arr in arrays:
         if arr.size == 0:
             continue
@@ -155,7 +156,7 @@ def _compute_pmax_global(arrays: List[np.ndarray], k: int) -> int:
             continue
         periods = torch.clamp(x.shape[-1] // torch.clamp(kidx, min=1), min=1)
         pmax = max(pmax, int(periods.max().item()))
-    return pmax
+    return min(pmax, cap)
 
 
 def _eval_wsmape(
@@ -314,10 +315,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
 
     # --- compute global period length
     k_periods = int(cfg["model"].get("k_periods", 0))
-    pmax_global = min(
-        _compute_pmax_global(train_arrays, k_periods),
-        cfg["model"].get("pmax_cap", 730),
-    )
+    pmax_cap = int(cfg["model"].get("pmax_cap", 730))
+    pmax_global = _compute_pmax_global(train_arrays, k_periods, pmax_cap)
     cfg.setdefault("model", {})
     cfg["model"]["pmax"] = int(pmax_global)
 
