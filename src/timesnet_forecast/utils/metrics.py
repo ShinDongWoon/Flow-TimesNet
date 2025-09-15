@@ -49,3 +49,19 @@ def wsmape_grouped(
         item_scores = [smape_item(y_true[:, j], y_pred[:, j]) for j in idxs]
         score += wnorm.get(st, 0.0) * (float(np.mean(item_scores)) if item_scores else 0.0)
     return float(score)
+
+
+def smape_mean(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-8) -> float:
+    """Mean symmetric MAPE across all series.
+
+    Uses the same masking strategy as :func:`_smape_np` in the unit tests:
+    only points where the actual value magnitude exceeds ``eps`` contribute
+    to the final mean.
+    """
+    assert y_true.shape == y_pred.shape, "y_true and y_pred must have same shape"
+    mask = np.abs(y_true) > eps
+    if not np.any(mask):
+        return 0.0
+    denom = np.abs(y_true) + np.abs(y_pred)
+    smape = 2.0 * np.abs(y_pred - y_true)[mask] / denom[mask]
+    return float(np.mean(smape))

@@ -9,14 +9,7 @@ import torch
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 from timesnet_forecast.models.timesnet import TimesNet
-from timesnet_forecast.utils.metrics import wsmape_grouped
-
-
-def _smape_np(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-8) -> float:
-    """Compute symmetric MAPE over the last axis."""
-    mask = np.abs(y_true) > eps
-    denom = np.abs(y_true) + np.abs(y_pred)
-    return float(np.mean(2.0 * np.abs(y_pred - y_true)[mask] / denom[mask]))
+from timesnet_forecast.utils.metrics import wsmape_grouped, smape_mean
 
 
 def test_dummy_training_smape_wsmape():
@@ -73,7 +66,7 @@ def test_dummy_training_smape_wsmape():
     y_true = actual.numpy()
     y_pred = pred.numpy()
 
-    smape = _smape_np(y_true, y_pred)
+    smape = smape_mean(y_true, y_pred)
     wsmape = wsmape_grouped(y_true, y_pred, ids=["A_1", "A_2"])
 
     assert smape < 0.1
