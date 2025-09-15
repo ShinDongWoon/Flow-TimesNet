@@ -40,7 +40,7 @@ train:
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 4
-  channels_last: false
+  channels_last: true
   val:
     strategy: "rolling"       # "holdout"|"rolling"
     holdout_days: 35          # must be >= model.input_len + model.pred_len
