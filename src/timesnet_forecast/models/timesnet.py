@@ -169,6 +169,7 @@ class TimesNet(nn.Module):
         dropout: float,
         activation: str,
         mode: str,
+        channels_last: bool = False,
     ) -> None:
         super().__init__()
         assert mode in ("direct", "recursive")
@@ -187,6 +188,7 @@ class TimesNet(nn.Module):
         self.dropout = float(dropout)
         self.d_model = int(d_model)
         self.n_layers = int(n_layers)
+        self.channels_last = bool(channels_last)
 
     def _build_lazy(self, x: torch.Tensor) -> None:
         """Instantiate convolutional blocks on first use.
@@ -194,15 +196,24 @@ class TimesNet(nn.Module):
         Args:
             x: reference tensor for device/dtype placement
         """
-        blocks = [
-            nn.Conv1d(in_channels=1, out_channels=self.d_model, kernel_size=1).to(
+        if self.channels_last:
+            first = nn.Conv2d(1, self.d_model, kernel_size=(1, 1)).to(
                 device=x.device, dtype=x.dtype
             )
-        ]
+        else:
+            first = nn.Conv1d(1, self.d_model, kernel_size=1).to(
+                device=x.device, dtype=x.dtype
+            )
+        blocks = [first]
         for _ in range(self.n_layers):
             blocks.append(
                 InceptionBlock(
-                    self.d_model, self.d_model, self.kernel_set, self.dropout, self.act
+                    self.d_model,
+                    self.d_model,
+                    self.kernel_set,
+                    self.dropout,
+                    self.act,
+                    channels_last=self.channels_last,
                 ).to(device=x.device, dtype=x.dtype)
             )
         self.blocks = nn.ModuleList(blocks)
@@ -227,8 +238,12 @@ class TimesNet(nn.Module):
         z = z_all.permute(0, 3, 1, 2).reshape(B * N, 1, K * P)
         if not self._lazy_built:
             self._build_lazy(x=z)
+        if self.channels_last:
+            z = z.unsqueeze(-1).contiguous(memory_format=torch.channels_last)
         for blk in self.blocks:
             z = checkpoint(blk, z, use_reentrant=False)
+        if self.channels_last:
+            z = z.squeeze(-1)
         z = self.pool(z).squeeze(-1)
         z = z.view(B, N, self.d_model)
         y_all = self.head(z)
