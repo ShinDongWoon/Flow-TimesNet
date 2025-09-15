@@ -111,6 +111,14 @@ def _build_dataloader(
     )
 
 
+def _assert_min_len(x: torch.Tensor, pmax: int) -> None:
+    """Ensure the sequence length meets the model's minimum requirement."""
+    if x.size(1) < pmax:
+        raise ValueError(
+            f"Sequence length {x.size(1)} is shorter than required pmax {pmax}."
+        )
+
+
 def _compute_pmax_global(arrays: List[np.ndarray], k: int) -> int:
     """Compute global maximum period length across training arrays.
 
@@ -159,6 +167,7 @@ def _eval_wsmape(
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
             if channels_last and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
+            _assert_min_len(xb, model.period.pmax)
             if mode == "direct":
                 out = model(xb)  # [B, H, N]
             else:
@@ -190,6 +199,7 @@ def _eval_smape(
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
             if channels_last and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
+            _assert_min_len(xb, model.period.pmax)
             if mode == "direct":
                 out = model(xb)  # [B, H, N]
             else:
@@ -421,6 +431,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             yb_w = yb_w.to(device, non_blocking=True)
             if cfg["train"]["channels_last"] and xb_w.dim() == 4:
                 xb_w = xb_w.to(memory_format=torch.channels_last)
+            _assert_min_len(xb_w, model.period.pmax)
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                 out_w = model(xb_w)
                 loss_w = loss_fn(out_w, yb_w) / accum_steps
@@ -449,6 +460,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         with torch.cuda.stream(capture_stream):
             graph.capture_begin()
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
+                _assert_min_len(static_x, model.period.pmax)
                 static_out = model(static_x)
                 static_loss = loss_fn(static_out, static_y)
                 static_scaled = static_loss / accum_steps
@@ -475,6 +487,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             yb = yb.to(device, non_blocking=True)
             if cfg["train"]["channels_last"] and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
+            _assert_min_len(xb, model.period.pmax)
             if use_graphs:
                 loss_val = graph_step(xb, yb)
             else:
