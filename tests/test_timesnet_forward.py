@@ -9,7 +9,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 from timesnet_forecast.models.timesnet import TimesNet
 
 
-def test_forward_shape_and_tail_processing():
+def test_forward_shape_and_head_processing():
     B, L, H, N = 2, 16, 4, 3
     torch.manual_seed(0)
 
@@ -37,5 +37,5 @@ def test_forward_shape_and_tail_processing():
 
     long_x = torch.randn(B, L + 5, N)
     out_long = model(long_x)
-    out_tail = model(long_x[:, -L:, :])
-    assert out_long.shape == out_tail.shape == (B, H, N)
+    out_head = model(long_x[:, :L, :])
+    assert out_long.shape == out_head.shape == (B, H, N)
