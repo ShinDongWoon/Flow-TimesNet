@@ -308,6 +308,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     pmax_global = _compute_pmax_global(train_arrays, k_periods, pmax_cap)
     cfg.setdefault("model", {})
     cfg["model"]["pmax"] = int(pmax_global)
+    min_period_threshold = int(cfg["model"].get("min_period_threshold", 1))
+    cfg["model"]["min_period_threshold"] = min_period_threshold
 
     # --- dataloaders
     input_len = int(cfg["model"]["input_len"])
@@ -338,6 +340,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         n_layers=int(cfg["model"]["n_layers"]),
         k_periods=int(cfg["model"]["k_periods"]),
         pmax=int(cfg["model"]["pmax"]),
+        min_period_threshold=min_period_threshold,
         kernel_set=list(cfg["model"]["kernel_set"]),
         dropout=float(cfg["model"]["dropout"]),
         activation=str(cfg["model"]["activation"]),

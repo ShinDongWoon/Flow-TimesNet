@@ -82,6 +82,28 @@ def test_periodicity_transform_matches_naive():
     assert torch.allclose(out_vec, out_ref, atol=1e-6)
 
 
+def test_periodicity_transform_min_period_threshold_expands_period():
+    class FixedFreqTransform(PeriodicityTransform):
+        def _topk_freq(self, x: torch.Tensor, k: int) -> torch.Tensor:  # type: ignore[override]
+            BN = x.shape[0]
+            return torch.full((BN, k), 20, dtype=torch.long, device=x.device)
+
+    x = torch.arange(1, 51, dtype=torch.float32).view(1, 50, 1)
+
+    low = FixedFreqTransform(k_periods=1, pmax=10, min_period_threshold=1)
+    high = FixedFreqTransform(k_periods=1, pmax=10, min_period_threshold=6)
+
+    out_low = low(x)
+    out_high = high(x)
+
+    # With the higher minimum period, more slots along P dimension remain populated.
+    nz_low = torch.count_nonzero(out_low.squeeze(0).squeeze(0).squeeze(-1))
+    nz_high = torch.count_nonzero(out_high.squeeze(0).squeeze(0).squeeze(-1))
+
+    assert nz_low.item() == 2  # T // 20 = 2 before applying threshold
+    assert nz_high.item() == 6  # Clamped up to the requested minimum
+
+
 def test_periodicity_transform_take_gt_T_with_compile():
     """Regression test for take > T with torch.compile."""
     torch.manual_seed(0)
