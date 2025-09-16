@@ -10,10 +10,14 @@ from torch.utils.checkpoint import checkpoint
 class PeriodicityTransform(nn.Module):
     """Approximate period folding via FFT."""
 
-    def __init__(self, k_periods: int, pmax: int) -> None:
+    def __init__(
+        self, k_periods: int, pmax: int, min_period_threshold: int = 1
+    ) -> None:
         super().__init__()
         self.k = int(k_periods)
         self.pmax = int(max(1, pmax))
+        min_thresh = int(max(1, min_period_threshold))
+        self.min_period_threshold = int(min(self.pmax, min_thresh))
 
     @staticmethod
     def _topk_freq(x: torch.Tensor, k: int) -> torch.Tensor:
@@ -60,8 +64,10 @@ class PeriodicityTransform(nn.Module):
             return x.new_zeros(B, 0, 1, N)
 
         # Compute period lengths and cycles
-        P = torch.clamp(T // torch.clamp(kidx, min=1), min=1)
-        P = torch.clamp(P, max=self.pmax)  # [BN, K]
+        P = T // torch.clamp(kidx, min=1)
+        P = torch.clamp(
+            P, min=self.min_period_threshold, max=self.pmax
+        )  # [BN, K]
         cycles = torch.clamp(T // P, min=1)  # [BN, K]
         take = cycles * P
 
@@ -167,6 +173,7 @@ class TimesNet(nn.Module):
         dropout: float,
         activation: str,
         mode: str,
+        min_period_threshold: int = 1,
         channels_last: bool = False,
         use_checkpoint: bool = True,
     ) -> None:
@@ -174,7 +181,11 @@ class TimesNet(nn.Module):
         assert mode in ("direct", "recursive")
         self.mode = mode
         self.pred_len = int(pred_len)
-        self.period = PeriodicityTransform(k_periods=k_periods, pmax=pmax)
+        self.period = PeriodicityTransform(
+            k_periods=k_periods,
+            pmax=pmax,
+            min_period_threshold=min_period_threshold,
+        )
         self.k = int(k_periods)
         self.input_len = int(input_len)
         self.act = activation

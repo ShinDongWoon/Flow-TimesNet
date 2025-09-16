@@ -72,6 +72,8 @@ def predict_once(cfg: Dict) -> str:
     scaler = scaler_meta["scaler"]
 
     # Build model
+    min_period_threshold = int(cfg_used["model"].get("min_period_threshold", 1))
+
     model = TimesNet(
         input_len=int(cfg_used["model"]["input_len"]),
         pred_len=int(cfg_used["model"]["pred_len"]),
@@ -79,6 +81,7 @@ def predict_once(cfg: Dict) -> str:
         n_layers=int(cfg_used["model"]["n_layers"]),
         k_periods=int(cfg_used["model"]["k_periods"]),
         pmax=int(cfg_used["model"]["pmax"]),
+        min_period_threshold=min_period_threshold,
         kernel_set=list(cfg_used["model"]["kernel_set"]),
         dropout=float(cfg_used["model"]["dropout"]),
         activation=str(cfg_used["model"]["activation"]),
