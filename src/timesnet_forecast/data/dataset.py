@@ -27,10 +27,11 @@ class SlidingWindowDataset(Dataset):
         self.X = wide_values.astype(np.float32)
         self.T, self.N = self.X.shape
         self.L = int(input_len)
-        pmax_global = int(pmax_global) if pmax_global is not None else None
-        if pmax_global is not None and pmax_global <= 0:
-            raise ValueError("pmax_global must be positive when provided")
-        self.window_len = int(max(self.L, pmax_global) if pmax_global is not None else self.L)
+        if pmax_global is None:
+            raise ValueError("pmax_global must be provided")
+        self.P = int(pmax_global)
+        if self.P <= 0:
+            raise ValueError("pmax_global must be positive")
         if mode == "direct":
             self.H = int(pred_len)
         else:
@@ -56,16 +57,15 @@ class SlidingWindowDataset(Dataset):
             delta = np.random.randint(-self.time_shift, self.time_shift + 1)
             s = int(np.clip(s + delta, 0, self.T - self.L - self.H))
         e = s + self.L
-        x = self.X[s:e, :]  # [L, N]
+        start = int(max(0, e - self.P))
+        x = self.X[start:e, :]  # [<=P, N]
         y = self.X[e : e + self.H, :]  # [H, N] or [1, N]
         if self.add_noise_std > 0:
             x = x + np.random.normal(scale=self.add_noise_std, size=x.shape)
-        if self.window_len > x.shape[0]:
-            pad_len = self.window_len - x.shape[0]
+        if x.shape[0] < self.P:
+            pad_len = self.P - x.shape[0]
             pad = np.zeros((pad_len, self.N), dtype=np.float32)
             x = np.concatenate([pad, x.astype(np.float32, copy=False)], axis=0)
-        elif self.window_len < x.shape[0]:
-            x = x[-self.window_len :, :]
         x = x.astype(np.float32, copy=False)
         y = y.astype(np.float32, copy=False)
         return torch.from_numpy(x), torch.from_numpy(y)
