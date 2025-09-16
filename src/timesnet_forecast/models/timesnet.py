@@ -236,10 +236,10 @@ class TimesNet(nn.Module):
         z_all = self.period(x)
         if z_all.size(1) == 0:
             out_steps = self.pred_len if self.mode == "direct" else 1
-            x_tail = x[:, -self.input_len:, :]
-            return x_tail.new_zeros(B, out_steps, N)
+            x_head = x[:, :self.input_len, :]
+            return x_head.new_zeros(B, out_steps, N)
 
-        z = z_all[:, :, -self.input_len:, :]  # [B, K, input_len, N]
+        z = z_all[:, :, :self.input_len, :]  # leading slice [B, K, input_len, N]
         K = z.size(1)
         steps = z.size(2)
         z = z.permute(0, 3, 1, 2).reshape(B * N, K, steps)
