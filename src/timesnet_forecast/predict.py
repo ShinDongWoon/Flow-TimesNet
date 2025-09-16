@@ -132,10 +132,10 @@ def predict_once(cfg: Dict) -> str:
             else:
                 Xn[:, j] = X[:, j]
 
-        # take last input_len with left zero padding if needed
-        L = int(cfg_used["model"]["input_len"])
+        # take last pmax (model focuses internally on input_len) with left zero padding if needed
+        P = int(cfg_used["model"]["pmax"])
         H = int(cfg_used["model"]["pred_len"])
-        last_seq = _pad_left_zeros(Xn, need_len=L)  # [L, N]
+        last_seq = _pad_left_zeros(Xn, need_len=P)  # [P, N]
         xb = torch.from_numpy(last_seq).unsqueeze(0)
         if cfg_used["train"]["channels_last"]:
             xb = xb.unsqueeze(-1).to(
