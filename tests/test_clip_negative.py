@@ -67,10 +67,10 @@ def test_clip_negative(tmp_path, monkeypatch):
     captured = []
     orig_build = train._build_dataloader
 
-    def capture_build(arrays, *args, **kwargs):
+    def capture_build(arrays, masks, *args, **kwargs):
         for a in arrays:
             captured.append(a)
-        return orig_build(arrays, *args, **kwargs)
+        return orig_build(arrays, masks, *args, **kwargs)
 
     monkeypatch.setattr(train, "_build_dataloader", capture_build)
 

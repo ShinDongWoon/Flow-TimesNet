@@ -29,25 +29,29 @@ from .predict import forecast_recursive_batch
 
 
 class WSMAPELoss(nn.Module):
-    """Differentiable approximation of weighted SMAPE.
+    """Differentiable approximation of weighted SMAPE."""
 
-    Computes ``2 * |y_pred - y_true| / (|y_true| + |y_pred| + eps)`` and
-    averages across all elements. Points where the actual value is exactly
-    zero contribute a zero weight to avoid unstable gradients.
-    """
-
-    def __init__(self, eps: float = 1e-8) -> None:
+    def __init__(self, eps: float = 1e-8, reduction: str = "mean") -> None:
         super().__init__()
         self.eps = eps
+        self.reduction = reduction
 
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        y_pred: torch.Tensor,
+        y_true: torch.Tensor,
+        reduction: str | None = None,
+    ) -> torch.Tensor:
         denom = torch.abs(y_true) + torch.abs(y_pred) + self.eps
-        diff = torch.abs(y_pred - y_true)
-        loss = 2.0 * diff / denom
-        mask = (torch.abs(y_true) > self.eps).float()
-        if mask.sum() == 0:
-            return torch.zeros((), device=y_pred.device, dtype=y_pred.dtype)
-        return (loss * mask).sum() / mask.sum()
+        loss = 2.0 * torch.abs(y_pred - y_true) / denom
+        red = self.reduction if reduction is None else reduction
+        if red == "none":
+            return loss
+        if red == "sum":
+            return loss.sum()
+        if red == "mean":
+            return loss.mean()
+        raise ValueError(f"Unsupported reduction: {red}")
 
 
 def _select_device(req: str) -> torch.device:
@@ -68,6 +72,7 @@ def _should_use_cuda_graphs(train_cfg: Dict, device: torch.device) -> bool:
 
 def _build_dataloader(
     arrays: List[np.ndarray],
+    masks: List[np.ndarray],
     input_len: int,
     pred_len: int,
     mode: str,
@@ -82,6 +87,8 @@ def _build_dataloader(
     augment: Dict | None = None,
     pmax_global: int | None = None,
 ) -> DataLoader:
+    if len(arrays) != len(masks):
+        raise ValueError("arrays and masks must have the same length")
     datasets = [
         SlidingWindowDataset(
             a,
@@ -91,8 +98,9 @@ def _build_dataloader(
             recursive_pred_len,
             augment,
             pmax_global=pmax_global,
+            valid_mask=m,
         )
-        for a in arrays
+        for a, m in zip(arrays, masks)
     ]
     if len(datasets) == 1:
         ds = datasets[0]
@@ -148,6 +156,38 @@ def _compute_pmax_global(arrays: List[np.ndarray], k: int, cap: int) -> int:
     return min(pmax, cap)
 
 
+def _masked_mean(loss_tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Compute the mean of ``loss_tensor`` over valid points given ``mask``."""
+
+    mask = mask.to(loss_tensor.dtype)
+    denom = torch.clamp(mask.sum(), min=1.0)
+    return (loss_tensor * mask).sum() / denom
+
+
+def _transform_dataframe(
+    df: pd.DataFrame,
+    ids: List[str],
+    scaler: Dict[str, Tuple[float, float]],
+    method: str,
+) -> pd.DataFrame:
+    """Apply a fitted scaler to a wide-format DataFrame."""
+
+    X = df.to_numpy(dtype=np.float32, copy=True)
+    out = np.zeros_like(X, dtype=np.float32)
+    for j, c in enumerate(ids):
+        if method == "zscore":
+            mu, sd = scaler[c]
+            denom = sd if sd != 0 else 1.0
+            out[:, j] = (X[:, j] - mu) / denom
+        elif method == "minmax":
+            mn, mx = scaler[c]
+            rng = (mx - mn) if (mx - mn) != 0 else 1.0
+            out[:, j] = (X[:, j] - mn) / rng
+        else:
+            out[:, j] = X[:, j]
+    return pd.DataFrame(out, index=df.index, columns=ids)
+
+
 def _eval_wsmape(
     model: nn.Module,
     loader: DataLoader,
@@ -157,14 +197,19 @@ def _eval_wsmape(
     pred_len: int,
     weights: Dict[str, float] | None = None,
     channels_last: bool = False,
+    use_loss_mask: bool = False,
 ) -> float:
     model.eval()
     ys: List[np.ndarray] = []
     ps: List[np.ndarray] = []
     with torch.inference_mode(), amp_autocast(True if device.type == "cuda" else False):
-        for xb, yb in loader:
+        for xb, yb, mask in loader:
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
+            if use_loss_mask:
+                mask = move_to_device(mask, device)
+            else:
+                mask = None
             if channels_last and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
             _assert_min_len(xb, model.period.pmax)
@@ -174,6 +219,9 @@ def _eval_wsmape(
                 # recursive multi-step forecast during validation
                 out = forecast_recursive_batch(model, xb, pred_len)  # [B, H, N]
                 out = out[:, : yb.shape[1], :]  # align horizon with provided targets
+            if use_loss_mask and mask is not None:
+                yb = yb * mask
+                out = out * mask
             ys.append(yb.detach().float().cpu().numpy())
             ps.append(out.detach().float().cpu().numpy())
     Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
@@ -189,14 +237,19 @@ def _eval_smape(
     ids: List[str],
     pred_len: int,
     channels_last: bool = False,
+    use_loss_mask: bool = False,
 ) -> float:
     model.eval()
     ys: List[np.ndarray] = []
     ps: List[np.ndarray] = []
     with torch.inference_mode(), amp_autocast(True if device.type == "cuda" else False):
-        for xb, yb in loader:
+        for xb, yb, mask in loader:
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
+            if use_loss_mask:
+                mask = move_to_device(mask, device)
+            else:
+                mask = None
             if channels_last and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
             _assert_min_len(xb, model.period.pmax)
@@ -205,6 +258,9 @@ def _eval_smape(
             else:
                 out = forecast_recursive_batch(model, xb, pred_len)
                 out = out[:, : yb.shape[1], :]
+            if use_loss_mask and mask is not None:
+                yb = yb * mask
+                out = out * mask
             ys.append(yb.detach().float().cpu().numpy())
             ps.append(out.detach().float().cpu().numpy())
     Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
@@ -225,45 +281,33 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     enc = cfg["data"]["encoding"]
     train_path = cfg["data"]["train_csv"]
     df = pd.read_csv(train_path, encoding=enc)
-    wide = io_utils.pivot_long_to_wide(
+    wide_raw = io_utils.pivot_long_to_wide(
         df, date_col=schema["date"], id_col=schema["id"], target_col=schema["target"],
-        fill_missing_dates=cfg["data"]["fill_missing_dates"], fillna0=True
+        fill_missing_dates=cfg["data"]["fill_missing_dates"], fillna0=False
     )
+    mask_wide = (~wide_raw.isna()).astype(np.float32)
+    wide = wide_raw.fillna(0.0)
     if cfg.get("preprocess", {}).get("clip_negative", False):
         wide = wide.clip(lower=0.0)
     ids = list(wide.columns)
 
     # --- normalization (FIT ONLY ON TRAIN PART to avoid leakage)
     # We'll split first to determine train-only fit.
+    norm_method = cfg["preprocess"]["normalize"]
+    norm_per_series = cfg["preprocess"]["normalize_per_series"]
+    eps = cfg["preprocess"]["eps"]
+
     if cfg["train"]["val"]["strategy"] == "holdout":
         trn_df, val_df = make_holdout_slices(wide, cfg["train"]["val"]["holdout_days"])
+        trn_mask_df, val_mask_df = make_holdout_slices(mask_wide, cfg["train"]["val"]["holdout_days"])
         scaler, trn_norm = io_utils.fit_series_scaler(
-            trn_df, cfg["preprocess"]["normalize"], cfg["preprocess"]["normalize_per_series"], cfg["preprocess"]["eps"]
+            trn_df, norm_method, norm_per_series, eps
         )
-        val_norm = pd.DataFrame(
-            trn_norm.values[-len(val_df):],  # dummy slice to align shape; we'll properly transform below
-            index=val_df.index, columns=ids
-        )
-        # Proper transform for val using train scaler:
-        V = val_df.values.astype(np.float32)
-        Vn = io_utils.inverse_transform(V, ids, scaler, method=cfg["preprocess"]["normalize"])  # identity if 'none'?
-        # Wait: inverse_transform applies inverse; for transform we reimplement quickly:
-        def _transform(X: np.ndarray) -> np.ndarray:
-            out = np.zeros_like(X, dtype=np.float32)
-            for j, c in enumerate(ids):
-                if cfg["preprocess"]["normalize"] == "zscore":
-                    mu, sd = scaler[c]
-                    out[:, j] = (X[:, j] - mu) / (sd if sd != 0 else 1.0)
-                elif cfg["preprocess"]["normalize"] == "minmax":
-                    mn, mx = scaler[c]
-                    rng = (mx - mn) if (mx - mn) != 0 else 1.0
-                    out[:, j] = (X[:, j] - mn) / rng
-                else:
-                    out[:, j] = X[:, j]
-            return out
-        val_norm = pd.DataFrame(_transform(val_df.values.astype(np.float32)), index=val_df.index, columns=ids)
-        train_arrays = [trn_norm.values.astype(np.float32)]
-        val_arrays = [val_norm.values.astype(np.float32)]
+        val_norm = _transform_dataframe(val_df, ids, scaler, norm_method)
+        train_arrays = [trn_norm.to_numpy(dtype=np.float32, copy=False)]
+        val_arrays = [val_norm.to_numpy(dtype=np.float32, copy=False)]
+        train_mask_arrays = [trn_mask_df.to_numpy(dtype=np.float32, copy=False)]
+        val_mask_arrays = [val_mask_df.to_numpy(dtype=np.float32, copy=False)]
     else:
         val_cfg = cfg["train"]["val"]
         fold_iter = make_rolling_slices(
@@ -275,32 +319,26 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             raise ValueError("No folds produced; check rolling validation configuration")
 
         scaler, _ = io_utils.fit_series_scaler(
-            first_tr, cfg["preprocess"]["normalize"], cfg["preprocess"]["normalize_per_series"], cfg["preprocess"]["eps"]
+            first_tr, norm_method, norm_per_series, eps
         )
 
-        def _transform_df(df_: pd.DataFrame) -> pd.DataFrame:
-            X = df_.to_numpy(dtype=np.float32, copy=True)
-            out = np.zeros_like(X, dtype=np.float32)
-            for j, c in enumerate(ids):
-                if cfg["preprocess"]["normalize"] == "zscore":
-                    mu, sd = scaler[c]
-                    out[:, j] = (X[:, j] - mu) / (sd if sd != 0 else 1.0)
-                elif cfg["preprocess"]["normalize"] == "minmax":
-                    mn, mx = scaler[c]
-                    rng = (mx - mn) if (mx - mn) != 0 else 1.0
-                    out[:, j] = (X[:, j] - mn) / rng
-                else:
-                    out[:, j] = X[:, j]
-            return pd.DataFrame(out, index=df_.index, columns=ids)
-
-        wide_norm = _transform_df(wide)
+        wide_norm = _transform_dataframe(wide, ids, scaler, norm_method)
         train_arrays: List[np.ndarray] = []
         val_arrays: List[np.ndarray] = []
-        for tr_df, va_df in make_rolling_slices(
-            wide_norm, val_cfg["rolling_folds"], val_cfg["rolling_step_days"], val_cfg["holdout_days"]
+        train_mask_arrays: List[np.ndarray] = []
+        val_mask_arrays: List[np.ndarray] = []
+        for (tr_df, va_df), (tr_mask_df, va_mask_df) in zip(
+            make_rolling_slices(
+                wide_norm, val_cfg["rolling_folds"], val_cfg["rolling_step_days"], val_cfg["holdout_days"]
+            ),
+            make_rolling_slices(
+                mask_wide, val_cfg["rolling_folds"], val_cfg["rolling_step_days"], val_cfg["holdout_days"]
+            ),
         ):
-            train_arrays.append(tr_df.to_numpy(copy=False))
-            val_arrays.append(va_df.to_numpy(copy=False))
+            train_arrays.append(tr_df.to_numpy(dtype=np.float32, copy=False))
+            val_arrays.append(va_df.to_numpy(dtype=np.float32, copy=False))
+            train_mask_arrays.append(tr_mask_df.to_numpy(dtype=np.float32, copy=False))
+            val_mask_arrays.append(va_mask_df.to_numpy(dtype=np.float32, copy=False))
 
     # --- compute global period length
     k_periods = int(cfg["model"].get("k_periods", 0))
@@ -316,13 +354,13 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     pred_len = int(cfg["model"]["pred_len"])
     mode = cfg["model"]["mode"]
     dl_train = _build_dataloader(
-        train_arrays, input_len, pred_len, mode, cfg["train"]["batch_size"],
+        train_arrays, train_mask_arrays, input_len, pred_len, mode, cfg["train"]["batch_size"],
         cfg["train"]["num_workers"], cfg["train"]["pin_memory"], cfg["train"]["persistent_workers"],
         cfg["train"]["prefetch_factor"], shuffle=True, drop_last=True,
         augment=cfg["data"].get("augment"), pmax_global=pmax_global,
     )
     dl_val = _build_dataloader(
-        val_arrays, input_len, pred_len, mode, batch_size=cfg["train"]["batch_size"],
+        val_arrays, val_mask_arrays, input_len, pred_len, mode, batch_size=cfg["train"]["batch_size"],
         num_workers=cfg["train"]["num_workers"], pin_memory=cfg["train"]["pin_memory"],
         persistent_workers=cfg["train"]["persistent_workers"], prefetch_factor=cfg["train"]["prefetch_factor"],
         shuffle=False, drop_last=False,
@@ -331,6 +369,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     )
     if len(dl_val.dataset) == 0:
         raise ValueError("Validation split has no windows; increase train.val.holdout_days or adjust model.input_len/pred_len.")
+
+    use_loss_masking = bool(cfg["train"].get("use_loss_masking", False))
 
     # --- model
     model = TimesNet(
@@ -425,17 +465,22 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         train_iter = iter(dl_train)
         for w in range(warmup_iters):
             try:
-                xb_w, yb_w = next(train_iter)
+                xb_w, yb_w, mb_w = next(train_iter)
             except StopIteration:
                 break
             xb_w = xb_w.to(device, non_blocking=True)
             yb_w = yb_w.to(device, non_blocking=True)
+            if use_loss_masking:
+                mb_w = mb_w.to(device, non_blocking=True)
+            else:
+                mb_w = torch.ones_like(yb_w)
             if cfg["train"]["channels_last"] and xb_w.dim() == 4:
                 xb_w = xb_w.to(memory_format=torch.channels_last)
             _assert_min_len(xb_w, model.period.pmax)
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                 out_w = model(xb_w)
-                loss_w = loss_fn(out_w, yb_w) / accum_steps
+                loss_tensor = loss_fn(out_w, yb_w, reduction="none")
+                loss_w = _masked_mean(loss_tensor, mb_w) / accum_steps
             grad_scaler.scale(loss_w).backward()
             if (w + 1) % accum_steps == 0:
                 if grad_clip and grad_clip > 0:
@@ -445,15 +490,21 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 grad_scaler.update()
                 optim.zero_grad(set_to_none=True)
 
-        xb0, yb0 = next(train_iter)
+        xb0, yb0, mb0 = next(train_iter)
         xb0 = xb0.to(device, non_blocking=True)
         yb0 = yb0.to(device, non_blocking=True)
+        if use_loss_masking:
+            mb0 = mb0.to(device, non_blocking=True)
+        else:
+            mb0 = torch.ones_like(yb0)
         if cfg["train"]["channels_last"] and xb0.dim() == 4:
             xb0 = xb0.to(memory_format=torch.channels_last)
         static_x = torch.empty_like(xb0)
         static_y = torch.empty_like(yb0)
+        static_m = torch.empty_like(mb0)
         static_x.copy_(xb0)
         static_y.copy_(yb0)
+        static_m.copy_(mb0)
         capture_stream = torch.cuda.Stream()
         graph = torch.cuda.CUDAGraph()
         optim.zero_grad(set_to_none=True)
@@ -463,7 +514,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                 _assert_min_len(static_x, model.period.pmax)
                 static_out = model(static_x)
-                static_loss = loss_fn(static_out, static_y)
+                static_loss_tensor = loss_fn(static_out, static_y, reduction="none")
+                static_loss = _masked_mean(static_loss_tensor, static_m)
                 static_scaled = static_loss / accum_steps
             grad_scaler.scale(static_scaled).backward()
             graph.capture_end()
@@ -471,9 +523,10 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         model.train()
         optim.zero_grad(set_to_none=True)
 
-        def graph_step(xb: torch.Tensor, yb: torch.Tensor) -> float:
+        def graph_step(xb: torch.Tensor, yb: torch.Tensor, mb: torch.Tensor) -> float:
             static_x.copy_(xb)
             static_y.copy_(yb)
+            static_m.copy_(mb)
             graph.replay()
             return float(static_loss.item())
 
@@ -483,21 +536,26 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         losses: List[float] = []
         optim.zero_grad(set_to_none=True)
         num_batches = len(dl_train)
-        for i, (xb, yb) in enumerate(tqdm(dl_train, desc=f"Epoch {ep}/{epochs}", leave=False)):
+        for i, (xb, yb, mb) in enumerate(tqdm(dl_train, desc=f"Epoch {ep}/{epochs}", leave=False)):
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
+            if use_loss_masking:
+                mb = mb.to(device, non_blocking=True)
+            else:
+                mb = torch.ones_like(yb)
             if cfg["train"]["channels_last"] and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
             _assert_min_len(xb, model.period.pmax)
             if use_graphs:
-                loss_val = graph_step(xb, yb)
+                loss_val = graph_step(xb, yb, mb)
             else:
                 with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                     out = model(xb)  # [B, H, N] or [B,1,N]
-                    loss_val = loss_fn(out, yb)
-                    loss = loss_val / accum_steps
+                    loss_tensor = loss_fn(out, yb, reduction="none")
+                    masked_loss = _masked_mean(loss_tensor, mb)
+                    loss = masked_loss / accum_steps
                 grad_scaler.scale(loss).backward()
-                loss_val = float(loss_val.item())
+                loss_val = float(masked_loss.item())
             if (i + 1) % accum_steps == 0 or (i + 1) == num_batches:
                 if grad_clip and grad_clip > 0:
                     grad_scaler.unscale_(optim)
@@ -505,7 +563,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 grad_scaler.step(optim)
                 grad_scaler.update()
                 optim.zero_grad(set_to_none=True)
-            losses.append(loss_val)
+            losses.append(float(loss_val))
 
         val_smape = _eval_smape(
             model,
@@ -515,6 +573,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             ids,
             pred_len,
             cfg["train"]["channels_last"],
+            use_loss_mask=use_loss_masking,
         )
         console().print(f"[bold]Epoch {ep}[/bold] loss={np.mean(losses):.6f}  val_smape={val_smape:.6f}")
         if scheduler is not None:

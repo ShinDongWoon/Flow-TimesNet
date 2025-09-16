@@ -21,10 +21,19 @@ class SlidingWindowDataset(Dataset):
         recursive_pred_len: int | None = None,
         augment: Dict | None = None,
         pmax_global: int | None = None,
+        valid_mask: np.ndarray | None = None,  # [T, N]
     ) -> None:
         super().__init__()
         assert mode in ("direct", "recursive")
         self.X = wide_values.astype(np.float32)
+        if valid_mask is not None and valid_mask.shape != self.X.shape:
+            raise ValueError(
+                "valid_mask must match wide_values shape"
+            )
+        if valid_mask is None:
+            self.M = np.ones_like(self.X, dtype=np.float32)
+        else:
+            self.M = valid_mask.astype(np.float32)
         self.T, self.N = self.X.shape
         self.L = int(input_len)
         if pmax_global is None:
@@ -51,7 +60,7 @@ class SlidingWindowDataset(Dataset):
     def __len__(self) -> int:
         return int(len(self.idxs))
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         s = int(self.idxs[idx])
         if self.time_shift > 0:
             delta = np.random.randint(-self.time_shift, self.time_shift + 1)
@@ -60,6 +69,7 @@ class SlidingWindowDataset(Dataset):
         start = int(max(0, e - self.P))
         x = self.X[start:e, :]  # [<=P, N]
         y = self.X[e : e + self.H, :]  # [H, N] or [1, N]
+        mask = self.M[e : e + self.H, :]
         if self.add_noise_std > 0:
             x = x + np.random.normal(scale=self.add_noise_std, size=x.shape)
         if x.shape[0] < self.P:
@@ -68,4 +78,5 @@ class SlidingWindowDataset(Dataset):
             x = np.concatenate([pad, x.astype(np.float32, copy=False)], axis=0)
         x = x.astype(np.float32, copy=False)
         y = y.astype(np.float32, copy=False)
-        return torch.from_numpy(x), torch.from_numpy(y)
+        mask = mask.astype(np.float32, copy=False)
+        return torch.from_numpy(x), torch.from_numpy(y), torch.from_numpy(mask)
