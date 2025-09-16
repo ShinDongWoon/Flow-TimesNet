@@ -81,6 +81,7 @@ def _build_dataloader(
     recursive_pred_len: int | None = None,
     augment: Dict | None = None,
     pmax_global: int | None = None,
+    min_history_for_training: int | None = None,
 ) -> DataLoader:
     datasets = [
         SlidingWindowDataset(
@@ -91,6 +92,7 @@ def _build_dataloader(
             recursive_pred_len,
             augment,
             pmax_global=pmax_global,
+            min_history_for_training=min_history_for_training,
         )
         for a in arrays
     ]
@@ -108,6 +110,38 @@ def _build_dataloader(
         prefetch_factor=prefetch_factor if num_workers > 0 else 2,
         drop_last=drop_last,
     )
+
+
+def _split_batch(batch):
+    if isinstance(batch, (list, tuple)):
+        if len(batch) == 3:
+            xb, yb, sid = batch
+            return xb, yb, sid
+        if len(batch) == 2:
+            xb, yb = batch
+            return xb, yb, None
+    raise ValueError("Unexpected batch structure from dataloader")
+
+
+def _aggregate_series_batches(
+    true_lists: List[List[np.ndarray]],
+    pred_lists: List[List[np.ndarray]],
+    num_series: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    lengths = [sum(arr.shape[0] for arr in true_lists[j]) for j in range(num_series)]
+    max_len = max(lengths, default=0)
+    y_mat = np.zeros((max_len, num_series), dtype=np.float32)
+    p_mat = np.zeros_like(y_mat)
+    for j in range(num_series):
+        if true_lists[j]:
+            col_true = np.concatenate(true_lists[j])
+            col_pred = np.concatenate(pred_lists[j]) if pred_lists[j] else np.zeros_like(col_true)
+            if col_true.shape != col_pred.shape:
+                raise ValueError("Mismatched shapes for series aggregates")
+            length = col_true.shape[0]
+            y_mat[:length, j] = col_true.astype(np.float32, copy=False)
+            p_mat[:length, j] = col_pred.astype(np.float32, copy=False)
+    return y_mat, p_mat
 
 
 def _assert_min_len(x: torch.Tensor, pmax: int) -> None:
@@ -161,8 +195,12 @@ def _eval_wsmape(
     model.eval()
     ys: List[np.ndarray] = []
     ps: List[np.ndarray] = []
+    per_series_true: List[List[np.ndarray]] = [list() for _ in ids]
+    per_series_pred: List[List[np.ndarray]] = [list() for _ in ids]
+    use_series_aggregation = False
     with torch.inference_mode(), amp_autocast(True if device.type == "cuda" else False):
-        for xb, yb in loader:
+        for batch in loader:
+            xb, yb, sid = _split_batch(batch)
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
             if channels_last and xb.dim() == 4:
@@ -174,11 +212,33 @@ def _eval_wsmape(
                 # recursive multi-step forecast during validation
                 out = forecast_recursive_batch(model, xb, pred_len)  # [B, H, N]
                 out = out[:, : yb.shape[1], :]  # align horizon with provided targets
-            ys.append(yb.detach().float().cpu().numpy())
-            ps.append(out.detach().float().cpu().numpy())
-    Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
-    P = np.concatenate(ps, axis=0).reshape(-1, len(ids))
-    return wsmape_grouped(Y, P, ids=ids, weights=None)
+            y_np = yb.detach().float().cpu().numpy()
+            p_np = out.detach().float().cpu().numpy()
+            if sid is None:
+                ys.append(y_np)
+                ps.append(p_np)
+            else:
+                use_series_aggregation = True
+                if torch.is_tensor(sid):
+                    sid_np = sid.detach().cpu().numpy()
+                else:
+                    sid_np = np.asarray(sid)
+                sid_np = np.atleast_1d(sid_np).astype(np.int64, copy=False)
+                for b, j in enumerate(sid_np.tolist()):
+                    if j < 0 or j >= len(ids):
+                        raise IndexError(
+                            f"Series index {j} out of range for ids of length {len(ids)}"
+                        )
+                    per_series_true[j].append(y_np[b, :, 0])
+                    per_series_pred[j].append(p_np[b, :, 0])
+    if use_series_aggregation:
+        Y, P = _aggregate_series_batches(per_series_true, per_series_pred, len(ids))
+    else:
+        if not ys:
+            return 0.0
+        Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
+        P = np.concatenate(ps, axis=0).reshape(-1, len(ids))
+    return wsmape_grouped(Y, P, ids=ids, weights=weights)
 
 
 def _eval_smape(
@@ -193,8 +253,12 @@ def _eval_smape(
     model.eval()
     ys: List[np.ndarray] = []
     ps: List[np.ndarray] = []
+    per_series_true: List[List[np.ndarray]] = [list() for _ in ids]
+    per_series_pred: List[List[np.ndarray]] = [list() for _ in ids]
+    use_series_aggregation = False
     with torch.inference_mode(), amp_autocast(True if device.type == "cuda" else False):
-        for xb, yb in loader:
+        for batch in loader:
+            xb, yb, sid = _split_batch(batch)
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
             if channels_last and xb.dim() == 4:
@@ -205,10 +269,32 @@ def _eval_smape(
             else:
                 out = forecast_recursive_batch(model, xb, pred_len)
                 out = out[:, : yb.shape[1], :]
-            ys.append(yb.detach().float().cpu().numpy())
-            ps.append(out.detach().float().cpu().numpy())
-    Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
-    P = np.concatenate(ps, axis=0).reshape(-1, len(ids))
+            y_np = yb.detach().float().cpu().numpy()
+            p_np = out.detach().float().cpu().numpy()
+            if sid is None:
+                ys.append(y_np)
+                ps.append(p_np)
+            else:
+                use_series_aggregation = True
+                if torch.is_tensor(sid):
+                    sid_np = sid.detach().cpu().numpy()
+                else:
+                    sid_np = np.asarray(sid)
+                sid_np = np.atleast_1d(sid_np).astype(np.int64, copy=False)
+                for b, j in enumerate(sid_np.tolist()):
+                    if j < 0 or j >= len(ids):
+                        raise IndexError(
+                            f"Series index {j} out of range for ids of length {len(ids)}"
+                        )
+                    per_series_true[j].append(y_np[b, :, 0])
+                    per_series_pred[j].append(p_np[b, :, 0])
+    if use_series_aggregation:
+        Y, P = _aggregate_series_batches(per_series_true, per_series_pred, len(ids))
+    else:
+        if not ys:
+            return 0.0
+        Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
+        P = np.concatenate(ps, axis=0).reshape(-1, len(ids))
     return smape_mean(Y, P)
 
 
@@ -315,11 +401,13 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     input_len = int(cfg["model"]["input_len"])
     pred_len = int(cfg["model"]["pred_len"])
     mode = cfg["model"]["mode"]
+    min_history_cfg = cfg["data"].get("min_history_for_training")
     dl_train = _build_dataloader(
         train_arrays, input_len, pred_len, mode, cfg["train"]["batch_size"],
         cfg["train"]["num_workers"], cfg["train"]["pin_memory"], cfg["train"]["persistent_workers"],
         cfg["train"]["prefetch_factor"], shuffle=True, drop_last=True,
         augment=cfg["data"].get("augment"), pmax_global=pmax_global,
+        min_history_for_training=min_history_cfg,
     )
     dl_val = _build_dataloader(
         val_arrays, input_len, pred_len, mode, batch_size=cfg["train"]["batch_size"],
@@ -328,6 +416,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         shuffle=False, drop_last=False,
         recursive_pred_len=(pred_len if mode == "recursive" else None),
         augment=None, pmax_global=pmax_global,
+        min_history_for_training=min_history_cfg,
     )
     if len(dl_val.dataset) == 0:
         raise ValueError("Validation split has no windows; increase train.val.holdout_days or adjust model.input_len/pred_len.")
@@ -425,9 +514,10 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         train_iter = iter(dl_train)
         for w in range(warmup_iters):
             try:
-                xb_w, yb_w = next(train_iter)
+                batch_w = next(train_iter)
             except StopIteration:
                 break
+            xb_w, yb_w, _ = _split_batch(batch_w)
             xb_w = xb_w.to(device, non_blocking=True)
             yb_w = yb_w.to(device, non_blocking=True)
             if cfg["train"]["channels_last"] and xb_w.dim() == 4:
@@ -445,7 +535,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 grad_scaler.update()
                 optim.zero_grad(set_to_none=True)
 
-        xb0, yb0 = next(train_iter)
+        batch0 = next(train_iter)
+        xb0, yb0, _ = _split_batch(batch0)
         xb0 = xb0.to(device, non_blocking=True)
         yb0 = yb0.to(device, non_blocking=True)
         if cfg["train"]["channels_last"] and xb0.dim() == 4:
@@ -483,7 +574,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         losses: List[float] = []
         optim.zero_grad(set_to_none=True)
         num_batches = len(dl_train)
-        for i, (xb, yb) in enumerate(tqdm(dl_train, desc=f"Epoch {ep}/{epochs}", leave=False)):
+        for i, batch in enumerate(tqdm(dl_train, desc=f"Epoch {ep}/{epochs}", leave=False)):
+            xb, yb, _ = _split_batch(batch)
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
             if cfg["train"]["channels_last"] and xb.dim() == 4:
