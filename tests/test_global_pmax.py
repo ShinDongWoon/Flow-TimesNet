@@ -11,6 +11,8 @@ sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 from timesnet_forecast.train import _compute_pmax_global
 from timesnet_forecast.config import Config
 from timesnet_forecast import train
+from timesnet_forecast.utils import io as io_utils
+from timesnet_forecast.data.split import make_holdout_slices
 
 
 def test_compute_pmax_global():
@@ -24,13 +26,17 @@ def test_compute_pmax_global():
     assert _compute_pmax_global([arr], k=1, cap=30) == 30
 
 
-def test_pmax_cap_applied(tmp_path, monkeypatch):
-    # Create a tiny training CSV
-    dates = pd.date_range("2023-01-01", periods=6, freq="D")
+def test_pmax_cap_applied(tmp_path):
+    # Create a synthetic training CSV with strong periodic components
+    periods = 60
+    dates = pd.date_range("2023-01-01", periods=periods, freq="D")
+    t = np.arange(periods, dtype=np.float32)
+    s1 = np.sin(2 * math.pi * 5 * t / periods) + 10.0
+    s2 = np.sin(2 * math.pi * 2 * t / periods) + 20.0
     rows = []
-    for d in dates:
-        rows.append({"date": d, "id": "S1", "target": 1.0})
-        rows.append({"date": d, "id": "S2", "target": 2.0})
+    for i, d in enumerate(dates):
+        rows.append({"date": d, "id": "S1", "target": float(s1[i])})
+        rows.append({"date": d, "id": "S2", "target": float(s2[i])})
     df = pd.DataFrame(rows)
     csv_path = tmp_path / "train.csv"
     df.to_csv(csv_path, index=False)
@@ -52,10 +58,12 @@ def test_pmax_cap_applied(tmp_path, monkeypatch):
         "train.amp=False",
         "train.compile=False",
         "train.cuda_graphs=False",
+        "train.channels_last=False",
         "train.val.strategy=holdout",
         "train.val.holdout_days=3",
         "preprocess.normalize=none",
         "preprocess.normalize_per_series=True",
+        "preprocess.clip_negative=False",
         "preprocess.eps=1e-8",
         "model.mode=direct",
         "model.input_len=2",
@@ -77,11 +85,31 @@ def test_pmax_cap_applied(tmp_path, monkeypatch):
     ]
     cfg = Config.from_files("configs/default.yaml", overrides=overrides).to_dict()
 
-    def _fake_compute(arrays, k, cap):
-        assert cap == 5
-        return min(50, cap)
+    schema = io_utils.resolve_schema(cfg)
+    df_loaded = pd.read_csv(csv_path)
+    wide = io_utils.pivot_long_to_wide(
+        df_loaded,
+        date_col=schema["date"],
+        id_col=schema["id"],
+        target_col=schema["target"],
+        fill_missing_dates=cfg["data"]["fill_missing_dates"],
+        fillna0=True,
+    )
+    train_df, _ = make_holdout_slices(wide, cfg["train"]["val"]["holdout_days"])
+    _, trn_norm = io_utils.fit_series_scaler(
+        train_df,
+        cfg["preprocess"]["normalize"],
+        cfg["preprocess"]["normalize_per_series"],
+        cfg["preprocess"]["eps"],
+    )
+    train_arrays = [trn_norm.values.astype(np.float32)]
+    expected_pmax = _compute_pmax_global(
+        train_arrays,
+        int(cfg["model"]["k_periods"]),
+        int(cfg["model"]["pmax_cap"]),
+    )
+    assert expected_pmax == int(cfg["model"]["pmax_cap"])
 
-    monkeypatch.setattr(train, "_compute_pmax_global", _fake_compute)
     train.train_once(cfg)
-    assert cfg["model"]["pmax"] == 5
+    assert cfg["model"]["pmax"] == expected_pmax
 
