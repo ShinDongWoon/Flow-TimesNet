@@ -435,7 +435,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         if cfg["train"]["channels_last"]:
             model.to(memory_format=torch.channels_last)
     if cfg["train"]["compile"]:
-        model = maybe_compile(model, True)
+        model = maybe_compile(model, True, warmup_args=(dummy,))
 
     # --- optimizer / scheduler / loss
     optim = torch.optim.AdamW(
