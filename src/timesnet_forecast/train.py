@@ -236,7 +236,7 @@ def _eval_wsmape(
     return wsmape_grouped(Y, P, ids=ids, weights=None)
 
 
-def _eval_smape(
+def _eval_metrics(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
@@ -245,9 +245,8 @@ def _eval_smape(
     pred_len: int,
     channels_last: bool = False,
     use_loss_mask: bool = False,
-    return_nll: bool = False,
     min_sigma: float = 0.0,
-) -> float | Tuple[float, float]:
+) -> Dict[str, float]:
     model.eval()
     ys: List[np.ndarray] = []
     ps: List[np.ndarray] = []
@@ -270,27 +269,23 @@ def _eval_smape(
                 mu = mu[:, : yb.shape[1], :]
                 sigma = sigma[:, : yb.shape[1], :]
             if loss_mask is not None:
-                yb_eval = yb * loss_mask
-                mu_eval = mu * loss_mask
+                mask_for_loss = loss_mask.to(yb.dtype)
+                yb_eval = yb * mask_for_loss
+                mu_eval = mu * mask_for_loss
             else:
+                mask_for_loss = torch.ones_like(yb, dtype=yb.dtype, device=yb.device)
                 yb_eval = yb
                 mu_eval = mu
-            if return_nll:
-                mask_for_loss = (
-                    loss_mask if loss_mask is not None else torch.ones_like(yb)
-                ).to(yb.dtype)
-                loss_tensor = gaussian_nll_loss(mu, sigma, yb, min_sigma=min_sigma)
-                nll_num += float((loss_tensor * mask_for_loss).sum().item())
-                nll_den += float(mask_for_loss.sum().item())
+            loss_tensor = gaussian_nll_loss(mu, sigma, yb, min_sigma=min_sigma)
+            nll_num += float((loss_tensor * mask_for_loss).sum().item())
+            nll_den += float(mask_for_loss.sum().item())
             ys.append(yb_eval.detach().float().cpu().numpy())
             ps.append(mu_eval.detach().float().cpu().numpy())
     Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
     P = np.concatenate(ps, axis=0).reshape(-1, len(ids))
     smape = smape_mean(Y, P)
-    if return_nll:
-        denom = nll_den if nll_den > 0 else 1.0
-        return smape, nll_num / denom
-    return smape
+    denom = nll_den if nll_den > 0 else 1.0
+    return {"nll": nll_num / denom, "smape": smape}
 
 
 def train_once(cfg: Dict) -> Tuple[float, Dict]:
@@ -485,6 +480,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             enabled=cfg["train"]["amp"] and device.type == "cuda",
         )
     # --- training loop
+    best_nll = float("inf")
     best_smape = float("inf")
     best_state = None
     grad_clip = float(cfg["train"]["grad_clip_norm"]) if cfg["train"]["grad_clip_norm"] else 0.0
@@ -601,7 +597,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 optim.zero_grad(set_to_none=True)
             losses.append(float(loss_val))
 
-        eval_metrics = _eval_smape(
+        eval_metrics = _eval_metrics(
             model,
             dl_val,
             device,
@@ -610,19 +606,20 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             pred_len,
             cfg["train"]["channels_last"],
             use_loss_mask=use_loss_masking,
-            return_nll=True,
             min_sigma=min_sigma,
         )
-        val_smape, val_nll = eval_metrics
+        val_nll = eval_metrics["nll"]
+        val_smape = eval_metrics["smape"]
         console().print(
-            f"[bold]Epoch {ep}[/bold] loss={np.mean(losses):.6f}  val_smape={val_smape:.6f}  val_nll={val_nll:.6f}"
+            f"[bold]Epoch {ep}[/bold] loss={np.mean(losses):.6f}  val_nll={val_nll:.6f}  val_smape={val_smape:.6f}"
         )
         if scheduler is not None:
             if sched_type == "ReduceLROnPlateau":
-                scheduler.step(val_smape)
+                scheduler.step(val_nll)
             else:
                 scheduler.step()
-        if val_smape < best_smape:
+        if val_nll < best_nll:
+            best_nll = val_nll
             best_smape = val_smape
             best_state = clean_state_dict(
                 {k: v.detach().cpu() for k, v in model.state_dict().items()}
@@ -633,12 +630,12 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             patience += 1
             if patience_limit is not None and patience > patience_limit:
                 console().print(
-                    f"[yellow]Early stopping at epoch {ep}; best epoch was {best_epoch} with val_smape={best_smape:.6f}[/yellow]"
+                    f"[yellow]Early stopping at epoch {ep}; best epoch was {best_epoch} with val_nll={best_nll:.6f} (val_smape={best_smape:.6f})[/yellow]"
                 )
                 break
 
     console().print(
-        f"[bold]Best epoch {best_epoch} with val_smape={best_smape:.6f}[/bold]"
+        f"[bold]Best epoch {best_epoch} with val_nll={best_nll:.6f} (val_smape={best_smape:.6f})[/bold]"
     )
 
     # --- save artifacts
@@ -661,7 +658,13 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     io_utils.save_json({"date": schema["date"], "target": schema["target"], "id": schema["id"]}, schema_path)
     save_yaml(cfg, cfg_path)
     console().print(f"[green]Saved:[/green] {model_path}, {scaler_path}, {schema_path}, {cfg_path}")
-    return best_smape, {"model": model_path, "scaler": scaler_path, "schema": schema_path, "config": cfg_path}
+    return best_nll, {
+        "model": model_path,
+        "scaler": scaler_path,
+        "schema": schema_path,
+        "config": cfg_path,
+        "metrics": {"nll": best_nll, "smape": best_smape},
+    }
 
 
 def main() -> None:
@@ -672,8 +675,14 @@ def main() -> None:
     parser.add_argument("--override", nargs="*", default=[])
     args = parser.parse_args()
     cfg = Config.from_files(args.config, overrides=args.override).to_dict()
-    best_smape, paths = train_once(cfg)
-    console().print(f"[bold magenta]Final best SMAPE: {best_smape:.6f}[/bold magenta]")
+    best_nll, paths = train_once(cfg)
+    metrics = paths.get("metrics") if isinstance(paths, dict) else None
+    if isinstance(metrics, dict) and "smape" in metrics:
+        console().print(
+            f"[bold magenta]Final best NLL: {best_nll:.6f} (SMAPE={metrics['smape']:.6f})[/bold magenta]"
+        )
+    else:
+        console().print(f"[bold magenta]Final best NLL: {best_nll:.6f}[/bold magenta]")
 
 
 if __name__ == "__main__":

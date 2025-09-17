@@ -71,12 +71,12 @@ def cmd_tune(args: argparse.Namespace) -> None:
 
     def objective(trial: optuna.Trial) -> float:
         cfg = _apply_trial_to_cfg(base, space, trial)
-        # train_once returns best val_smape
-        val_smape, _ = train_once(cfg)
-        trial.report(val_smape, step=1)
+        # train_once returns best validation NLL
+        val_nll, _ = train_once(cfg)
+        trial.report(val_nll, step=1)
         if trial.should_prune():
             raise optuna.TrialPruned()
-        return val_smape
+        return val_nll
 
     study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
     study.optimize(objective, n_trials=int(args.n_trials), timeout=timeout)
