@@ -50,11 +50,20 @@ def gaussian_nll_loss(
         Tensor of per-element losses with the same shape as ``mu``.
     """
 
+    orig_dtype = mu.dtype
+
+    mu_f32 = mu.to(torch.float32)
+    sigma_f32 = sigma.to(torch.float32)
+    target_f32 = target.to(torch.float32)
+
     if min_sigma > 0.0:
-        sigma = torch.clamp(sigma, min=min_sigma)
-    log_sigma = torch.log(sigma)
-    z = (target - mu) / sigma
-    return 0.5 * (z**2 + 2.0 * log_sigma + LOG_2PI)
+        sigma_f32 = torch.clamp(sigma_f32, min=min_sigma)
+
+    log_sigma = torch.log(sigma_f32)
+    z = (target_f32 - mu_f32) / sigma_f32
+    loss_f32 = 0.5 * (z**2 + 2.0 * log_sigma + mu_f32.new_tensor(LOG_2PI))
+
+    return loss_f32.to(orig_dtype)
 
 
 def _select_device(req: str) -> torch.device:
