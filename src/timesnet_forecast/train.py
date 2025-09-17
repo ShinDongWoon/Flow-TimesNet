@@ -308,27 +308,33 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         wide = wide.clip(lower=0.0)
     ids = list(wide.columns)
 
-    # --- normalization (FIT ONLY ON TRAIN PART to avoid leakage)
+    # --- scaler fit (metadata only; model trains on raw counts)
     # We'll split first to determine train-only fit.
     norm_method = cfg["preprocess"]["normalize"]
     norm_per_series = cfg["preprocess"]["normalize_per_series"]
     eps = cfg["preprocess"]["eps"]
 
     if cfg["train"]["val"]["strategy"] == "holdout":
-        trn_df, val_df = make_holdout_slices(wide, cfg["train"]["val"]["holdout_days"])
-        trn_mask_df, val_mask_df = make_holdout_slices(mask_wide, cfg["train"]["val"]["holdout_days"])
-        scaler, trn_norm = io_utils.fit_series_scaler(
+        trn_df, val_df = make_holdout_slices(
+            wide, cfg["train"]["val"]["holdout_days"]
+        )
+        trn_mask_df, val_mask_df = make_holdout_slices(
+            mask_wide, cfg["train"]["val"]["holdout_days"]
+        )
+        scaler, _ = io_utils.fit_series_scaler(
             trn_df, norm_method, norm_per_series, eps
         )
-        val_norm = _transform_dataframe(val_df, ids, scaler, norm_method)
-        train_arrays = [trn_norm.to_numpy(dtype=np.float32, copy=False)]
-        val_arrays = [val_norm.to_numpy(dtype=np.float32, copy=False)]
+        train_arrays_raw = [trn_df.to_numpy(dtype=np.float32, copy=False)]
+        val_arrays_raw = [val_df.to_numpy(dtype=np.float32, copy=False)]
         train_mask_arrays = [trn_mask_df.to_numpy(dtype=np.float32, copy=False)]
         val_mask_arrays = [val_mask_df.to_numpy(dtype=np.float32, copy=False)]
     else:
         val_cfg = cfg["train"]["val"]
         fold_iter = make_rolling_slices(
-            wide, val_cfg["rolling_folds"], val_cfg["rolling_step_days"], val_cfg["holdout_days"]
+            wide,
+            val_cfg["rolling_folds"],
+            val_cfg["rolling_step_days"],
+            val_cfg["holdout_days"],
         )
         try:
             first_tr, _ = next(fold_iter)
@@ -339,28 +345,33 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             first_tr, norm_method, norm_per_series, eps
         )
 
-        wide_norm = _transform_dataframe(wide, ids, scaler, norm_method)
-        train_arrays: List[np.ndarray] = []
-        val_arrays: List[np.ndarray] = []
+        train_arrays_raw: List[np.ndarray] = []
+        val_arrays_raw: List[np.ndarray] = []
         train_mask_arrays: List[np.ndarray] = []
         val_mask_arrays: List[np.ndarray] = []
         for (tr_df, va_df), (tr_mask_df, va_mask_df) in zip(
             make_rolling_slices(
-                wide_norm, val_cfg["rolling_folds"], val_cfg["rolling_step_days"], val_cfg["holdout_days"]
+                wide,
+                val_cfg["rolling_folds"],
+                val_cfg["rolling_step_days"],
+                val_cfg["holdout_days"],
             ),
             make_rolling_slices(
-                mask_wide, val_cfg["rolling_folds"], val_cfg["rolling_step_days"], val_cfg["holdout_days"]
+                mask_wide,
+                val_cfg["rolling_folds"],
+                val_cfg["rolling_step_days"],
+                val_cfg["holdout_days"],
             ),
         ):
-            train_arrays.append(tr_df.to_numpy(dtype=np.float32, copy=False))
-            val_arrays.append(va_df.to_numpy(dtype=np.float32, copy=False))
+            train_arrays_raw.append(tr_df.to_numpy(dtype=np.float32, copy=False))
+            val_arrays_raw.append(va_df.to_numpy(dtype=np.float32, copy=False))
             train_mask_arrays.append(tr_mask_df.to_numpy(dtype=np.float32, copy=False))
             val_mask_arrays.append(va_mask_df.to_numpy(dtype=np.float32, copy=False))
 
     # --- compute global period length
     k_periods = int(cfg["model"].get("k_periods", 0))
     pmax_cap = int(cfg["model"].get("pmax_cap", 730))
-    pmax_global = _compute_pmax_global(train_arrays, k_periods, pmax_cap)
+    pmax_global = _compute_pmax_global(train_arrays_raw, k_periods, pmax_cap)
     cfg.setdefault("model", {})
     cfg["model"]["pmax"] = int(pmax_global)
     min_period_threshold = int(cfg["model"].get("min_period_threshold", 1))
@@ -371,13 +382,23 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     pred_len = int(cfg["model"]["pred_len"])
     mode = cfg["model"]["mode"]
     dl_train = _build_dataloader(
-        train_arrays, train_mask_arrays, input_len, pred_len, mode, cfg["train"]["batch_size"],
+        train_arrays_raw,
+        train_mask_arrays,
+        input_len,
+        pred_len,
+        mode,
+        cfg["train"]["batch_size"],
         cfg["train"]["num_workers"], cfg["train"]["pin_memory"], cfg["train"]["persistent_workers"],
         cfg["train"]["prefetch_factor"], shuffle=True, drop_last=True,
         augment=cfg["data"].get("augment"), pmax_global=pmax_global,
     )
     dl_val = _build_dataloader(
-        val_arrays, val_mask_arrays, input_len, pred_len, mode, batch_size=cfg["train"]["batch_size"],
+        val_arrays_raw,
+        val_mask_arrays,
+        input_len,
+        pred_len,
+        mode,
+        batch_size=cfg["train"]["batch_size"],
         num_workers=cfg["train"]["num_workers"], pin_memory=cfg["train"]["pin_memory"],
         persistent_workers=cfg["train"]["persistent_workers"], prefetch_factor=cfg["train"]["prefetch_factor"],
         shuffle=False, drop_last=False,
