@@ -54,15 +54,18 @@ def test_dummy_training_smape_wsmape():
             xb = X[idx[j : j + 4]]
             yb = Y[idx[j : j + 4]]
             optimizer.zero_grad()
-            out = model(xb)
-            loss = loss_fn(out, yb)
+            mu_batch, alpha_batch = model(xb)
+            assert torch.all(alpha_batch > 0)
+            loss = loss_fn(mu_batch, yb)
             loss.backward()
             optimizer.step()
 
     input_seq = data[60 - input_len : 60]
     actual = data[60 : 60 + pred_len]
     with torch.no_grad():
-        pred = model(input_seq.unsqueeze(0)).squeeze(0)
+        pred_mu, pred_alpha = model(input_seq.unsqueeze(0))
+        assert torch.all(pred_alpha > 0)
+        pred = pred_mu.squeeze(0)
 
     y_true = actual.numpy()
     y_pred = pred.numpy()

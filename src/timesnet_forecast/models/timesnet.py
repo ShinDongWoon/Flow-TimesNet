@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -159,7 +159,7 @@ class TimesNet(nn.Module):
     """
     입력 [B, T, N] -> PeriodicityTransform -> [B, K, P, N]
     채널/주기 축을 conv1d가 처리하기 쉽게 [B, N, K*P]로 변환 후 InceptionBlock 스택.
-    전역 풀링 후 선형 헤드가 pred_len 생성 (direct) 또는 1스텝 (recursive).
+    전역 풀링 후 선형 헤드가 각 시점에 대한 (mu, alpha) 파라미터를 생성한다.
     """
     def __init__(
         self,
@@ -195,12 +195,14 @@ class TimesNet(nn.Module):
         self.pool: nn.Module = nn.Identity()
         self.head: nn.Module = nn.Identity()
         self._lazy_built = False
+        self._out_steps = self.pred_len if self.mode == "direct" else 1
         self.kernel_set = kernel_set
         self.dropout = float(dropout)
         self.d_model = int(d_model)
         self.n_layers = int(n_layers)
         self.channels_last = bool(channels_last)
         self.use_checkpoint = bool(use_checkpoint)
+        self.positive_eps = 1e-6
 
     def _build_lazy(self, x: torch.Tensor) -> None:
         """Instantiate convolutional blocks on first use.
@@ -232,23 +234,33 @@ class TimesNet(nn.Module):
         # Pool only over the temporal dimension; series dimension is preserved.
         self.pool = nn.AdaptiveAvgPool1d(1)
         out_steps = self.pred_len if self.mode == "direct" else 1
-        # Linear head operates independently for each series on the feature dimension.
-        self.head = nn.Linear(self.d_model, out_steps).to(device=x.device, dtype=x.dtype)
+        self._out_steps = out_steps
+        # Linear head operates independently for each series on the feature dimension
+        # and emits both mean (mu) and dispersion (alpha) parameters.
+        self.head = nn.Linear(self.d_model, out_steps * 2).to(
+            device=x.device, dtype=x.dtype
+        )
         self._lazy_built = True
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B, T, N]
-        returns:
-          direct:    [B, pred_len, N]
-          recursive: [B, 1, N]
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute distribution parameters for the forecast horizon.
+
+        Args:
+            x: Input tensor shaped ``[B, T, N]``.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: ``(mu, alpha)`` where each tensor
+            has shape ``[B, steps, N]`` with ``steps`` equal to ``pred_len`` when
+            ``mode`` is ``"direct"`` and ``1`` otherwise.
         """
         B, T, N = x.shape
         z_all = self.period(x)
         if z_all.size(1) == 0:
-            out_steps = self.pred_len if self.mode == "direct" else 1
-            x_head = x[:, :self.input_len, :]
-            return x_head.new_zeros(B, out_steps, N)
+            out_steps = self._out_steps
+            x_head = x[:, : self.input_len, :]
+            mu = x_head.new_zeros(B, out_steps, N)
+            alpha = x_head.new_full((B, out_steps, N), self.positive_eps)
+            return mu, alpha
 
         z = z_all[:, :, :self.input_len, :]  # leading slice [B, K, input_len, N]
         K = z.size(1)
@@ -265,5 +277,10 @@ class TimesNet(nn.Module):
             z = z.squeeze(-1)
         z = self.pool(z).squeeze(-1)
         z = z.view(B, N, self.d_model)
-        y_all = self.head(z)
-        return y_all.permute(0, 2, 1)
+        params = self.head(z)
+        mu_raw, alpha_raw = params.chunk(2, dim=-1)
+        mu = F.softplus(mu_raw) + self.positive_eps
+        alpha = F.softplus(alpha_raw) + self.positive_eps
+        mu = mu.permute(0, 2, 1)
+        alpha = alpha.permute(0, 2, 1)
+        return mu, alpha
