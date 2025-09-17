@@ -175,6 +175,40 @@ def _masked_mean(loss_tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (loss_tensor * mask).sum() / denom
 
 
+def _masked_std(arrays: List[np.ndarray], masks: List[np.ndarray]) -> float:
+    """Compute the standard deviation across ``arrays`` given element-wise masks."""
+
+    if len(arrays) == 0:
+        return 0.0
+
+    total = 0.0
+    total_sq = 0.0
+    count = 0
+    for arr, mask in zip(arrays, masks):
+        if arr.size == 0:
+            continue
+        if mask is None:
+            values = arr.reshape(-1)
+        else:
+            valid = mask > 0.0
+            if not np.any(valid):
+                continue
+            values = arr[valid]
+        if values.size == 0:
+            continue
+        values64 = values.astype(np.float64, copy=False)
+        total += float(values64.sum())
+        total_sq += float(np.square(values64).sum())
+        count += int(values.size)
+
+    if count == 0:
+        return 0.0
+
+    mean = total / count
+    variance = max(total_sq / count - mean * mean, 0.0)
+    return float(math.sqrt(variance))
+
+
 def _transform_dataframe(
     df: pd.DataFrame,
     ids: List[str],
@@ -408,7 +442,18 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         raise ValueError("Validation split has no windows; increase train.val.holdout_days or adjust model.input_len/pred_len.")
 
     use_loss_masking = bool(cfg["train"].get("use_loss_masking", False))
-    min_sigma = float(cfg["train"].get("min_sigma", 1e-3))
+
+    target_std = _masked_std(train_arrays, train_mask_arrays)
+    min_sigma_cfg = float(cfg["train"].get("min_sigma", 1e-3))
+    min_sigma_scale = float(cfg["train"].get("min_sigma_scale", 0.1))
+    scaled_min_sigma = target_std * min_sigma_scale if target_std > 0.0 else 0.0
+    min_sigma = max(min_sigma_cfg, scaled_min_sigma)
+    cfg.setdefault("train", {})
+    cfg["train"]["min_sigma_effective"] = float(min_sigma)
+    console().print(
+        "[bold green]min_sigma calibrated:[/bold green] "
+        f"{min_sigma:.6f} (target std={target_std:.6f}, scale={min_sigma_scale})"
+    )
 
     # --- model
     model = TimesNet(
