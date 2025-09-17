@@ -338,6 +338,16 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     seed_everything(int(cfg.get("tuning", {}).get("seed", 2025)))
     console().print(f"[bold green]Device:[/bold green] {device}")
 
+    use_graphs = _should_use_cuda_graphs(cfg["train"], device)
+    requested_checkpoint = bool(cfg["train"].get("use_checkpoint", False))
+    use_checkpoint = requested_checkpoint
+    if use_graphs and use_checkpoint:
+        console().print(
+            "[yellow]train.use_checkpoint disabled because train.cuda_graphs is enabled.[/yellow]"
+        )
+        use_checkpoint = False
+    cfg["train"]["use_checkpoint"] = bool(use_checkpoint)
+
     # --- data loading
     schema = io_utils.resolve_schema(cfg)
     enc = cfg["data"]["encoding"]
@@ -469,7 +479,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         activation=str(cfg["model"]["activation"]),
         mode=mode,
         channels_last=cfg["train"]["channels_last"],
-        use_checkpoint=not cfg["train"].get("cuda_graphs", False),
+        use_checkpoint=use_checkpoint,
         min_sigma=min_sigma,
     ).to(device)
 
@@ -542,7 +552,6 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     best_epoch = 0
     accum_steps = int(cfg["train"].get("accumulation_steps", 1))
 
-    use_graphs = _should_use_cuda_graphs(cfg["train"], device)
     if use_graphs:
         warmup_iters = 3
         train_iter = iter(dl_train)

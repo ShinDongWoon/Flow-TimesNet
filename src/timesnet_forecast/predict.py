@@ -80,6 +80,10 @@ def predict_once(cfg: Dict) -> str:
     # Build model
     min_period_threshold = int(cfg_used["model"].get("min_period_threshold", 1))
 
+    use_checkpoint = bool(cfg_used["train"].get("use_checkpoint", False))
+    if cfg_used["train"].get("cuda_graphs", False):
+        use_checkpoint = False
+
     model = TimesNet(
         input_len=int(cfg_used["model"]["input_len"]),
         pred_len=int(cfg_used["model"]["pred_len"]),
@@ -93,7 +97,7 @@ def predict_once(cfg: Dict) -> str:
         activation=str(cfg_used["model"]["activation"]),
         mode=str(cfg_used["model"]["mode"]),
         channels_last=cfg_used["train"]["channels_last"],
-        use_checkpoint=not cfg_used["train"].get("cuda_graphs", False),
+        use_checkpoint=use_checkpoint,
     ).to(device)
     # Lazily construct layers (independent of number of series now).
     dummy = torch.zeros(1, 1, 1, device=device)
