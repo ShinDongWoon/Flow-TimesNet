@@ -119,14 +119,26 @@ def predict_once(cfg: Dict) -> str:
         )
         if cfg_used.get("preprocess", {}).get("clip_negative", False):
             wide = wide.clip(lower=0.0)
-        # align columns to training ids and operate on raw counts
+        # align columns to training ids
         wide = wide.reindex(columns=ids).fillna(0.0)
         X = wide.values.astype(np.float32)
+        # transform by scaler
+        Xn = np.zeros_like(X, dtype=np.float32)
+        for j, c in enumerate(ids):
+            if method == "zscore":
+                mu, sd = scaler[c]
+                Xn[:, j] = (X[:, j] - mu) / (sd if sd != 0 else 1.0)
+            elif method == "minmax":
+                mn, mx = scaler[c]
+                rng = (mx - mn) if (mx - mn) != 0 else 1.0
+                Xn[:, j] = (X[:, j] - mn) / rng
+            else:
+                Xn[:, j] = X[:, j]
 
         # take last pmax (model focuses internally on input_len) with left zero padding if needed
         P = int(cfg_used["model"]["pmax"])
         H = int(cfg_used["model"]["pred_len"])
-        last_seq = _pad_left_zeros(X, need_len=P)  # [P, N]
+        last_seq = _pad_left_zeros(Xn, need_len=P)  # [P, N]
         xb = torch.from_numpy(last_seq).unsqueeze(0)
         if cfg_used["train"]["channels_last"]:
             xb = xb.unsqueeze(-1).to(
@@ -143,10 +155,12 @@ def predict_once(cfg: Dict) -> str:
             else:
                 out = forecast_recursive_batch(model, xb, H)  # [1, H, N]
 
-        P_raw = out.squeeze(0).float().cpu().numpy()  # [H, N]
-        P_raw = np.clip(P_raw, 0.0, None)
+        Pn = out.squeeze(0).float().cpu().numpy()  # [H, N]
+        # inverse transform & clip
+        P = io_utils.inverse_transform(Pn, ids, scaler, method=method)
+        P = np.clip(P, 0.0, None)
 
-        pred_df = pd.DataFrame(P_raw, columns=ids)
+        pred_df = pd.DataFrame(P, columns=ids)
         test_name = os.path.splitext(os.path.basename(fp))[0]
         # Attach row keys for later concatenation
         pred_df["row_key"] = [f"{test_name}+D{i+1}" for i in range(len(pred_df))]
