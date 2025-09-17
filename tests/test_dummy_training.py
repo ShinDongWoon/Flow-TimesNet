@@ -9,6 +9,7 @@ import torch
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 from timesnet_forecast.models.timesnet import TimesNet
+from timesnet_forecast.train import gaussian_nll_loss
 from timesnet_forecast.utils.metrics import wsmape_grouped, smape_mean
 
 
@@ -46,23 +47,24 @@ def test_dummy_training_smape_wsmape():
         _ = model(X[:1])
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    loss_fn = torch.nn.MSELoss()
-
     for _ in range(30):
         idx = torch.randperm(X.size(0))
         for j in range(0, len(idx), 4):
             xb = X[idx[j : j + 4]]
             yb = Y[idx[j : j + 4]]
             optimizer.zero_grad()
-            out = model(xb)
-            loss = loss_fn(out, yb)
+            mu, sigma = model(xb)
+            loss_tensor = gaussian_nll_loss(mu, sigma, yb)
+            loss = loss_tensor.mean()
             loss.backward()
             optimizer.step()
 
     input_seq = data[60 - input_len : 60]
     actual = data[60 : 60 + pred_len]
     with torch.no_grad():
-        pred = model(input_seq.unsqueeze(0)).squeeze(0)
+        pred_mu, pred_sigma = model(input_seq.unsqueeze(0))
+        pred = pred_mu.squeeze(0)
+        assert torch.all(pred_sigma > 0)
 
     y_true = actual.numpy()
     y_pred = pred.numpy()

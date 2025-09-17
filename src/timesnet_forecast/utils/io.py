@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple, Literal
+from typing import Dict, List, Tuple, Literal, Optional
 import os
 import json
 import pickle
@@ -78,7 +78,7 @@ def fit_series_scaler(
     method: Literal["zscore", "minmax", "none"] = "zscore",
     per_series: bool = True,
     eps: float = 1e-8,
-) -> Tuple[Dict[str, Tuple[float, float]], pd.DataFrame]:
+) -> Tuple[Optional[Dict[str, Tuple[float, float]]], pd.DataFrame]:
     """
     Return scaler dict and normalized DataFrame.
     - zscore: (mean, std)
@@ -88,9 +88,7 @@ def fit_series_scaler(
     ids = list(wide_df.columns)
     scaler: Dict[str, Tuple[float, float]] = {}
     if method == "none":
-        for c in ids:
-            scaler[c] = (0.0, 1.0)
-        return scaler, wide_df.copy()
+        return None, wide_df.copy()
 
     X = wide_df.values.astype(np.float32)
     if per_series:
@@ -128,7 +126,10 @@ def fit_series_scaler(
 
 
 def inverse_transform(
-    arr: np.ndarray, ids: List[str], scaler: Dict[str, Tuple[float, float]], method: str
+    arr: np.ndarray,
+    ids: List[str],
+    scaler: Optional[Dict[str, Tuple[float, float]]],
+    method: str,
 ) -> np.ndarray:
     """
     arr: [T_or_H, N]
@@ -136,10 +137,10 @@ def inverse_transform(
     out = np.zeros_like(arr, dtype=np.float32)
     for j, c in enumerate(ids):
         a = arr[:, j]
-        if method == "zscore":
+        if method == "zscore" and scaler is not None:
             mu, sd = scaler[c]
             out[:, j] = a * sd + mu
-        elif method == "minmax":
+        elif method == "minmax" and scaler is not None:
             mn, mx = scaler[c]
             rng = (mx - mn) if (mx - mn) != 0 else 1.0
             out[:, j] = a * rng + mn

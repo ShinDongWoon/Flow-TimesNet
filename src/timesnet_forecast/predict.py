@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from glob import glob
-from typing import List
+from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import torch
@@ -31,18 +31,24 @@ def _pad_left_zeros(arr: np.ndarray, need_len: int) -> np.ndarray:
     return np.concatenate([pad, arr], axis=0)
 
 
-def forecast_direct_batch(model: TimesNet, last_seq: torch.Tensor) -> torch.Tensor:
-    return model(last_seq)  # [B, H, N]
+def forecast_direct_batch(
+    model: TimesNet, last_seq: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return model(last_seq)
 
 
-def forecast_recursive_batch(model: TimesNet, last_seq: torch.Tensor, H: int) -> torch.Tensor:
-    outs = []
+def forecast_recursive_batch(
+    model: TimesNet, last_seq: torch.Tensor, H: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    mus: List[torch.Tensor] = []
+    sigmas: List[torch.Tensor] = []
     seq = last_seq
     for _ in range(H):
-        y1 = model(seq)  # [B, 1, N]
-        outs.append(y1)
-        seq = torch.cat([seq[:, 1:, :], y1], dim=1)
-    return torch.cat(outs, dim=1)
+        mu_step, sigma_step = model(seq)
+        mus.append(mu_step)
+        sigmas.append(sigma_step)
+        seq = torch.cat([seq[:, 1:, :], mu_step], dim=1)
+    return torch.cat(mus, dim=1), torch.cat(sigmas, dim=1)
 
 
 def predict_once(cfg: Dict) -> str:
@@ -123,17 +129,20 @@ def predict_once(cfg: Dict) -> str:
         wide = wide.reindex(columns=ids).fillna(0.0)
         X = wide.values.astype(np.float32)
         # transform by scaler
-        Xn = np.zeros_like(X, dtype=np.float32)
-        for j, c in enumerate(ids):
-            if method == "zscore":
-                mu, sd = scaler[c]
-                Xn[:, j] = (X[:, j] - mu) / (sd if sd != 0 else 1.0)
-            elif method == "minmax":
-                mn, mx = scaler[c]
-                rng = (mx - mn) if (mx - mn) != 0 else 1.0
-                Xn[:, j] = (X[:, j] - mn) / rng
-            else:
-                Xn[:, j] = X[:, j]
+        if method == "none" or scaler is None:
+            Xn = X
+        else:
+            Xn = np.zeros_like(X, dtype=np.float32)
+            for j, c in enumerate(ids):
+                if method == "zscore":
+                    mu, sd = scaler[c]
+                    Xn[:, j] = (X[:, j] - mu) / (sd if sd != 0 else 1.0)
+                elif method == "minmax":
+                    mn, mx = scaler[c]
+                    rng = (mx - mn) if (mx - mn) != 0 else 1.0
+                    Xn[:, j] = (X[:, j] - mn) / rng
+                else:
+                    Xn[:, j] = X[:, j]
 
         # take last pmax (model focuses internally on input_len) with left zero padding if needed
         P = int(cfg_used["model"]["pmax"])
@@ -151,11 +160,11 @@ def predict_once(cfg: Dict) -> str:
 
         with torch.inference_mode(), amp_autocast(cfg_used["train"]["amp"] and device.type == "cuda"):
             if cfg_used["model"]["mode"] == "direct":
-                out = forecast_direct_batch(model, xb)  # [1, H, N]
+                mu_pred, _ = forecast_direct_batch(model, xb)
             else:
-                out = forecast_recursive_batch(model, xb, H)  # [1, H, N]
+                mu_pred, _ = forecast_recursive_batch(model, xb, H)
 
-        Pn = out.squeeze(0).float().cpu().numpy()  # [H, N]
+        Pn = mu_pred.squeeze(0).float().cpu().numpy()  # [H, N]
         # inverse transform & clip
         P = io_utils.inverse_transform(Pn, ids, scaler, method=method)
         P = np.clip(P, 0.0, None)
