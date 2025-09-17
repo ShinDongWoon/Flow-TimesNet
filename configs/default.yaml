@@ -15,7 +15,7 @@ data:
 
 preprocess:
   to_wide: true
-  normalize: "zscore"         # zscore|minmax|none
+  normalize: "none"           # zscore|minmax|none
   normalize_per_series: true
   eps: 1.0e-8
   clip_negative: true
@@ -32,6 +32,7 @@ train:
   amp: true
   compile: true
   cuda_graphs: false         # Mutually exclusive with compile
+  min_sigma: 1.0e-3
   lr_scheduler:
     type: "cosine"
     T_max: ${train.epochs}   # or explicit integer

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -176,11 +176,13 @@ class TimesNet(nn.Module):
         min_period_threshold: int = 1,
         channels_last: bool = False,
         use_checkpoint: bool = True,
+        min_sigma: float = 1e-3,
     ) -> None:
         super().__init__()
         assert mode in ("direct", "recursive")
         self.mode = mode
         self.pred_len = int(pred_len)
+        self._out_steps = self.pred_len if self.mode == "direct" else 1
         self.period = PeriodicityTransform(
             k_periods=k_periods,
             pmax=pmax,
@@ -201,6 +203,7 @@ class TimesNet(nn.Module):
         self.n_layers = int(n_layers)
         self.channels_last = bool(channels_last)
         self.use_checkpoint = bool(use_checkpoint)
+        self.min_sigma = float(min_sigma)
 
     def _build_lazy(self, x: torch.Tensor) -> None:
         """Instantiate convolutional blocks on first use.
@@ -231,24 +234,26 @@ class TimesNet(nn.Module):
         self.blocks = nn.ModuleList(blocks)
         # Pool only over the temporal dimension; series dimension is preserved.
         self.pool = nn.AdaptiveAvgPool1d(1)
-        out_steps = self.pred_len if self.mode == "direct" else 1
+        out_steps = self._out_steps
         # Linear head operates independently for each series on the feature dimension.
-        self.head = nn.Linear(self.d_model, out_steps).to(device=x.device, dtype=x.dtype)
+        self.head = nn.Linear(self.d_model, out_steps * 2).to(device=x.device, dtype=x.dtype)
         self._lazy_built = True
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         x: [B, T, N]
         returns:
-          direct:    [B, pred_len, N]
-          recursive: [B, 1, N]
+          Tuple(mu, sigma) where each tensor has shape:
+            direct:    [B, pred_len, N]
+            recursive: [B, 1, N]
         """
         B, T, N = x.shape
         z_all = self.period(x)
         if z_all.size(1) == 0:
-            out_steps = self.pred_len if self.mode == "direct" else 1
-            x_head = x[:, :self.input_len, :]
-            return x_head.new_zeros(B, out_steps, N)
+            out_steps = self._out_steps
+            mu = x.new_zeros(B, out_steps, N)
+            sigma = x.new_full((B, out_steps, N), self.min_sigma)
+            return mu, sigma
 
         z = z_all[:, :, :self.input_len, :]  # leading slice [B, K, input_len, N]
         K = z.size(1)
@@ -266,4 +271,9 @@ class TimesNet(nn.Module):
         z = self.pool(z).squeeze(-1)
         z = z.view(B, N, self.d_model)
         y_all = self.head(z)
-        return y_all.permute(0, 2, 1)
+        out_steps = self._out_steps
+        params = y_all.view(B, N, out_steps, 2)
+        mu = params[..., 0].permute(0, 2, 1).contiguous()
+        log_sigma = params[..., 1]
+        sigma = F.softplus(log_sigma).permute(0, 2, 1).contiguous() + self.min_sigma
+        return mu, sigma

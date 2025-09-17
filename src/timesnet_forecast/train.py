@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Dict, List, Tuple
+import math
+from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import torch
@@ -28,30 +29,32 @@ from .models.timesnet import TimesNet, PeriodicityTransform
 from .predict import forecast_recursive_batch
 
 
-class WSMAPELoss(nn.Module):
-    """Differentiable approximation of weighted SMAPE."""
+LOG_2PI = math.log(2.0 * math.pi)
 
-    def __init__(self, eps: float = 1e-8, reduction: str = "mean") -> None:
-        super().__init__()
-        self.eps = eps
-        self.reduction = reduction
 
-    def forward(
-        self,
-        y_pred: torch.Tensor,
-        y_true: torch.Tensor,
-        reduction: str | None = None,
-    ) -> torch.Tensor:
-        denom = torch.abs(y_true) + torch.abs(y_pred) + self.eps
-        loss = 2.0 * torch.abs(y_pred - y_true) / denom
-        red = self.reduction if reduction is None else reduction
-        if red == "none":
-            return loss
-        if red == "sum":
-            return loss.sum()
-        if red == "mean":
-            return loss.mean()
-        raise ValueError(f"Unsupported reduction: {red}")
+def gaussian_nll_loss(
+    mu: torch.Tensor,
+    sigma: torch.Tensor,
+    target: torch.Tensor,
+    min_sigma: float = 0.0,
+) -> torch.Tensor:
+    """Element-wise Gaussian negative log-likelihood.
+
+    Args:
+        mu: Predicted mean ``[B, H, N]``.
+        sigma: Predicted standard deviation ``[B, H, N]``.
+        target: Ground truth ``[B, H, N]``.
+        min_sigma: Optional clamp ensuring strictly positive variance.
+
+    Returns:
+        Tensor of per-element losses with the same shape as ``mu``.
+    """
+
+    if min_sigma > 0.0:
+        sigma = torch.clamp(sigma, min=min_sigma)
+    log_sigma = torch.log(sigma)
+    z = (target - mu) / sigma
+    return 0.5 * (z**2 + 2.0 * log_sigma + LOG_2PI)
 
 
 def _select_device(req: str) -> torch.device:
@@ -167,11 +170,13 @@ def _masked_mean(loss_tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 def _transform_dataframe(
     df: pd.DataFrame,
     ids: List[str],
-    scaler: Dict[str, Tuple[float, float]],
+    scaler: Optional[Dict[str, Tuple[float, float]]],
     method: str,
 ) -> pd.DataFrame:
     """Apply a fitted scaler to a wide-format DataFrame."""
 
+    if method == "none" or scaler is None:
+        return df.copy()
     X = df.to_numpy(dtype=np.float32, copy=True)
     out = np.zeros_like(X, dtype=np.float32)
     for j, c in enumerate(ids):
@@ -206,24 +211,26 @@ def _eval_wsmape(
         for xb, yb, mask in loader:
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
-            if use_loss_mask:
-                mask = move_to_device(mask, device)
-            else:
-                mask = None
+            loss_mask = move_to_device(mask, device) if use_loss_mask else None
+            if loss_mask is not None:
+                loss_mask = loss_mask.to(yb.dtype)
             if channels_last and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
             _assert_min_len(xb, model.period.pmax)
             if mode == "direct":
-                out = model(xb)  # [B, H, N]
+                mu, _ = model(xb)
             else:
                 # recursive multi-step forecast during validation
-                out = forecast_recursive_batch(model, xb, pred_len)  # [B, H, N]
-                out = out[:, : yb.shape[1], :]  # align horizon with provided targets
-            if use_loss_mask and mask is not None:
-                yb = yb * mask
-                out = out * mask
-            ys.append(yb.detach().float().cpu().numpy())
-            ps.append(out.detach().float().cpu().numpy())
+                mu, _ = forecast_recursive_batch(model, xb, pred_len)
+                mu = mu[:, : yb.shape[1], :]
+            if loss_mask is not None:
+                yb_eval = yb * loss_mask
+                mu_eval = mu * loss_mask
+            else:
+                yb_eval = yb
+                mu_eval = mu
+            ys.append(yb_eval.detach().float().cpu().numpy())
+            ps.append(mu_eval.detach().float().cpu().numpy())
     Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
     P = np.concatenate(ps, axis=0).reshape(-1, len(ids))
     return wsmape_grouped(Y, P, ids=ids, weights=None)
@@ -238,34 +245,52 @@ def _eval_smape(
     pred_len: int,
     channels_last: bool = False,
     use_loss_mask: bool = False,
-) -> float:
+    return_nll: bool = False,
+    min_sigma: float = 0.0,
+) -> float | Tuple[float, float]:
     model.eval()
     ys: List[np.ndarray] = []
     ps: List[np.ndarray] = []
+    nll_num = 0.0
+    nll_den = 0.0
     with torch.inference_mode(), amp_autocast(True if device.type == "cuda" else False):
         for xb, yb, mask in loader:
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
-            if use_loss_mask:
-                mask = move_to_device(mask, device)
-            else:
-                mask = None
+            loss_mask = move_to_device(mask, device) if use_loss_mask else None
+            if loss_mask is not None:
+                loss_mask = loss_mask.to(yb.dtype)
             if channels_last and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
             _assert_min_len(xb, model.period.pmax)
             if mode == "direct":
-                out = model(xb)  # [B, H, N]
+                mu, sigma = model(xb)
             else:
-                out = forecast_recursive_batch(model, xb, pred_len)
-                out = out[:, : yb.shape[1], :]
-            if use_loss_mask and mask is not None:
-                yb = yb * mask
-                out = out * mask
-            ys.append(yb.detach().float().cpu().numpy())
-            ps.append(out.detach().float().cpu().numpy())
+                mu, sigma = forecast_recursive_batch(model, xb, pred_len)
+                mu = mu[:, : yb.shape[1], :]
+                sigma = sigma[:, : yb.shape[1], :]
+            if loss_mask is not None:
+                yb_eval = yb * loss_mask
+                mu_eval = mu * loss_mask
+            else:
+                yb_eval = yb
+                mu_eval = mu
+            if return_nll:
+                mask_for_loss = (
+                    loss_mask if loss_mask is not None else torch.ones_like(yb)
+                ).to(yb.dtype)
+                loss_tensor = gaussian_nll_loss(mu, sigma, yb, min_sigma=min_sigma)
+                nll_num += float((loss_tensor * mask_for_loss).sum().item())
+                nll_den += float(mask_for_loss.sum().item())
+            ys.append(yb_eval.detach().float().cpu().numpy())
+            ps.append(mu_eval.detach().float().cpu().numpy())
     Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
     P = np.concatenate(ps, axis=0).reshape(-1, len(ids))
-    return smape_mean(Y, P)
+    smape = smape_mean(Y, P)
+    if return_nll:
+        denom = nll_den if nll_den > 0 else 1.0
+        return smape, nll_num / denom
+    return smape
 
 
 def train_once(cfg: Dict) -> Tuple[float, Dict]:
@@ -300,10 +325,15 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     if cfg["train"]["val"]["strategy"] == "holdout":
         trn_df, val_df = make_holdout_slices(wide, cfg["train"]["val"]["holdout_days"])
         trn_mask_df, val_mask_df = make_holdout_slices(mask_wide, cfg["train"]["val"]["holdout_days"])
-        scaler, trn_norm = io_utils.fit_series_scaler(
-            trn_df, norm_method, norm_per_series, eps
-        )
-        val_norm = _transform_dataframe(val_df, ids, scaler, norm_method)
+        if norm_method == "none":
+            scaler = None
+            trn_norm = trn_df.copy()
+            val_norm = val_df.copy()
+        else:
+            scaler, trn_norm = io_utils.fit_series_scaler(
+                trn_df, norm_method, norm_per_series, eps
+            )
+            val_norm = _transform_dataframe(val_df, ids, scaler, norm_method)
         train_arrays = [trn_norm.to_numpy(dtype=np.float32, copy=False)]
         val_arrays = [val_norm.to_numpy(dtype=np.float32, copy=False)]
         train_mask_arrays = [trn_mask_df.to_numpy(dtype=np.float32, copy=False)]
@@ -318,11 +348,15 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         except StopIteration:
             raise ValueError("No folds produced; check rolling validation configuration")
 
-        scaler, _ = io_utils.fit_series_scaler(
-            first_tr, norm_method, norm_per_series, eps
-        )
+        if norm_method == "none":
+            scaler = None
+            wide_norm = wide.copy()
+        else:
+            scaler, _ = io_utils.fit_series_scaler(
+                first_tr, norm_method, norm_per_series, eps
+            )
 
-        wide_norm = _transform_dataframe(wide, ids, scaler, norm_method)
+            wide_norm = _transform_dataframe(wide, ids, scaler, norm_method)
         train_arrays: List[np.ndarray] = []
         val_arrays: List[np.ndarray] = []
         train_mask_arrays: List[np.ndarray] = []
@@ -371,6 +405,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         raise ValueError("Validation split has no windows; increase train.val.holdout_days or adjust model.input_len/pred_len.")
 
     use_loss_masking = bool(cfg["train"].get("use_loss_masking", False))
+    min_sigma = float(cfg["train"].get("min_sigma", 1e-3))
 
     # --- model
     model = TimesNet(
@@ -387,6 +422,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         mode=mode,
         channels_last=cfg["train"]["channels_last"],
         use_checkpoint=not cfg["train"].get("cuda_graphs", False),
+        min_sigma=min_sigma,
     ).to(device)
 
     # Lazily build model parameters so that downstream utilities see them
@@ -448,8 +484,6 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             device=device.type,
             enabled=cfg["train"]["amp"] and device.type == "cuda",
         )
-    loss_fn = WSMAPELoss()
-
     # --- training loop
     best_smape = float("inf")
     best_state = None
@@ -471,15 +505,15 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             xb_w = xb_w.to(device, non_blocking=True)
             yb_w = yb_w.to(device, non_blocking=True)
             if use_loss_masking:
-                mb_w = mb_w.to(device, non_blocking=True)
+                mb_w = mb_w.to(device, non_blocking=True).to(yb_w.dtype)
             else:
                 mb_w = torch.ones_like(yb_w)
             if cfg["train"]["channels_last"] and xb_w.dim() == 4:
                 xb_w = xb_w.to(memory_format=torch.channels_last)
             _assert_min_len(xb_w, model.period.pmax)
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
-                out_w = model(xb_w)
-                loss_tensor = loss_fn(out_w, yb_w, reduction="none")
+                mu_w, sigma_w = model(xb_w)
+                loss_tensor = gaussian_nll_loss(mu_w, sigma_w, yb_w, min_sigma=min_sigma)
                 loss_w = _masked_mean(loss_tensor, mb_w) / accum_steps
             grad_scaler.scale(loss_w).backward()
             if (w + 1) % accum_steps == 0:
@@ -494,7 +528,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         xb0 = xb0.to(device, non_blocking=True)
         yb0 = yb0.to(device, non_blocking=True)
         if use_loss_masking:
-            mb0 = mb0.to(device, non_blocking=True)
+            mb0 = mb0.to(device, non_blocking=True).to(yb0.dtype)
         else:
             mb0 = torch.ones_like(yb0)
         if cfg["train"]["channels_last"] and xb0.dim() == 4:
@@ -513,8 +547,10 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             graph.capture_begin()
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                 _assert_min_len(static_x, model.period.pmax)
-                static_out = model(static_x)
-                static_loss_tensor = loss_fn(static_out, static_y, reduction="none")
+                static_mu, static_sigma = model(static_x)
+                static_loss_tensor = gaussian_nll_loss(
+                    static_mu, static_sigma, static_y, min_sigma=min_sigma
+                )
                 static_loss = _masked_mean(static_loss_tensor, static_m)
                 static_scaled = static_loss / accum_steps
             grad_scaler.scale(static_scaled).backward()
@@ -540,7 +576,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
             if use_loss_masking:
-                mb = mb.to(device, non_blocking=True)
+                mb = mb.to(device, non_blocking=True).to(yb.dtype)
             else:
                 mb = torch.ones_like(yb)
             if cfg["train"]["channels_last"] and xb.dim() == 4:
@@ -550,8 +586,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 loss_val = graph_step(xb, yb, mb)
             else:
                 with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
-                    out = model(xb)  # [B, H, N] or [B,1,N]
-                    loss_tensor = loss_fn(out, yb, reduction="none")
+                    mu, sigma = model(xb)
+                    loss_tensor = gaussian_nll_loss(mu, sigma, yb, min_sigma=min_sigma)
                     masked_loss = _masked_mean(loss_tensor, mb)
                     loss = masked_loss / accum_steps
                 grad_scaler.scale(loss).backward()
@@ -565,7 +601,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 optim.zero_grad(set_to_none=True)
             losses.append(float(loss_val))
 
-        val_smape = _eval_smape(
+        eval_metrics = _eval_smape(
             model,
             dl_val,
             device,
@@ -574,8 +610,13 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             pred_len,
             cfg["train"]["channels_last"],
             use_loss_mask=use_loss_masking,
+            return_nll=True,
+            min_sigma=min_sigma,
         )
-        console().print(f"[bold]Epoch {ep}[/bold] loss={np.mean(losses):.6f}  val_smape={val_smape:.6f}")
+        val_smape, val_nll = eval_metrics
+        console().print(
+            f"[bold]Epoch {ep}[/bold] loss={np.mean(losses):.6f}  val_smape={val_smape:.6f}  val_nll={val_nll:.6f}"
+        )
         if scheduler is not None:
             if sched_type == "ReduceLROnPlateau":
                 scheduler.step(val_smape)
