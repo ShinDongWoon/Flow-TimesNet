@@ -53,3 +53,23 @@ def test_gaussian_nll_autocast_stability():
         loss = gaussian_nll_loss(mu, sigma, target, min_sigma=1e-6)
 
     assert torch.isfinite(loss).all()
+
+
+def test_gaussian_nll_autocast_large_residuals_remain_float32():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        autocast_ctx = torch.cuda.amp.autocast(dtype=torch.float16)
+    elif hasattr(torch, "autocast"):
+        autocast_ctx = torch.autocast(device_type="cpu", dtype=torch.bfloat16)
+    else:
+        autocast_ctx = nullcontext()
+
+    mu = torch.zeros((2, 1, 1), dtype=torch.float16, device=device)
+    sigma = torch.ones_like(mu)
+    target = torch.full((2, 1, 1), 1e6, dtype=torch.float32, device=device)
+
+    with autocast_ctx:
+        loss = gaussian_nll_loss(mu, sigma, target, min_sigma=1e-6)
+
+    assert loss.dtype == torch.float32
+    assert torch.isfinite(loss).all()

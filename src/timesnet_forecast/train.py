@@ -47,10 +47,9 @@ def gaussian_nll_loss(
         min_sigma: Optional clamp ensuring strictly positive variance.
 
     Returns:
-        Tensor of per-element losses with the same shape as ``mu``.
+        Tensor of per-element losses with the same shape as ``mu`` stored in
+        ``float32`` precision to preserve numerical stability under AMP.
     """
-
-    orig_dtype = mu.dtype
 
     mu_f32 = mu.to(torch.float32)
     sigma_f32 = sigma.to(torch.float32)
@@ -63,7 +62,7 @@ def gaussian_nll_loss(
     z = (target_f32 - mu_f32) / sigma_f32
     loss_f32 = 0.5 * (z**2 + 2.0 * log_sigma + mu_f32.new_tensor(LOG_2PI))
 
-    return loss_f32.to(orig_dtype)
+    return loss_f32
 
 
 def _select_device(req: str) -> torch.device:
