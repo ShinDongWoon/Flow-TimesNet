@@ -33,6 +33,7 @@ train:
   compile: true
   cuda_graphs: false         # Mutually exclusive with compile
   min_sigma: 1.0e-3
+  min_sigma_scale: 0.1       # floor multiplier applied to train target std
   lr_scheduler:
     type: "cosine"
     T_max: ${train.epochs}   # or explicit integer
