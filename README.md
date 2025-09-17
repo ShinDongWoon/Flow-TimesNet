@@ -3,7 +3,7 @@
 - Validation holdout period must be at least `input_len + pred_len` days.
 - Submission files now output actual business dates in the first column instead of row keys.
 - Optional early stopping: set `train.early_stopping_patience` to an integer to stop training
-  when validation WSMAPE does not improve for that many consecutive epochs. Leave it unset or
+  when the validation Gaussian NLL does not improve for that many consecutive epochs. Leave it unset or
   `null` to disable early stopping.
 - Simple data augmentation can be enabled via the `data.augment` section of the config.
   - `add_noise_std`: standard deviation of Gaussian noise added to input windows.
@@ -12,8 +12,8 @@
   the original data scale. When normalisation is disabled the saved scaler artifact stores `None`.
 - TimesNet now emits probabilistic forecasts `(mu, sigma)` and training optimises a Gaussian
   negative log-likelihood with a configurable `train.min_sigma` lower bound for numerical
-  stability. Validation still reports SMAPE for model selection while logging the mean NLL for
-  monitoring.
+  stability. Validation uses the mean Gaussian NLL for model selection while still reporting
+  SMAPE as a secondary diagnostic metric.
 - Configuration option `model.inception_kernel_set` has been renamed to `model.kernel_set`. The previous name is still accepted for backward compatibility.
 - Using CUDA Graphs (`train.cuda_graphs: true`) disables dropout because the model is placed in evaluation mode during graph capture. This trades regularization for faster execution.
 - Manual CUDA graph capture (`train.cuda_graphs`) and `torch.compile` (`train.compile`) are mutually exclusive. TorchDynamo already performs graph capture and its compiled modules cannot be re-captured safely.

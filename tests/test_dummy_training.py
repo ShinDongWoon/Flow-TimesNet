@@ -1,15 +1,17 @@
 import math
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 
 import numpy as np
+import pytest
 import torch
 
 # Ensure the project src is on the path for imports
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 from timesnet_forecast.models.timesnet import TimesNet
-from timesnet_forecast.train import gaussian_nll_loss
+from timesnet_forecast.train import gaussian_nll_loss, _eval_metrics
 from timesnet_forecast.utils.metrics import wsmape_grouped, smape_mean
 
 
@@ -74,3 +76,48 @@ def test_dummy_training_smape_wsmape():
 
     assert smape < 0.1
     assert wsmape < 0.1
+
+
+def test_eval_metrics_returns_masked_nll():
+    mu = torch.tensor([[[1.5, 2.0], [2.0, 4.0]]], dtype=torch.float32)
+    sigma = torch.full_like(mu, 0.5)
+    target = torch.tensor([[[1.0, 2.5], [3.0, 1.0]]], dtype=torch.float32)
+    mask = torch.tensor([[[1.0, 0.0], [1.0, 1.0]]], dtype=torch.float32)
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self, mu: torch.Tensor, sigma: torch.Tensor) -> None:
+            super().__init__()
+            self.register_buffer("mu_buf", mu)
+            self.register_buffer("sigma_buf", sigma)
+            self.period = SimpleNamespace(pmax=1)
+
+        def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            batch = x.shape[0]
+            mu = self.mu_buf.expand(batch, -1, -1)
+            sigma = self.sigma_buf.expand(batch, -1, -1)
+            return mu, sigma
+
+    model = DummyModel(mu, sigma)
+    xb = torch.zeros((1, 3, 2), dtype=torch.float32)
+    loader = [(xb, target, mask)]
+    metrics = _eval_metrics(
+        model,
+        loader,
+        torch.device("cpu"),
+        mode="direct",
+        ids=["A_1", "A_2"],
+        pred_len=2,
+        channels_last=False,
+        use_loss_mask=True,
+        min_sigma=0.0,
+    )
+
+    expected_loss = gaussian_nll_loss(mu, sigma, target)
+    expected_nll = float((expected_loss * mask).sum().item() / mask.sum().item())
+    expected_smape = smape_mean(
+        (target * mask).numpy().reshape(-1, 2),
+        (mu * mask).numpy().reshape(-1, 2),
+    )
+
+    assert metrics["nll"] == pytest.approx(expected_nll)
+    assert metrics["smape"] == pytest.approx(expected_smape)
