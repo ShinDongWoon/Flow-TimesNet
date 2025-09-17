@@ -32,17 +32,16 @@ def _pad_left_zeros(arr: np.ndarray, need_len: int) -> np.ndarray:
 
 
 def forecast_direct_batch(model: TimesNet, last_seq: torch.Tensor) -> torch.Tensor:
-    mu, _ = model(last_seq)
-    return mu  # [B, H, N]
+    return model(last_seq)  # [B, H, N]
 
 
 def forecast_recursive_batch(model: TimesNet, last_seq: torch.Tensor, H: int) -> torch.Tensor:
     outs = []
     seq = last_seq
     for _ in range(H):
-        mu_step, _ = model(seq)  # [B, 1, N]
-        outs.append(mu_step)
-        seq = torch.cat([seq[:, 1:, :], mu_step], dim=1)
+        y1 = model(seq)  # [B, 1, N]
+        outs.append(y1)
+        seq = torch.cat([seq[:, 1:, :], y1], dim=1)
     return torch.cat(outs, dim=1)
 
 
@@ -152,9 +151,9 @@ def predict_once(cfg: Dict) -> str:
 
         with torch.inference_mode(), amp_autocast(cfg_used["train"]["amp"] and device.type == "cuda"):
             if cfg_used["model"]["mode"] == "direct":
-                out = forecast_direct_batch(model, xb)  # mean forecasts [1, H, N]
+                out = forecast_direct_batch(model, xb)  # [1, H, N]
             else:
-                out = forecast_recursive_batch(model, xb, H)  # mean forecasts [1, H, N]
+                out = forecast_recursive_batch(model, xb, H)  # [1, H, N]
 
         Pn = out.squeeze(0).float().cpu().numpy()  # [H, N]
         # inverse transform & clip

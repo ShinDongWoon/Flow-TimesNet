@@ -28,46 +28,29 @@ from .models.timesnet import TimesNet, PeriodicityTransform
 from .predict import forecast_recursive_batch
 
 
-class NegativeBinomialNLLLoss(nn.Module):
-    """Negative log-likelihood for a mean/dispersion parameterised NB."""
+class WSMAPELoss(nn.Module):
+    """Differentiable approximation of weighted SMAPE."""
 
     def __init__(self, eps: float = 1e-8, reduction: str = "mean") -> None:
         super().__init__()
-        self.eps = float(eps)
+        self.eps = eps
         self.reduction = reduction
 
     def forward(
         self,
-        mu: torch.Tensor,
-        alpha: torch.Tensor,
+        y_pred: torch.Tensor,
         y_true: torch.Tensor,
         reduction: str | None = None,
     ) -> torch.Tensor:
-        mu = torch.clamp(mu, min=self.eps)
-        alpha = torch.clamp(alpha, min=self.eps)
-        y_true = y_true.to(mu.dtype)
-
-        r = 1.0 / torch.clamp(alpha, min=self.eps)
-        log_r = torch.log(torch.clamp(r, min=self.eps))
-        log_mu = torch.log(mu)
-        log_r_plus_mu = torch.log(r + mu + self.eps)
-
-        log_prob = (
-            torch.lgamma(y_true + r)
-            - torch.lgamma(r)
-            - torch.lgamma(y_true + 1.0)
-            + r * (log_r - log_r_plus_mu)
-            + y_true * (log_mu - log_r_plus_mu)
-        )
-        nll = -log_prob
-
+        denom = torch.abs(y_true) + torch.abs(y_pred) + self.eps
+        loss = 2.0 * torch.abs(y_pred - y_true) / denom
         red = self.reduction if reduction is None else reduction
         if red == "none":
-            return nll
+            return loss
         if red == "sum":
-            return nll.sum()
+            return loss.sum()
         if red == "mean":
-            return nll.mean()
+            return loss.mean()
         raise ValueError(f"Unsupported reduction: {red}")
 
 
@@ -231,16 +214,16 @@ def _eval_wsmape(
                 xb = xb.to(memory_format=torch.channels_last)
             _assert_min_len(xb, model.period.pmax)
             if mode == "direct":
-                mu_pred, _ = model(xb)  # [B, H, N]
+                out = model(xb)  # [B, H, N]
             else:
                 # recursive multi-step forecast during validation
-                mu_pred = forecast_recursive_batch(model, xb, pred_len)  # [B, H, N]
-                mu_pred = mu_pred[:, : yb.shape[1], :]  # align horizon with provided targets
+                out = forecast_recursive_batch(model, xb, pred_len)  # [B, H, N]
+                out = out[:, : yb.shape[1], :]  # align horizon with provided targets
             if use_loss_mask and mask is not None:
                 yb = yb * mask
-                mu_pred = mu_pred * mask
+                out = out * mask
             ys.append(yb.detach().float().cpu().numpy())
-            ps.append(mu_pred.detach().float().cpu().numpy())
+            ps.append(out.detach().float().cpu().numpy())
     Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
     P = np.concatenate(ps, axis=0).reshape(-1, len(ids))
     return wsmape_grouped(Y, P, ids=ids, weights=None)
@@ -271,15 +254,15 @@ def _eval_smape(
                 xb = xb.to(memory_format=torch.channels_last)
             _assert_min_len(xb, model.period.pmax)
             if mode == "direct":
-                mu_pred, _ = model(xb)  # [B, H, N]
+                out = model(xb)  # [B, H, N]
             else:
-                mu_pred = forecast_recursive_batch(model, xb, pred_len)
-                mu_pred = mu_pred[:, : yb.shape[1], :]
+                out = forecast_recursive_batch(model, xb, pred_len)
+                out = out[:, : yb.shape[1], :]
             if use_loss_mask and mask is not None:
                 yb = yb * mask
-                mu_pred = mu_pred * mask
+                out = out * mask
             ys.append(yb.detach().float().cpu().numpy())
-            ps.append(mu_pred.detach().float().cpu().numpy())
+            ps.append(out.detach().float().cpu().numpy())
     Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
     P = np.concatenate(ps, axis=0).reshape(-1, len(ids))
     return smape_mean(Y, P)
@@ -465,7 +448,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             device=device.type,
             enabled=cfg["train"]["amp"] and device.type == "cuda",
         )
-    loss_fn = NegativeBinomialNLLLoss()
+    loss_fn = WSMAPELoss()
 
     # --- training loop
     best_smape = float("inf")
@@ -495,8 +478,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 xb_w = xb_w.to(memory_format=torch.channels_last)
             _assert_min_len(xb_w, model.period.pmax)
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
-                mu_w, alpha_w = model(xb_w)
-                loss_tensor = loss_fn(mu_w, alpha_w, yb_w, reduction="none")
+                out_w = model(xb_w)
+                loss_tensor = loss_fn(out_w, yb_w, reduction="none")
                 loss_w = _masked_mean(loss_tensor, mb_w) / accum_steps
             grad_scaler.scale(loss_w).backward()
             if (w + 1) % accum_steps == 0:
@@ -530,8 +513,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             graph.capture_begin()
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                 _assert_min_len(static_x, model.period.pmax)
-                static_mu, static_alpha = model(static_x)
-                static_loss_tensor = loss_fn(static_mu, static_alpha, static_y, reduction="none")
+                static_out = model(static_x)
+                static_loss_tensor = loss_fn(static_out, static_y, reduction="none")
                 static_loss = _masked_mean(static_loss_tensor, static_m)
                 static_scaled = static_loss / accum_steps
             grad_scaler.scale(static_scaled).backward()
@@ -567,8 +550,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 loss_val = graph_step(xb, yb, mb)
             else:
                 with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
-                    mu_pred, alpha_pred = model(xb)  # [B, H, N] or [B,1,N]
-                    loss_tensor = loss_fn(mu_pred, alpha_pred, yb, reduction="none")
+                    out = model(xb)  # [B, H, N] or [B,1,N]
+                    loss_tensor = loss_fn(out, yb, reduction="none")
                     masked_loss = _masked_mean(loss_tensor, mb)
                     loss = masked_loss / accum_steps
                 grad_scaler.scale(loss).backward()
