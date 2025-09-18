@@ -1,3 +1,4 @@
+import math
 import sys
 from pathlib import Path
 
@@ -296,6 +297,76 @@ def test_period_group_chunk_helper_caps_size(monkeypatch):
     finally:
         model.period_group_max_chunk_bytes = max_bytes_backup
         model.period_group_chunk = chunk_backup
+
+
+def test_period_group_chunks_shrink_with_budget(monkeypatch):
+    torch.manual_seed(0)
+    B, L, H, N = 1, 32, 4, 1
+    dtype = torch.float32
+    model = TimesNet(
+        input_len=L,
+        pred_len=H,
+        d_model=4,
+        n_layers=0,
+        k_periods=1,
+        pmax=L,
+        kernel_set=[3],
+        dropout=0.0,
+        activation="gelu",
+        mode="direct",
+        use_checkpoint=False,
+    )
+    with torch.no_grad():
+        model(torch.randn(1, L, N, dtype=dtype))
+
+    tile_count = 12
+    cycles = 2
+    period = 3
+    values = torch.randn(tile_count, cycles, period, dtype=dtype)
+    batch_indices = torch.zeros(tile_count, dtype=torch.long)
+    freq_indices = torch.zeros(tile_count, dtype=torch.long)
+    fake_group = PeriodGroup(
+        values=values,
+        batch_indices=batch_indices,
+        frequency_indices=freq_indices,
+        cycles=cycles,
+        period=period,
+    )
+
+    monkeypatch.setattr(model.period, "forward", lambda *args, **kwargs: [fake_group])
+
+    element_size = torch.tensor(0, dtype=dtype).element_size()
+    base_elements = float(model.d_model) * float(cycles) * float(period)
+    kernel_paths = max(len(model.kernel_set), 1)
+    block_multiplier = max(model.n_layers, 1) * kernel_paths
+    estimated_elements = base_elements * (1.0 + float(block_multiplier))
+    safety_factor = 4.0
+    bytes_per_tile = int(
+        max(math.ceil(estimated_elements * element_size * safety_factor), 1)
+    )
+
+    model.period_group_max_chunk_bytes = bytes_per_tile * 5
+    model.period_group_chunk = None
+    model.period_group_memory_ratio = 1.0
+
+    chunk_sizes: list[int] = []
+
+    def capture_frontend(module, inputs, output):
+        chunk_sizes.append(int(inputs[0].shape[0]))
+
+    hook = model.frontend.register_forward_hook(capture_frontend)
+    try:
+        x = torch.randn(B, L, N, dtype=dtype)
+        model.eval()
+        with torch.no_grad():
+            model(x)
+    finally:
+        hook.remove()
+
+    assert len(chunk_sizes) >= 3
+    assert chunk_sizes[0] > 1
+    assert chunk_sizes[1] < chunk_sizes[0]
+    assert all(size <= chunk_sizes[1] for size in chunk_sizes[1:])
 
 
 def test_adaptive_pool_matches_reference_for_variable_lengths():

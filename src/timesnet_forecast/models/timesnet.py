@@ -496,15 +496,29 @@ class TimesNet(nn.Module):
         self.period_group_max_chunk_bytes: Optional[int] = max_bytes_override
 
     def _resolve_period_group_chunk(
-        self, group: PeriodGroup, dtype: torch.dtype | None
+        self,
+        group: PeriodGroup,
+        dtype: torch.dtype | None,
+        running_budget: dict[str, int] | None = None,
+        remaining_tiles: int | None = None,
     ) -> int:
         total_tiles = int(group.values.size(0))
         if total_tiles <= 0:
+            if running_budget is not None:
+                running_budget.setdefault("bytes_per_tile", 0)
+                running_budget.setdefault("remaining_bytes", 0)
             return 0
 
+        if remaining_tiles is None:
+            remaining_tiles = total_tiles
+        else:
+            remaining_tiles = max(0, min(int(remaining_tiles), total_tiles))
+        if remaining_tiles <= 0:
+            return 0
+
+        chunk_limit = int(remaining_tiles)
         if self.period_group_chunk is not None:
-            chunk = max(1, min(total_tiles, int(self.period_group_chunk)))
-            return chunk
+            chunk_limit = max(1, min(chunk_limit, int(self.period_group_chunk)))
 
         dtype_obj = dtype or group.values.dtype
         try:
@@ -546,13 +560,39 @@ class TimesNet(nn.Module):
         if max_bytes is not None:
             budget_bytes = max(1, min(budget_bytes, max_bytes))
 
-        if bytes_per_tile <= 0:
-            return max(total_tiles, 1)
+        if running_budget is not None:
+            stored_bytes_per_tile = int(running_budget.get("bytes_per_tile", 0))
+            if stored_bytes_per_tile > 0:
+                bytes_per_tile = stored_bytes_per_tile
+            else:
+                running_budget["bytes_per_tile"] = bytes_per_tile
 
-        chunk = budget_bytes // bytes_per_tile
-        if chunk <= 0:
-            chunk = 1
-        return max(1, min(total_tiles, chunk))
+            remaining_bytes = running_budget.get("remaining_bytes")
+            if remaining_bytes is None:
+                remaining_bytes = budget_bytes
+            else:
+                remaining_bytes = int(remaining_bytes)
+                if remaining_bytes < 0:
+                    remaining_bytes = 0
+                remaining_bytes = min(remaining_bytes, budget_bytes)
+        else:
+            remaining_bytes = int(budget_bytes)
+
+        if bytes_per_tile <= 0:
+            chunk = chunk_limit
+        else:
+            chunk = remaining_bytes // bytes_per_tile
+            if chunk <= 0:
+                chunk = 1
+
+        chunk = max(1, min(chunk, chunk_limit))
+
+        if running_budget is not None:
+            running_budget["bytes_per_tile"] = bytes_per_tile
+            consumed = int(chunk) * bytes_per_tile if bytes_per_tile > 0 else 0
+            running_budget["remaining_bytes"] = max(remaining_bytes - consumed, 0)
+
+        return int(chunk)
 
     # ------------------------------------------------------------------
     # Backwards compatibility hooks
@@ -638,15 +678,27 @@ class TimesNet(nn.Module):
                 if isinstance(group.values, torch.Tensor)
                 else x.dtype
             )
-            chunk_size = self._resolve_period_group_chunk(
-                group=group, dtype=chunk_dtype
-            )
-            if chunk_size <= 0:
-                chunk_size = int(total_tiles)
-            chunk_size = max(1, min(int(chunk_size), int(total_tiles)))
-            for start_idx in range(0, total_tiles, chunk_size):
-                end_idx = min(start_idx + chunk_size, total_tiles)
-                values_chunk = group.values[start_idx:end_idx]
+            budget_state: dict[str, int] = {}
+            start_idx = 0
+            while start_idx < total_tiles:
+                remaining_tiles = total_tiles - start_idx
+                chunk_size = self._resolve_period_group_chunk(
+                    group=group,
+                    dtype=chunk_dtype,
+                    running_budget=budget_state,
+                    remaining_tiles=remaining_tiles,
+                )
+                chunk_size = int(chunk_size) if chunk_size is not None else 0
+                if chunk_size <= 0:
+                    chunk_size = int(remaining_tiles)
+                chunk_size = max(1, min(chunk_size, int(remaining_tiles)))
+                chunk_start = start_idx
+                end_idx = min(chunk_start + chunk_size, total_tiles)
+                if end_idx <= chunk_start:
+                    start_idx = total_tiles
+                    continue
+                values_chunk = group.values[chunk_start:end_idx]
+                start_idx = end_idx
                 if values_chunk.numel() == 0:
                     continue
                 tiles = values_chunk.unsqueeze(1)  # [M, 1, C, P]
@@ -685,7 +737,7 @@ class TimesNet(nn.Module):
                     raise RuntimeError(
                         "flat_sum and features must reside on the same device"
                     )
-                batch_chunk = group.batch_indices[start_idx:end_idx]
+                batch_chunk = group.batch_indices[chunk_start:end_idx]
                 features.index_add_(0, batch_chunk, flat_sum)
                 if coverage_update.device != coverage.device:
                     raise RuntimeError(
