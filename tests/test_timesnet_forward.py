@@ -11,6 +11,7 @@ from timesnet_forecast.models.timesnet import (
     PeriodGroup,
     TimesNet,
     _adaptive_pool_valid_lengths,
+    _pool_trailing_sums,
 )
 
 
@@ -128,6 +129,27 @@ def test_timesnet_respects_history_mask():
 
     assert torch.allclose(mu_mask, mu_trim, atol=1e-5)
     assert torch.allclose(sigma_mask, sigma_trim, atol=1e-5)
+
+
+def test_pool_trailing_sums_matches_adaptive_pool():
+    torch.manual_seed(123)
+    B, C, T = 4, 3, 19
+    target = 7
+    values = torch.randn(B, C, T)
+    valid_lengths = torch.randint(1, T + 1, (B,))
+
+    sums, counts = _pool_trailing_sums(values, valid_lengths, target)
+    counts_f = counts.to(values.dtype).unsqueeze(1)
+    averages = sums / counts_f
+
+    pooled, _ = _adaptive_pool_valid_lengths(
+        features=values,
+        mask=torch.ones(B, 1, T, dtype=values.dtype),
+        valid_lengths=valid_lengths,
+        target_len=target,
+    )
+
+    torch.testing.assert_close(averages, pooled, atol=1e-6, rtol=1e-5)
 
 
 def test_period_group_chunk_preserves_outputs():
