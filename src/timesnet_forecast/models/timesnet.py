@@ -593,11 +593,11 @@ class TimesNet(nn.Module):
                 pad_left = start
                 pad_right = T - start - length
                 flat_padded = F.pad(flat, (pad_left, pad_right))
-                if flat_padded.dtype != features.dtype:
+                if features.dtype != flat_padded.dtype:
                     # Mixed precision autocast can yield lower precision tiles; align the
                     # accumulation buffers with the tile dtype to avoid redundant casts.
                     features = features.to(dtype=flat_padded.dtype)
-                if flat_padded.dtype != coverage.dtype:
+                if coverage.dtype != flat_padded.dtype:
                     coverage = coverage.to(dtype=flat_padded.dtype)
                 if flat_padded.device != features.device:
                     raise RuntimeError(
@@ -607,9 +607,10 @@ class TimesNet(nn.Module):
                 features.index_add_(0, batch_chunk, flat_padded)
                 coverage_update = flat.new_ones((flat.size(0), 1, length))
                 coverage_update = F.pad(coverage_update, (pad_left, pad_right))
-                if coverage_update.dtype != coverage.dtype:
-                    coverage = coverage.to(dtype=coverage_update.dtype)
+                if features.dtype != coverage_update.dtype:
                     features = features.to(dtype=coverage_update.dtype)
+                if coverage.dtype != coverage_update.dtype:
+                    coverage = coverage.to(dtype=coverage_update.dtype)
                 if coverage_update.device != coverage.device:
                     raise RuntimeError(
                         "coverage_update and coverage must reside on the same device"
