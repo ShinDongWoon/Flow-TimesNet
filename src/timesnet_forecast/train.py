@@ -36,7 +36,7 @@ def gaussian_nll_loss(
     mu: torch.Tensor,
     sigma: torch.Tensor,
     target: torch.Tensor,
-    min_sigma: float = 0.0,
+    min_sigma: float | torch.Tensor = 0.0,
 ) -> torch.Tensor:
     """Element-wise Gaussian negative log-likelihood.
 
@@ -44,7 +44,9 @@ def gaussian_nll_loss(
         mu: Predicted mean ``[B, H, N]``.
         sigma: Predicted standard deviation ``[B, H, N]``.
         target: Ground truth ``[B, H, N]``.
-        min_sigma: Optional clamp ensuring strictly positive variance.
+        min_sigma: Optional clamp ensuring strictly positive variance. May be a
+            scalar ``float`` or a tensor shaped ``[1, 1, N]`` to provide
+            per-series floors.
 
     Returns:
         Tensor of per-element losses with the same shape as ``mu`` stored in
@@ -55,8 +57,14 @@ def gaussian_nll_loss(
     sigma_f32 = sigma.to(torch.float32)
     target_f32 = target.to(torch.float32)
 
-    if min_sigma > 0.0:
-        sigma_f32 = torch.clamp(sigma_f32, min=min_sigma)
+    if isinstance(min_sigma, torch.Tensor):
+        if min_sigma.numel() > 0:
+            floor = min_sigma.to(device=sigma_f32.device, dtype=sigma_f32.dtype)
+            sigma_f32 = torch.maximum(sigma_f32, floor)
+    else:
+        min_sigma_val = float(min_sigma)
+        if min_sigma_val > 0.0:
+            sigma_f32 = torch.clamp(sigma_f32, min=min_sigma_val)
 
     log_sigma = torch.log(sigma_f32)
     z = (target_f32 - mu_f32) / sigma_f32
@@ -179,7 +187,7 @@ def _masked_std(
     arrays: List[np.ndarray],
     masks: List[np.ndarray],
     method: str = "global",
-) -> float:
+) -> Tuple[float, np.ndarray | None]:
     """Compute a standard deviation summary over ``arrays`` respecting ``masks``.
 
     Args:
@@ -194,11 +202,14 @@ def _masked_std(
             outlier series.
 
     Returns:
-        A scalar ``float`` describing the spread of the valid targets.
+        Tuple containing the aggregate standard deviation summary and an optional
+        array with the per-series standard deviations. ``None`` is returned for
+        the per-series component when ``method`` does not require it or when the
+        number of series cannot be inferred.
     """
 
     if len(arrays) == 0:
-        return 0.0
+        return 0.0, None
 
     method_normalized = method.lower()
 
@@ -224,11 +235,11 @@ def _masked_std(
             count += int(values.size)
 
         if count == 0:
-            return 0.0
+            return 0.0, None
 
         mean = total / count
         variance = max(total_sq / count - mean * mean, 0.0)
-        return float(math.sqrt(variance))
+        return float(math.sqrt(variance)), None
 
     if method_normalized == "per_series_median":
         n_series: int | None = None
@@ -271,11 +282,12 @@ def _masked_std(
             per_count += mask_float.sum(axis=0)
 
         if n_series is None or per_sum is None or per_sum_sq is None or per_count is None:
-            return 0.0
+            return 0.0, None
 
         valid_series = per_count > 0.0
+        per_series_std = np.zeros(n_series, dtype=np.float64)
         if not np.any(valid_series):
-            return 0.0
+            return 0.0, per_series_std
 
         means = np.zeros_like(per_sum)
         means[valid_series] = per_sum[valid_series] / per_count[valid_series]
@@ -284,10 +296,11 @@ def _masked_std(
             per_sum_sq[valid_series] / per_count[valid_series] - means[valid_series] ** 2,
             0.0,
         )
-        stds = np.sqrt(variances[valid_series])
+        per_series_std[valid_series] = np.sqrt(variances[valid_series])
+        stds = per_series_std[valid_series]
         if stds.size == 0:
-            return 0.0
-        return float(np.median(stds))
+            return 0.0, per_series_std
+        return float(np.median(stds)), per_series_std
 
     raise ValueError(f"Unsupported min_sigma_method '{method}'. Expected 'global' or 'per_series_median'.")
 
@@ -370,7 +383,7 @@ def _eval_metrics(
     pred_len: int,
     channels_last: bool = False,
     use_loss_mask: bool = False,
-    min_sigma: float = 0.0,
+    min_sigma: float | torch.Tensor = 0.0,
 ) -> Dict[str, float]:
     model.eval()
     ys: List[np.ndarray] = []
@@ -537,17 +550,39 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     use_loss_masking = bool(cfg["train"].get("use_loss_masking", False))
 
     min_sigma_method = str(cfg["train"].get("min_sigma_method", "global"))
-    target_std = _masked_std(train_arrays, train_mask_arrays, method=min_sigma_method)
+    target_std, per_series_std = _masked_std(
+        train_arrays, train_mask_arrays, method=min_sigma_method
+    )
     min_sigma_cfg = float(cfg["train"].get("min_sigma", 1e-3))
     min_sigma_scale = float(cfg["train"].get("min_sigma_scale", 0.1))
     scaled_min_sigma = target_std * min_sigma_scale if target_std > 0.0 else 0.0
-    min_sigma = max(min_sigma_cfg, scaled_min_sigma)
+    min_sigma_scalar = max(min_sigma_cfg, scaled_min_sigma)
+
     cfg.setdefault("train", {})
-    cfg["train"]["min_sigma_effective"] = float(min_sigma)
-    console().print(
+    per_series_floor_list: List[float] | None = None
+    if per_series_std is not None and per_series_std.size > 0:
+        per_series_scaled = np.asarray(per_series_std, dtype=np.float64) * min_sigma_scale
+        per_series_scaled = np.maximum(per_series_scaled, min_sigma_scalar)
+        per_series_floor_list = [float(x) for x in per_series_scaled]
+        cfg["train"]["min_sigma_vector"] = per_series_floor_list
+    else:
+        cfg["train"].pop("min_sigma_vector", None)
+
+    cfg["train"]["min_sigma_effective"] = float(min_sigma_scalar)
+    msg = (
         "[bold green]min_sigma calibrated:[/bold green] "
-        f"{min_sigma:.6f} (target std={target_std:.6f}, scale={min_sigma_scale})"
+        f"{min_sigma_scalar:.6f} (target std={target_std:.6f}, scale={min_sigma_scale})"
     )
+    if per_series_floor_list:
+        msg += f"  per-series max={max(per_series_floor_list):.6f}"
+    console().print(msg)
+
+    if per_series_floor_list is not None:
+        min_sigma_vector_tensor = torch.tensor(
+            per_series_floor_list, dtype=torch.float32
+        ).view(1, 1, -1)
+    else:
+        min_sigma_vector_tensor = None
 
     # --- model
     model = TimesNet(
@@ -564,7 +599,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         mode=mode,
         channels_last=cfg["train"]["channels_last"],
         use_checkpoint=use_checkpoint,
-        min_sigma=min_sigma,
+        min_sigma=min_sigma_scalar,
+        min_sigma_vector=min_sigma_vector_tensor,
     ).to(device)
 
     # Lazily build model parameters so that downstream utilities see them
@@ -575,6 +611,11 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             model.to(memory_format=torch.channels_last)
     if cfg["train"]["compile"]:
         model = maybe_compile(model, True, warmup_args=(dummy,))
+
+    if isinstance(getattr(model, "min_sigma_vector", None), torch.Tensor) and model.min_sigma_vector.numel() > 0:
+        min_sigma: float | torch.Tensor = model.min_sigma_vector
+    else:
+        min_sigma = min_sigma_scalar
 
     # --- optimizer / scheduler / loss
     optim = torch.optim.AdamW(

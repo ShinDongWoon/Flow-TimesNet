@@ -36,12 +36,13 @@ def test_masked_std_global_matches_numpy():
         np.array([[1.0, 1.0], [0.0, 1.0]], dtype=np.float32),
     ]
 
-    result = _masked_std(arrays, masks, method="global")
+    summary, per_series = _masked_std(arrays, masks, method="global")
 
     valid = _collect_valid_values(arrays, masks)
     expected = 0.0 if valid.size == 0 else float(np.std(valid))
 
-    assert result == pytest.approx(expected)
+    assert summary == pytest.approx(expected)
+    assert per_series is None
 
 
 def test_masked_std_per_series_median_is_robust():
@@ -70,8 +71,11 @@ def test_masked_std_per_series_median_is_robust():
         )
     ]
 
-    global_std = _masked_std(arrays, masks, method="global")
-    robust_std = _masked_std(arrays, masks, method="per_series_median")
+    global_std, _ = _masked_std(arrays, masks, method="global")
+    robust_std, per_series = _masked_std(arrays, masks, method="per_series_median")
+
+    assert per_series is not None
+    assert per_series.shape[0] == arrays[0].shape[1]
 
     per_series_values = []
     arr = arrays[0]
@@ -84,4 +88,31 @@ def test_masked_std_per_series_median_is_robust():
 
     assert robust_std == pytest.approx(expected_robust)
     assert robust_std < global_std
+
+
+def test_per_series_floor_retains_high_variance_channels():
+    arrays = [
+        np.array(
+            [
+                [0.0, 0.00, 0.01],
+                [10.0, 0.05, 0.02],
+                [20.0, 0.10, 0.03],
+                [30.0, 0.15, 0.04],
+            ],
+            dtype=np.float32,
+        )
+    ]
+    masks = [np.ones_like(arrays[0], dtype=np.float32)]
+
+    summary, per_series = _masked_std(arrays, masks, method="per_series_median")
+    assert per_series is not None
+    scale = 0.2
+    min_sigma_cfg = 1e-3
+
+    scalar_floor = max(min_sigma_cfg, summary * scale)
+    per_series_floor = np.maximum(per_series * scale, scalar_floor)
+
+    high_idx = int(np.argmax(per_series))
+    assert per_series_floor[high_idx] > scalar_floor * 10
+    assert np.all(per_series_floor >= scalar_floor)
 
