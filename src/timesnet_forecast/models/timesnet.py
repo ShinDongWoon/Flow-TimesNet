@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import math
 from typing import List, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from torch.nn import init
 
 
 class PeriodicityTransform(nn.Module):
@@ -42,26 +44,30 @@ class PeriodicityTransform(nn.Module):
         topk = torch.clamp(topk, min=1)
         return topk
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Vectorised period folding.
 
         Args:
             x: [B, T, N]
 
         Returns:
-            torch.Tensor: [B, K, P_max, N]
+            Tuple[torch.Tensor, torch.Tensor]:
+                folded tensor [B, N, K * C_max, P_max]
+                mask tensor   [B, N, K * C_max, P_max]
         """
         B, T, N = x.shape
         # Flatten batch & channel for joint processing
         seqs = x.permute(0, 2, 1).reshape(B * N, T)  # [BN, T]
 
         if self.k <= 0:
-            return x.new_zeros(B, 0, 1, N)
+            empty = x.new_zeros(B, N, 0, self.pmax)
+            return empty, empty
 
         kidx = self._topk_freq(seqs, self.k)  # [BN, K]
         K = kidx.size(1)
         if K == 0 or kidx.numel() == 0:
-            return x.new_zeros(B, 0, 1, N)
+            empty = x.new_zeros(B, N, 0, self.pmax)
+            return empty, empty
 
         # Compute period lengths and cycles
         P = T // torch.clamp(kidx, min=1)
@@ -90,12 +96,12 @@ class PeriodicityTransform(nn.Module):
 
         mask_c = idx_c.view(1, 1, -1, 1) < cycles[..., None, None]
         mask_p = idx_p.view(1, 1, 1, -1) < P[..., None, None]
-        mask = mask_c & mask_p
+        mask = (mask_c & mask_p).to(gathered.dtype)
         gathered = gathered * mask
 
-        seg_all = gathered.sum(dim=2) / torch.clamp(cycles[..., None], min=1)
-        seg_all = seg_all.view(B, N, K, Pmax).permute(0, 2, 3, 1)  # [B, K, Pmax, N]
-        return seg_all
+        gathered = gathered.reshape(B, N, K * gathered.size(2), Pmax)
+        flat_mask = mask.reshape(B, N, K * mask.size(2), Pmax)
+        return gathered, flat_mask
 
 
 class InceptionBlock(nn.Module):
@@ -239,6 +245,34 @@ class TimesNet(nn.Module):
         self.head = nn.Linear(self.d_model, out_steps * 2).to(device=x.device, dtype=x.dtype)
         self._lazy_built = True
 
+    def _resize_frontend(
+        self, new_in_channels: int, device: torch.device, dtype: torch.dtype
+    ) -> None:
+        """Expand the input projection if additional cycles appear.
+
+        Args:
+            new_in_channels: desired number of input channels
+            device: target device for the resized layer
+            dtype: target dtype for the resized layer
+        """
+        if new_in_channels <= self.k:
+            return
+        conv = self.blocks[0]
+        old_weight = conv.weight.data
+        old_in = old_weight.size(1)
+        if new_in_channels <= old_in:
+            self.k = new_in_channels
+            return
+        new_shape = (old_weight.size(0), new_in_channels, *old_weight.shape[2:])
+        with torch.no_grad():
+            new_weight = torch.zeros(new_shape, device=device, dtype=dtype)
+            new_weight[:, :old_in, ...] = old_weight
+            if new_in_channels > old_in:
+                init.kaiming_uniform_(new_weight[:, old_in:, ...], a=math.sqrt(5))
+            conv.weight.data = new_weight
+        conv.in_channels = new_in_channels
+        self.k = new_in_channels
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         x: [B, T, N]
@@ -248,26 +282,43 @@ class TimesNet(nn.Module):
             recursive: [B, 1, N]
         """
         B, T, N = x.shape
-        z_all = self.period(x)
-        if z_all.size(1) == 0:
+        z_all, mask_all = self.period(x)
+        if z_all.size(2) == 0:
             out_steps = self._out_steps
             mu = x.new_zeros(B, out_steps, N)
             sigma = x.new_full((B, out_steps, N), self.min_sigma)
             return mu, sigma
 
-        z = z_all[:, :, :self.input_len, :]  # leading slice [B, K, input_len, N]
-        K = z.size(1)
-        steps = z.size(2)
-        z = z.permute(0, 3, 1, 2).reshape(B * N, K, steps)
+        steps = min(self.input_len, z_all.size(-1))
+        z = z_all[..., :steps]
+        mask = mask_all[..., :steps]
+        KC = z.size(2)
+        z = z.reshape(B * N, KC, steps)
+        mask = mask.reshape(B * N, KC, steps)
         if not self._lazy_built:
-            self.k = K
+            self.k = KC
             self._build_lazy(x=z)
+        else:
+            if KC > self.k:
+                self._resize_frontend(KC, device=z.device, dtype=z.dtype)
+            elif KC < self.k:
+                pad = self.k - KC
+                if pad > 0:
+                    pad_shape = (z.size(0), pad, steps)
+                    z = torch.cat([z, z.new_zeros(pad_shape)], dim=1)
+                    mask = torch.cat([mask, mask.new_zeros(pad_shape)], dim=1)
+                    KC = self.k
+        z = z * mask
+        step_mask = mask.amax(dim=1, keepdim=True).to(dtype=z.dtype)
         if self.channels_last:
             z = z.unsqueeze(-1).contiguous(memory_format=torch.channels_last)
+            step_mask = step_mask.unsqueeze(-1)
         for blk in self.blocks:
             z = checkpoint(blk, z, use_reentrant=False) if self.use_checkpoint else blk(z)
         if self.channels_last:
             z = z.squeeze(-1)
+            step_mask = step_mask.squeeze(-1)
+        z = z * step_mask
         z = self.pool(z).squeeze(-1)
         z = z.view(B, N, self.d_model)
         y_all = self.head(z)
