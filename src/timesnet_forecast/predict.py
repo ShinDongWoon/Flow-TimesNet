@@ -142,6 +142,7 @@ def predict_once(cfg: Dict) -> str:
                 device=model.blocks[0].weight.device,
                 dtype=model.blocks[0].weight.dtype,
             )
+    clean_state.pop("min_sigma_vector", None)
     model.load_state_dict(clean_state, strict=True)
     if cfg_used["train"]["channels_last"]:
         model.to(memory_format=torch.channels_last)
