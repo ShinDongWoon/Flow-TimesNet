@@ -4,12 +4,15 @@ from types import SimpleNamespace
 import sys
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
 # Ensure the project src is on the path for imports
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
+from timesnet_forecast.config import Config
+from timesnet_forecast import train as train_module
 from timesnet_forecast.models.timesnet import TimesNet
 from timesnet_forecast.train import gaussian_nll_loss, _eval_metrics
 from timesnet_forecast.utils.metrics import wsmape_grouped, smape_mean
@@ -124,3 +127,80 @@ def test_eval_metrics_returns_masked_nll():
 
     assert metrics["nll"] == pytest.approx(expected_nll)
     assert metrics["smape"] == pytest.approx(expected_smape)
+
+
+def test_training_warmup_uses_pmax_no_resize(tmp_path, monkeypatch):
+    periods = 96
+    dates = pd.date_range("2023-01-01", periods=periods, freq="D")
+    t = np.arange(periods, dtype=np.float32)
+    s1 = np.sin(2 * math.pi * t / 32) + 10.0
+    s2 = np.cos(2 * math.pi * t / 24) + 5.0
+    rows = []
+    for i, d in enumerate(dates):
+        rows.append({"date": d, "id": "S1", "target": float(s1[i])})
+        rows.append({"date": d, "id": "S2", "target": float(s2[i])})
+    df = pd.DataFrame(rows)
+    csv_path = tmp_path / "train.csv"
+    df.to_csv(csv_path, index=False)
+
+    overrides = [
+        f"data.train_csv={csv_path}",
+        "data.date_col=date",
+        "data.id_col=id",
+        "data.target_col=target",
+        "data.encoding=utf-8",
+        "data.fill_missing_dates=False",
+        "train.device=cpu",
+        "train.epochs=1",
+        "train.batch_size=8",
+        "train.num_workers=1",
+        "train.pin_memory=False",
+        "train.persistent_workers=False",
+        "train.prefetch_factor=2",
+        "train.amp=False",
+        "train.compile=False",
+        "train.cuda_graphs=False",
+        "train.channels_last=True",
+        "train.use_loss_masking=False",
+        "train.val.strategy=holdout",
+        "train.val.holdout_days=24",
+        "preprocess.normalize=none",
+        "preprocess.normalize_per_series=True",
+        "preprocess.clip_negative=False",
+        "preprocess.eps=1e-8",
+        "model.mode=direct",
+        "model.input_len=16",
+        "model.pred_len=4",
+        "model.d_model=8",
+        "model.n_layers=1",
+        "model.dropout=0.0",
+        "model.k_periods=2",
+        "model.kernel_set=[3]",
+        "model.pmax_cap=64",
+        "model.min_period_threshold=1",
+        "train.lr=1e-3",
+        "train.weight_decay=0.0",
+        "train.grad_clip_norm=0.0",
+        f"artifacts.dir={tmp_path / 'artifacts'}",
+        "artifacts.model_file=model.pth",
+        "artifacts.scaler_file=scaler.pkl",
+        "artifacts.schema_file=schema.json",
+        "artifacts.config_file=config.yaml",
+    ]
+    cfg = Config.from_files("configs/default.yaml", overrides=overrides).to_dict()
+
+    resize_called = False
+
+    original_resize = TimesNet._resize_frontend
+
+    def spy_resize(self, new_in_channels, device, dtype):
+        nonlocal resize_called
+        resize_called = True
+        return original_resize(self, new_in_channels, device, dtype)
+
+    monkeypatch.setattr(TimesNet, "_resize_frontend", spy_resize)
+
+    train_module.train_once(cfg)
+
+    assert cfg["model"]["pmax"] > cfg["model"]["input_len"]
+    assert not resize_called
