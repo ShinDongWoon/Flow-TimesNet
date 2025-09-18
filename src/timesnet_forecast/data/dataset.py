@@ -41,6 +41,10 @@ class SlidingWindowDataset(Dataset):
         self.P = int(pmax_global)
         if self.P <= 0:
             raise ValueError("pmax_global must be positive")
+        if self.P < self.L:
+            raise ValueError(
+                "pmax_global must be greater than or equal to input_len to preserve the full history"
+            )
         if mode == "direct":
             self.H = int(pred_len)
         else:
