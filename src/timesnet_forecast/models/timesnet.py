@@ -479,17 +479,19 @@ class TimesNet(nn.Module):
             pad_right = T - start - length
             flat_padded = F.pad(flat, (pad_left, pad_right))
             if flat_padded.dtype != features.dtype:
-                # Mixed precision autocast can yield lower precision tiles; align with
-                # the accumulation buffer without forcing an unnecessary device copy.
-                flat_padded = flat_padded.to(dtype=features.dtype)
+                # Mixed precision autocast can yield lower precision tiles; align the
+                # accumulation buffers with the tile dtype to avoid redundant casts.
+                features = features.to(dtype=flat_padded.dtype)
+            if flat_padded.dtype != coverage.dtype:
+                coverage = coverage.to(dtype=flat_padded.dtype)
             if flat_padded.device != features.device:
                 raise RuntimeError("flat_padded and features must reside on the same device")
             features.index_add_(0, group.batch_indices, flat_padded)
             coverage_update = flat.new_ones((flat.size(0), 1, length))
             coverage_update = F.pad(coverage_update, (pad_left, pad_right))
             if coverage_update.dtype != coverage.dtype:
-                # Align dtype with coverage accumulation tensor while avoiding redundant copies.
-                coverage_update = coverage_update.to(dtype=coverage.dtype)
+                coverage = coverage.to(dtype=coverage_update.dtype)
+                features = features.to(dtype=coverage_update.dtype)
             if coverage_update.device != coverage.device:
                 raise RuntimeError(
                     "coverage_update and coverage must reside on the same device"
@@ -512,6 +514,8 @@ class TimesNet(nn.Module):
         if hist_mask_flat is not None:
             raw_input = raw_input * hist_mask_flat.unsqueeze(1)
         raw_features = self.raw_proj(raw_input)
+        if raw_features.dtype != features.dtype:
+            raw_features = raw_features.to(dtype=features.dtype)
         features = features + raw_features
         features = features * step_mask
 
