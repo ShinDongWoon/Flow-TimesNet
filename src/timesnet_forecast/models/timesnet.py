@@ -19,6 +19,80 @@ class PeriodGroup:
     period: int
 
 
+def _adaptive_pool_valid_lengths(
+    features: torch.Tensor,
+    mask: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    target_len: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pool the trailing valid prefix for a batch of sequences.
+
+    This vectorized variant reproduces the behaviour of slicing each
+    ``features[idx]`` / ``mask[idx]`` pair to the final ``valid_lengths[idx]``
+    timesteps and then applying :func:`torch.nn.functional.adaptive_avg_pool1d`.
+    """
+
+    if features.ndim != 3 or mask.ndim != 3:
+        raise ValueError("features and mask must be 3D tensors")
+
+    if features.shape[0] != mask.shape[0] or features.shape[-1] != mask.shape[-1]:
+        raise ValueError("features and mask must share batch and time dimensions")
+
+    if features.device != mask.device:
+        raise ValueError("features and mask must reside on the same device")
+
+    BN, _, T = features.shape
+    if T == 0:
+        raise ValueError("features must have a non-empty time dimension")
+
+    target_steps = max(int(target_len), 1)
+
+    lengths = valid_lengths.clamp(min=1, max=T)
+    if not torch.all(lengths == T):
+        time_idx = torch.arange(T, device=features.device, dtype=valid_lengths.dtype)
+        time_idx = time_idx.view(1, 1, T)
+        start = (T - lengths).view(BN, 1, 1)
+        range_mask = (time_idx >= start).to(features.dtype)
+        features = features * range_mask
+        mask = mask * range_mask
+
+    offsets = (T - lengths).view(BN, 1)
+    steps = torch.arange(target_steps + 1, device=features.device, dtype=valid_lengths.dtype)
+    scaled = lengths.view(BN, 1) * steps.view(1, -1)
+    start_rel = scaled[:, :-1] // target_steps
+    end_rel = (scaled[:, 1:] + target_steps - 1) // target_steps
+
+    start_idx = (start_rel + offsets).clamp(min=0, max=T)
+    end_idx = (end_rel + offsets).clamp(min=0, max=T)
+    counts = (end_idx - start_idx).clamp(min=1)
+
+    feat_cumsum = torch.cumsum(features.to(torch.float64), dim=-1)
+    feat_cumsum = torch.cat(
+        [feat_cumsum.new_zeros(BN, features.size(1), 1), feat_cumsum], dim=-1
+    )
+    mask_cumsum = torch.cumsum(mask.to(torch.float64), dim=-1)
+    mask_cumsum = torch.cat(
+        [mask_cumsum.new_zeros(BN, mask.size(1), 1), mask_cumsum], dim=-1
+    )
+
+    start_idx_feat = start_idx.view(BN, 1, target_steps).expand(-1, features.size(1), -1)
+    end_idx_feat = end_idx.view(BN, 1, target_steps).expand(-1, features.size(1), -1)
+    feat_start = torch.gather(feat_cumsum, dim=-1, index=start_idx_feat)
+    feat_end = torch.gather(feat_cumsum, dim=-1, index=end_idx_feat)
+    feat_sum = feat_end - feat_start
+
+    start_idx_mask = start_idx.view(BN, 1, target_steps).expand(-1, mask.size(1), -1)
+    end_idx_mask = end_idx.view(BN, 1, target_steps).expand(-1, mask.size(1), -1)
+    mask_start = torch.gather(mask_cumsum, dim=-1, index=start_idx_mask)
+    mask_end = torch.gather(mask_cumsum, dim=-1, index=end_idx_mask)
+    mask_sum = mask_end - mask_start
+
+    denom = counts.view(BN, 1, target_steps).to(torch.float64)
+    pooled_feats = (feat_sum / denom).to(features.dtype)
+    pooled_mask = (mask_sum / denom).to(mask.dtype)
+    return pooled_feats, pooled_mask
+
+
 class PeriodicityTransform(nn.Module):
     """Approximate period folding via FFT."""
 
@@ -414,18 +488,12 @@ class TimesNet(nn.Module):
         else:
             valid_lengths = torch.full((BN,), T, dtype=torch.long, device=x.device)
 
-        pooled_feats: List[torch.Tensor] = []
-        pooled_masks: List[torch.Tensor] = []
-        for idx in range(BN):
-            length = int(valid_lengths[idx].item())
-            length = max(min(length, features.size(-1)), 1)
-            start_idx = features.size(-1) - length
-            feat_slice = features[idx : idx + 1, :, start_idx:]
-            mask_slice = step_mask[idx : idx + 1, :, start_idx:]
-            pooled_feats.append(F.adaptive_avg_pool1d(feat_slice, self.input_len))
-            pooled_masks.append(F.adaptive_avg_pool1d(mask_slice, self.input_len))
-        features = torch.cat(pooled_feats, dim=0)
-        pooled_mask = torch.cat(pooled_masks, dim=0)
+        features, pooled_mask = _adaptive_pool_valid_lengths(
+            features=features,
+            mask=step_mask,
+            valid_lengths=valid_lengths,
+            target_len=self.input_len,
+        )
 
         eps = torch.finfo(features.dtype).eps
         features = features / (pooled_mask + eps)

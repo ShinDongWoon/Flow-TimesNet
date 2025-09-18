@@ -2,11 +2,12 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 # Ensure the project src is on the path for imports
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
-from timesnet_forecast.models.timesnet import TimesNet
+from timesnet_forecast.models.timesnet import TimesNet, _adaptive_pool_valid_lengths
 
 
 def test_forward_shape_and_head_processing():
@@ -123,3 +124,37 @@ def test_timesnet_respects_history_mask():
 
     assert torch.allclose(mu_mask, mu_trim, atol=1e-5)
     assert torch.allclose(sigma_mask, sigma_trim, atol=1e-5)
+
+
+def test_adaptive_pool_matches_reference_for_variable_lengths():
+    torch.manual_seed(0)
+    BN, C, T = 7, 5, 23
+    output_len = 11
+    features = torch.randn(BN, C, T)
+    valid_lengths = torch.randint(1, T + 1, (BN,), dtype=torch.long)
+
+    step_mask = torch.zeros(BN, 1, T, dtype=features.dtype)
+    for idx, length in enumerate(valid_lengths.tolist()):
+        start = T - length
+        step_mask[idx, :, start:] = 1.0
+
+    # Reference implementation using the original per-index slicing
+    ref_feats = []
+    ref_masks = []
+    for idx in range(BN):
+        length = int(valid_lengths[idx].item())
+        length = max(min(length, T), 1)
+        start_idx = T - length
+        feat_slice = features[idx : idx + 1, :, start_idx:]
+        mask_slice = step_mask[idx : idx + 1, :, start_idx:]
+        ref_feats.append(F.adaptive_avg_pool1d(feat_slice, output_len))
+        ref_masks.append(F.adaptive_avg_pool1d(mask_slice, output_len))
+    expected_feats = torch.cat(ref_feats, dim=0)
+    expected_masks = torch.cat(ref_masks, dim=0)
+
+    pooled_feats, pooled_masks = _adaptive_pool_valid_lengths(
+        features, step_mask, valid_lengths, output_len
+    )
+
+    torch.testing.assert_close(pooled_feats, expected_feats)
+    torch.testing.assert_close(pooled_masks, expected_masks)
