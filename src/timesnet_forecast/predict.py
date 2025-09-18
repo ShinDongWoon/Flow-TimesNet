@@ -80,9 +80,22 @@ def predict_once(cfg: Dict) -> str:
     # Build model
     min_period_threshold = int(cfg_used["model"].get("min_period_threshold", 1))
 
-    use_checkpoint = bool(cfg_used["train"].get("use_checkpoint", False))
+    train_cfg = cfg_used["train"]
+    use_checkpoint = bool(train_cfg.get("use_checkpoint", False))
     if cfg_used["train"].get("cuda_graphs", False):
         use_checkpoint = False
+
+    min_sigma_scalar = float(train_cfg.get("min_sigma_effective", 1e-3))
+    min_sigma_vector_cfg = train_cfg.get("min_sigma_vector")
+    min_sigma_vector_tensor: torch.Tensor | None = None
+    if min_sigma_vector_cfg is not None:
+        min_sigma_vector_tensor = torch.as_tensor(
+            min_sigma_vector_cfg, dtype=torch.float32
+        )
+        if min_sigma_vector_tensor.numel() == 0:
+            min_sigma_vector_tensor = None
+        else:
+            min_sigma_vector_tensor = min_sigma_vector_tensor.reshape(1, 1, -1)
 
     model = TimesNet(
         input_len=int(cfg_used["model"]["input_len"]),
@@ -98,6 +111,8 @@ def predict_once(cfg: Dict) -> str:
         mode=str(cfg_used["model"]["mode"]),
         channels_last=cfg_used["train"]["channels_last"],
         use_checkpoint=use_checkpoint,
+        min_sigma=min_sigma_scalar,
+        min_sigma_vector=min_sigma_vector_tensor,
     ).to(device)
     # Lazily construct layers (independent of number of series now).
     dummy = torch.zeros(1, 1, 1, device=device)
