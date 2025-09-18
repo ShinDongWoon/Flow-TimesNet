@@ -150,6 +150,8 @@ def predict_once(cfg: Dict) -> str:
             buffer_cpu = buffer_cpu.to(dtype=checkpoint_value.dtype)
         if not isinstance(checkpoint_value, torch.Tensor):
             clean_state["min_sigma_vector"] = buffer_cpu
+    else:
+        clean_state.pop("min_sigma_vector", None)
     model.load_state_dict(clean_state, strict=True)
     if cfg_used["train"]["channels_last"]:
         model.to(memory_format=torch.channels_last)
