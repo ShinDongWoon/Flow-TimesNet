@@ -94,6 +94,79 @@ def _adaptive_pool_valid_lengths(
     return pooled_feats, pooled_mask
 
 
+def _pool_trailing_sums(
+    values: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    target_len: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Aggregate trailing prefixes into ``target_len`` bins via summation.
+
+    Args:
+        values: Tensor shaped ``[B, C, T]``.
+        valid_lengths: Tensor shaped ``[B]`` describing the number of valid
+            trailing timesteps per sequence. When a length is zero the
+            corresponding output sums and counts are also zeroed.
+        target_len: Number of output bins.
+
+    Returns:
+        Tuple ``(sum_values, counts)`` where ``sum_values`` has shape
+        ``[B, C, target_len]`` and contains the summed values for each output
+        bin, and ``counts`` has shape ``[B, target_len]`` storing the number of
+        contributing timesteps per bin.
+    """
+
+    if values.ndim != 3:
+        raise ValueError("values must be a 3D tensor")
+
+    if valid_lengths.ndim != 1 or valid_lengths.size(0) != values.size(0):
+        raise ValueError("valid_lengths must be 1D with the same batch size")
+
+    B, C, T = values.shape
+    if T <= 0:
+        raise ValueError("values must have a non-empty time dimension")
+
+    target_steps = max(int(target_len), 1)
+    device = values.device
+    lengths = valid_lengths.to(device=device, dtype=torch.long)
+    lengths = lengths.clamp(min=0, max=T)
+    has_valid = lengths > 0
+    lengths_safe = torch.where(has_valid, lengths, torch.ones_like(lengths))
+
+    if not torch.all(lengths_safe == T):
+        time_idx = torch.arange(T, device=device, dtype=lengths_safe.dtype)
+        time_idx = time_idx.view(1, 1, T)
+        start = (T - lengths_safe).view(B, 1, 1)
+        range_mask = (time_idx >= start).to(values.dtype)
+        values = values * range_mask
+
+    offsets = (T - lengths_safe).view(B, 1)
+    steps = torch.arange(target_steps + 1, device=device, dtype=lengths_safe.dtype)
+    scaled = lengths_safe.view(B, 1) * steps.view(1, -1)
+    start_rel = scaled[:, :-1] // target_steps
+    end_rel = (scaled[:, 1:] + target_steps - 1) // target_steps
+
+    start_idx = (start_rel + offsets).clamp(min=0, max=T)
+    end_idx = (end_rel + offsets).clamp(min=0, max=T)
+    counts = (end_idx - start_idx).clamp(min=1)
+
+    values_cumsum = torch.cumsum(values.to(torch.float64), dim=-1)
+    values_cumsum = torch.cat(
+        [values_cumsum.new_zeros(B, C, 1), values_cumsum], dim=-1
+    )
+    start_idx_vals = start_idx.view(B, 1, target_steps).expand(-1, C, -1)
+    end_idx_vals = end_idx.view(B, 1, target_steps).expand(-1, C, -1)
+    start_vals = torch.gather(values_cumsum, dim=-1, index=start_idx_vals)
+    end_vals = torch.gather(values_cumsum, dim=-1, index=end_idx_vals)
+    sum_vals = (end_vals - start_vals).to(values.dtype)
+
+    if not torch.all(has_valid):
+        keep_mask = has_valid.view(B, 1, 1).to(sum_vals.dtype)
+        sum_vals = sum_vals * keep_mask
+        counts = counts * has_valid.view(B, 1).expand_as(counts).to(counts.dtype)
+
+    return sum_vals, counts
+
+
 class PeriodicityTransform(nn.Module):
     """Approximate period folding via FFT."""
 
@@ -553,8 +626,9 @@ class TimesNet(nn.Module):
         if not self._lazy_built:
             self._build_lazy(x=x)
 
-        features = x.new_zeros(BN, self.d_model, T)
-        coverage = x.new_zeros(BN, 1, T)
+        input_window = int(max(1, min(T, self.input_len)))
+        features = x.new_zeros(BN, self.d_model, input_window)
+        coverage = x.new_zeros(BN, 1, input_window)
         for group in groups:
             total_tiles = group.values.size(0)
             if total_tiles == 0:
@@ -588,29 +662,31 @@ class TimesNet(nn.Module):
                     continue
                 if flat.size(-1) > T:
                     flat = flat[..., -T:]
-                length = flat.size(-1)
-                start = max(T - length, 0)
-                pad_left = start
-                pad_right = T - start - length
-                flat_padded = F.pad(flat, (pad_left, pad_right))
-                if features.dtype != flat_padded.dtype:
+                tile_len = flat.size(-1)
+                tile_lengths = torch.full(
+                    (flat.size(0),),
+                    tile_len,
+                    dtype=torch.long,
+                    device=flat.device,
+                )
+                flat_sum, tile_counts = _pool_trailing_sums(
+                    values=flat,
+                    valid_lengths=tile_lengths,
+                    target_len=input_window,
+                )
+                coverage_update = tile_counts.to(dtype=flat_sum.dtype).unsqueeze(1)
+                if features.dtype != flat_sum.dtype:
                     # Mixed precision autocast can yield lower precision tiles; align the
                     # accumulation buffers with the tile dtype to avoid redundant casts.
-                    features = features.to(dtype=flat_padded.dtype)
-                if coverage.dtype != flat_padded.dtype:
-                    coverage = coverage.to(dtype=flat_padded.dtype)
-                if flat_padded.device != features.device:
+                    features = features.to(dtype=flat_sum.dtype)
+                if coverage.dtype != flat_sum.dtype:
+                    coverage = coverage.to(dtype=flat_sum.dtype)
+                if flat_sum.device != features.device:
                     raise RuntimeError(
-                        "flat_padded and features must reside on the same device"
+                        "flat_sum and features must reside on the same device"
                     )
                 batch_chunk = group.batch_indices[start_idx:end_idx]
-                features.index_add_(0, batch_chunk, flat_padded)
-                coverage_update = flat.new_ones((flat.size(0), 1, length))
-                coverage_update = F.pad(coverage_update, (pad_left, pad_right))
-                if features.dtype != coverage_update.dtype:
-                    features = features.to(dtype=coverage_update.dtype)
-                if coverage.dtype != coverage_update.dtype:
-                    coverage = coverage.to(dtype=coverage_update.dtype)
+                features.index_add_(0, batch_chunk, flat_sum)
                 if coverage_update.device != coverage.device:
                     raise RuntimeError(
                         "coverage_update and coverage must reside on the same device"
@@ -622,33 +698,71 @@ class TimesNet(nn.Module):
         features = features / coverage_safe
         step_mask = coverage_mask.to(features.dtype)
         hist_mask_flat = None
+        mask_lengths = None
         if mask is not None:
             hist_mask_flat = mask.permute(0, 2, 1).reshape(BN, T)
+            mask_lengths = hist_mask_flat.to(torch.long).sum(dim=-1)
+            mask_vals = hist_mask_flat.unsqueeze(1).to(features.dtype)
+            mask_sums, _ = _pool_trailing_sums(
+                values=mask_vals,
+                valid_lengths=mask_lengths,
+                target_len=input_window,
+            )
             step_mask = torch.maximum(
                 step_mask,
-                (hist_mask_flat > 0).unsqueeze(1).to(features.dtype),
+                (mask_sums > 0).to(features.dtype),
             )
 
         raw_input = x.permute(0, 2, 1).reshape(BN, T).unsqueeze(1)
         if hist_mask_flat is not None:
             raw_input = raw_input * hist_mask_flat.unsqueeze(1)
-        raw_features = self.raw_proj(raw_input)
+            raw_lengths = mask_lengths
+        else:
+            raw_lengths = torch.full((BN,), T, dtype=torch.long, device=x.device)
+        raw_sums, raw_counts = _pool_trailing_sums(
+            values=raw_input,
+            valid_lengths=raw_lengths,
+            target_len=input_window,
+        )
+        raw_counts = raw_counts.to(raw_sums.dtype).unsqueeze(1)
+        raw_counts_safe = torch.where(
+            raw_counts > 0,
+            raw_counts,
+            raw_counts.new_ones(raw_counts.shape),
+        )
+        raw_avg = raw_sums / raw_counts_safe
+        raw_avg = torch.where(raw_counts > 0, raw_avg, torch.zeros_like(raw_avg))
+        if raw_avg.dtype != features.dtype:
+            raw_avg = raw_avg.to(dtype=features.dtype)
+        raw_features = self.raw_proj(raw_avg)
         if raw_features.dtype != features.dtype:
             raw_features = raw_features.to(dtype=features.dtype)
         features = features + raw_features
         features = features * step_mask
 
         if hist_mask_flat is not None:
-            valid_lengths = hist_mask_flat.to(torch.long).sum(dim=-1)
+            valid_lengths = torch.minimum(
+                mask_lengths,
+                torch.full_like(mask_lengths, input_window),
+            )
         else:
-            valid_lengths = torch.full((BN,), T, dtype=torch.long, device=x.device)
+            valid_lengths = torch.full(
+                (BN,), input_window, dtype=torch.long, device=x.device
+            )
 
-        features, pooled_mask = _adaptive_pool_valid_lengths(
-            features=features,
-            mask=step_mask,
-            valid_lengths=valid_lengths,
-            target_len=self.input_len,
-        )
+        needs_pooling = input_window != self.input_len
+        if not needs_pooling:
+            needs_pooling = bool(torch.any(valid_lengths < input_window).item())
+
+        if needs_pooling:
+            features, pooled_mask = _adaptive_pool_valid_lengths(
+                features=features,
+                mask=step_mask,
+                valid_lengths=valid_lengths,
+                target_len=self.input_len,
+            )
+        else:
+            pooled_mask = step_mask
 
         eps = torch.finfo(features.dtype).eps
         features = features / (pooled_mask + eps)
