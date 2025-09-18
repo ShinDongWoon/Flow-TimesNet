@@ -1,8 +1,10 @@
+import math
 import sys
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+import pytest
 
 # Ensure the project src is on the path for imports
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
@@ -232,6 +234,97 @@ def test_period_group_chunk_helper_caps_size(monkeypatch):
     finally:
         model.period_group_max_chunk_bytes = max_bytes_backup
         model.period_group_chunk = chunk_backup
+
+
+def test_period_group_chunk_size_shrinks_with_consumed_tiles(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    torch.manual_seed(0)
+    B, L, N = 1, 16, 1
+    total_tiles = 5
+    cycles = 1
+    period = 1
+    dtype = torch.float32
+
+    model = TimesNet(
+        input_len=L,
+        pred_len=1,
+        d_model=2,
+        n_layers=0,
+        k_periods=1,
+        pmax=1,
+        kernel_set=[1],
+        dropout=0.0,
+        activation="relu",
+        mode="direct",
+        channels_last=False,
+        use_checkpoint=False,
+        period_group_memory_ratio=1.0,
+    )
+
+    element_size = torch.tensor(0, dtype=dtype).element_size()
+    kernel_paths = max(len(model.kernel_set), 1)
+    block_multiplier = max(model.n_layers, 1) * kernel_paths
+    base_elements = float(model.d_model) * float(cycles) * float(period)
+    estimated_elements = base_elements * (1.0 + float(block_multiplier))
+    bytes_per_tile = int(
+        max(
+            math.ceil(estimated_elements * element_size * 4.0),
+            1,
+        )
+    )
+    model.period_group_max_chunk_bytes = bytes_per_tile * 3
+
+    values = torch.randn(total_tiles, cycles, period, dtype=dtype)
+    batch_indices = torch.zeros(total_tiles, dtype=torch.long)
+    freq_indices = torch.zeros(total_tiles, dtype=torch.long)
+    fake_group = PeriodGroup(
+        values=values,
+        batch_indices=batch_indices,
+        frequency_indices=freq_indices,
+        cycles=cycles,
+        period=period,
+    )
+
+    monkeypatch.setattr(model.period, "forward", lambda *args, **kwargs: [fake_group])
+
+    resolver_log = []
+    original_resolver = TimesNet._resolve_period_group_chunk
+
+    def wrapped_resolver(self, group, dtype, tiles_processed=None, budget_bytes=None):
+        chunk = original_resolver(
+            self,
+            group=group,
+            dtype=dtype,
+            tiles_processed=tiles_processed,
+            budget_bytes=budget_bytes,
+        )
+        resolver_log.append(
+            {
+                "tiles_processed": 0 if tiles_processed is None else int(tiles_processed),
+                "chunk": int(chunk),
+            }
+        )
+        return chunk
+
+    monkeypatch.setattr(TimesNet, "_resolve_period_group_chunk", wrapped_resolver)
+
+    x = torch.randn(B, L, N, dtype=dtype)
+    with torch.no_grad():
+        model(x)
+
+    assert len(resolver_log) > 1, "expected multiple chunk resolution steps"
+
+    processed = 0
+    for entry in resolver_log:
+        assert entry["tiles_processed"] == processed
+        processed += entry["chunk"]
+
+    assert processed >= total_tiles
+
+    first_chunk = resolver_log[0]["chunk"]
+    later_chunks = [entry["chunk"] for entry in resolver_log[1:]]
+    assert any(chunk < first_chunk for chunk in later_chunks)
 
 
 def test_adaptive_pool_matches_reference_for_variable_lengths():
