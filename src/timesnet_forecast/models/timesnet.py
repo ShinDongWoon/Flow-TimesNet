@@ -211,46 +211,65 @@ class PeriodicityTransform(nn.Module):
             torch.zeros_like(periods),
         )
 
-        groups: dict[tuple[int, int], dict[str, List[torch.Tensor] | List[int]]] = {}
-        for bn in range(BN):
-            seq = seqs[bn]
-            for freq_rank in range(K):
-                cycle_val = int(cycles[bn, freq_rank].item())
-                period_val = int(periods[bn, freq_rank].item())
-                if cycle_val <= 0 or period_val <= 0:
-                    continue
-                take = cycle_val * period_val
-                if take <= 0:
-                    continue
-                start = max(T - take, 0)
-                idx_range = torch.arange(take, device=x.device)
-                gather_idx = (start + idx_range).clamp(min=0, max=max(T - 1, 0))
-                tile = seq.index_select(0, gather_idx).view(cycle_val, period_val).contiguous()
-                key = (cycle_val, period_val)
-                payload = groups.setdefault(
-                    key,
-                    {"tiles": [], "batch": [], "freq": []},
-                )
-                payload["tiles"].append(tile)
-                payload["batch"].append(bn)
-                payload["freq"].append(freq_rank)
+        valid_mask = (cycles > 0) & (periods > 0)
+        if not torch.any(valid_mask):
+            return []
+
+        cycle_vals = torch.masked_select(cycles, valid_mask)
+        period_vals = torch.masked_select(periods, valid_mask)
+
+        batch_grid = (
+            torch.arange(BN, device=x.device, dtype=torch.long)
+            .view(BN, 1)
+            .expand(BN, K)
+        )
+        freq_grid = (
+            torch.arange(K, device=x.device, dtype=torch.long)
+            .view(1, K)
+            .expand(BN, K)
+        )
+        batch_vals = torch.masked_select(batch_grid, valid_mask)
+        freq_vals = torch.masked_select(freq_grid, valid_mask)
+
+        pair_keys = torch.stack([cycle_vals, period_vals], dim=1)
+        unique_pairs, inverse = torch.unique(pair_keys, dim=0, return_inverse=True)
 
         out: List[PeriodGroup] = []
-        for (cycle_val, period_val), payload in groups.items():
-            tiles = torch.stack(payload["tiles"], dim=0)
-            batch_idx = torch.as_tensor(
-                payload["batch"], dtype=torch.long, device=x.device
-            )
-            freq_idx = torch.as_tensor(
-                payload["freq"], dtype=torch.long, device=x.device
-            )
+        max_time_idx = max(T - 1, 0)
+        for group_idx in range(unique_pairs.size(0)):
+            selector = inverse == group_idx
+            if not torch.any(selector):
+                continue
+            select_idx = torch.nonzero(selector, as_tuple=False).squeeze(-1)
+
+            bn_sel = torch.index_select(batch_vals, 0, select_idx)
+            freq_sel = torch.index_select(freq_vals, 0, select_idx)
+            if bn_sel.numel() == 0:
+                continue
+
+            cycles_int = int(unique_pairs[group_idx, 0].item())
+            period_int = int(unique_pairs[group_idx, 1].item())
+            take = cycles_int * period_int
+            if take <= 0:
+                continue
+
+            start = max(T - take, 0)
+            gather_idx = torch.arange(take, device=x.device, dtype=torch.long)
+            if gather_idx.numel() == 0:
+                continue
+            gather_idx = (gather_idx + start).clamp_(min=0, max=max_time_idx)
+
+            seq_subset = seqs.index_select(0, bn_sel)
+            tiles = seq_subset.index_select(1, gather_idx)
+            tiles = tiles.reshape(-1, cycles_int, period_int).contiguous()
+
             out.append(
                 PeriodGroup(
                     values=tiles,
-                    batch_indices=batch_idx,
-                    frequency_indices=freq_idx,
-                    cycles=cycle_val,
-                    period=period_val,
+                    batch_indices=bn_sel,
+                    frequency_indices=freq_sel,
+                    cycles=cycles_int,
+                    period=period_int,
                 )
             )
 

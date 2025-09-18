@@ -12,7 +12,11 @@ from timesnet_forecast.models.timesnet import PeriodicityTransform, PeriodGroup
 
 
 def _periodicity_transform_naive(
-    x: torch.Tensor, k: int, pmax: int
+    x: torch.Tensor,
+    k: int,
+    pmax: int,
+    mask: torch.Tensor | None = None,
+    min_period_threshold: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Reference implementation using explicit loops for verification."""
     B, T, N = x.shape
@@ -20,38 +24,101 @@ def _periodicity_transform_naive(
         empty = x.new_zeros(B, N, 0, pmax)
         return empty, empty
 
-    seqs = x.permute(0, 2, 1).reshape(B * N, T)
-    kidx = PeriodicityTransform._topk_freq(seqs, k)
+    BN = B * N
+    seqs = x.permute(0, 2, 1).reshape(BN, T)
+
+    if mask is not None:
+        if mask.shape != x.shape:
+            raise ValueError("mask must match the input shape")
+        mask_flat = mask.permute(0, 2, 1).reshape(BN, T)
+        valid_lengths = (mask_flat > 0).to(torch.long).sum(dim=-1)
+    else:
+        valid_lengths = torch.full((BN,), T, dtype=torch.long, device=x.device)
+
+    if mask is None:
+        kidx = PeriodicityTransform._topk_freq(seqs, k)
+    else:
+        cols = max(k, 1)
+        kidx = torch.ones((BN, cols), dtype=torch.long, device=x.device)
+        has_data = valid_lengths > 0
+        if has_data.any():
+            uniq = torch.unique(valid_lengths[has_data])
+            for length_val in uniq.tolist():
+                length_int = int(length_val)
+                if length_int <= 0:
+                    continue
+                idxs = torch.nonzero(valid_lengths == length_int, as_tuple=False).squeeze(-1)
+                if idxs.numel() == 0:
+                    continue
+                seq_subset = seqs.index_select(0, idxs)
+                seq_trim = seq_subset[:, T - length_int :]
+                subset_kidx = PeriodicityTransform._topk_freq(seq_trim, k)
+                if subset_kidx.size(1) < cols:
+                    pad = torch.ones(
+                        (subset_kidx.size(0), cols - subset_kidx.size(1)),
+                        dtype=torch.long,
+                        device=x.device,
+                    )
+                    subset_kidx = torch.cat([subset_kidx, pad], dim=1)
+                kidx.index_copy_(0, idxs, subset_kidx[:, :cols])
+
     K = kidx.size(1)
     if K == 0 or kidx.numel() == 0:
         empty = x.new_zeros(B, N, 0, pmax)
         return empty, empty
 
-    kidx = kidx.view(B, N, K)
-    P = torch.clamp(T // torch.clamp(kidx, min=1), min=1)
-    P = torch.clamp(P, min=1, max=pmax)
-    cycles = torch.clamp(T // P, min=1)
-    Cmax = int(torch.clamp(cycles.max(), min=1).item())
+    kidx = kidx.view(BN, K)
+    effective_lengths = torch.clamp(valid_lengths, min=1)
+    lengths_exp = effective_lengths.view(BN, 1)
+    kidx_clamped = torch.clamp(kidx, min=1)
+    periods = lengths_exp // kidx_clamped
+    periods = torch.clamp(periods, max=pmax)
+    min_period = torch.full_like(periods, min_period_threshold)
+    min_period = torch.minimum(min_period, lengths_exp)
+    periods = torch.maximum(periods, min_period)
+    periods = torch.clamp(periods, min=1)
 
-    folded = x.new_zeros(B, N, K * Cmax, pmax)
+    has_observations = (valid_lengths > 0).view(BN, 1)
+    cycles = torch.where(
+        has_observations,
+        torch.clamp(lengths_exp // torch.clamp(periods, min=1), min=1),
+        torch.zeros_like(periods),
+    )
+
+    if cycles.numel() == 0:
+        empty = x.new_zeros(B, N, 0, pmax)
+        return empty, empty
+
+    max_cycles = int(cycles.max().item()) if cycles.numel() > 0 else 0
+    if max_cycles <= 0:
+        empty = x.new_zeros(B, N, 0, pmax)
+        return empty, empty
+
+    folded = x.new_zeros(B, N, K * max_cycles, pmax)
     mask = torch.zeros_like(folded)
-    for b in range(B):
-        for n in range(N):
-            for ki in range(K):
-                period = int(P[b, n, ki].item())
-                cycle = int(cycles[b, n, ki].item())
-                if period <= 0 or cycle <= 0:
-                    continue
-                take = cycle * period
-                base = max(T - take, 0)
-                slot = ki * Cmax
-                for c in range(Cmax):
-                    for p in range(pmax):
-                        if c < cycle and p < period:
-                            idx = base + c * period + p
-                            idx = min(max(idx, 0), T - 1)
-                            folded[b, n, slot + c, p] = x[b, idx, n]
-                            mask[b, n, slot + c, p] = 1.0
+    for bn in range(BN):
+        seq = seqs[bn]
+        b = bn // N
+        n = bn % N
+        for freq_rank in range(K):
+            period_val = int(periods[bn, freq_rank].item())
+            cycle_val = int(cycles[bn, freq_rank].item())
+            if period_val <= 0 or cycle_val <= 0:
+                continue
+            take = cycle_val * period_val
+            if take <= 0:
+                continue
+            start = max(T - take, 0)
+            idx_range = torch.arange(take, device=x.device, dtype=torch.long)
+            if idx_range.numel() == 0:
+                continue
+            gather_idx = (start + idx_range).clamp(min=0, max=max(T - 1, 0))
+            tile = seq.index_select(0, gather_idx).view(cycle_val, period_val)
+            row_base = freq_rank * max_cycles
+            row_slice = slice(row_base, row_base + cycle_val)
+            col_slice = slice(0, period_val)
+            folded[b, n, row_slice, col_slice] = tile
+            mask[b, n, row_slice, col_slice] = 1.0
     return folded, mask
 
 
@@ -128,6 +195,34 @@ def test_periodicity_transform_matches_naive():
     transform = PeriodicityTransform(k, pmax=pmax)
     groups = transform(x)
     out_vec, mask_vec = _groups_to_dense(groups, x, k, pmax)
+    assert torch.allclose(out_vec, out_ref, atol=1e-6)
+    assert torch.allclose(mask_vec, mask_ref, atol=1e-6)
+
+
+def test_periodicity_transform_matches_naive_with_mask():
+    """Vectorised implementation should match naive reference when masked."""
+
+    torch.manual_seed(1)
+    B, T, N, k = 2, 48, 3, 2
+    x = torch.randn(B, T, N)
+    pmax = T
+
+    valid_lengths = torch.randint(0, T + 1, (B, N))
+    if not torch.any(valid_lengths > 0):
+        valid_lengths[0, 0] = T
+
+    hist_mask = torch.zeros(B, T, N, dtype=torch.float32)
+    for b in range(B):
+        for n in range(N):
+            length = int(valid_lengths[b, n].item())
+            if length > 0:
+                hist_mask[b, -length:, n] = 1.0
+
+    out_ref, mask_ref = _periodicity_transform_naive(x, k, pmax, mask=hist_mask)
+    transform = PeriodicityTransform(k, pmax=pmax)
+    groups = transform(x, mask=hist_mask)
+    out_vec, mask_vec = _groups_to_dense(groups, x, k, pmax)
+
     assert torch.allclose(out_vec, out_ref, atol=1e-6)
     assert torch.allclose(mask_vec, mask_ref, atol=1e-6)
 
