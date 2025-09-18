@@ -18,15 +18,15 @@ def test_forward_shape_and_head_processing():
         pred_len=H,
         d_model=8,
         n_layers=1,
-        k_periods=1,
+        k_periods=3,
         pmax=L,
-        kernel_set=[3],
+        kernel_set=[3, 5],
         dropout=0.0,
         activation="gelu",
         mode="direct",
     )
     with torch.no_grad():
-        model(torch.zeros(1, L, N))  # build lazy layers
+        model(torch.randn(1, L, N))  # build lazy layers with non-zero data
 
     x = torch.randn(B, L, N)
     model.train()
@@ -68,3 +68,58 @@ def test_timesnet_applies_per_series_floor():
     _, sigma = model(x)
     expected_floor = floor.view(1, 1, N)
     assert torch.all(sigma >= expected_floor)
+
+
+def test_timesnet_handles_zero_periods():
+    B, L, H, N = 2, 10, 2, 2
+    model = TimesNet(
+        input_len=L,
+        pred_len=H,
+        d_model=4,
+        n_layers=0,
+        k_periods=0,
+        pmax=L,
+        kernel_set=[3],
+        dropout=0.0,
+        activation="gelu",
+        mode="direct",
+        min_sigma=0.05,
+    )
+    x = torch.randn(B, L, N)
+    mu, sigma = model(x)
+    assert mu.shape == (B, H, N)
+    assert sigma.shape == (B, H, N)
+    assert torch.allclose(mu, torch.zeros_like(mu))
+    assert torch.allclose(sigma, torch.full_like(mu, 0.05))
+
+
+def test_timesnet_respects_history_mask():
+    B, L, H, N = 1, 12, 2, 2
+    total_len = L + 6
+    torch.manual_seed(1)
+    model = TimesNet(
+        input_len=L,
+        pred_len=H,
+        d_model=8,
+        n_layers=1,
+        k_periods=2,
+        pmax=total_len,
+        kernel_set=[3],
+        dropout=0.0,
+        activation="gelu",
+        mode="direct",
+    )
+    with torch.no_grad():
+        model(torch.randn(1, L, N))
+
+    padded = torch.randn(B, total_len, N)
+    mask = torch.zeros_like(padded)
+    mask[:, -L:, :] = 1.0
+    trimmed = padded[:, -L:, :]
+
+    model.eval()
+    mu_mask, sigma_mask = model(padded, mask=mask)
+    mu_trim, sigma_trim = model(trimmed)
+
+    assert torch.allclose(mu_mask, mu_trim, atol=1e-5)
+    assert torch.allclose(sigma_mask, sigma_trim, atol=1e-5)

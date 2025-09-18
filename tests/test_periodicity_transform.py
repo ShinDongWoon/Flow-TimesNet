@@ -1,15 +1,14 @@
 import math
 from pathlib import Path
 import sys
-from typing import Tuple
+from typing import List, Tuple
 
 import torch
-import torch.nn.functional as F
 
 # Ensure the project src is on the path for imports
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
-from timesnet_forecast.models.timesnet import PeriodicityTransform
+from timesnet_forecast.models.timesnet import PeriodicityTransform, PeriodGroup
 
 
 def _periodicity_transform_naive(
@@ -56,6 +55,46 @@ def _periodicity_transform_naive(
     return folded, mask
 
 
+def _groups_to_dense(
+    groups: List[PeriodGroup],
+    x: torch.Tensor,
+    k: int,
+    pmax: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reconstruct dense representations from grouped period tiles."""
+
+    B, _, N = x.shape
+    if k <= 0 or len(groups) == 0:
+        empty = x.new_zeros(B, N, 0, pmax)
+        return empty, empty
+
+    max_cycles = max((g.cycles for g in groups), default=0)
+    if max_cycles <= 0:
+        empty = x.new_zeros(B, N, 0, pmax)
+        return empty, empty
+
+    folded = x.new_zeros(B, N, k * max_cycles, pmax)
+    mask = torch.zeros_like(folded)
+    for group in groups:
+        cycles = group.cycles
+        period = group.period
+        if cycles <= 0 or period <= 0:
+            continue
+        for tile, bn_idx, freq_idx in zip(
+            group.values, group.batch_indices, group.frequency_indices
+        ):
+            bn = int(bn_idx.item())
+            freq = int(freq_idx.item())
+            b = bn // N
+            n = bn % N
+            row_base = freq * max_cycles
+            row_slice = slice(row_base, row_base + cycles)
+            col_slice = slice(0, period)
+            folded[b, n, row_slice, col_slice] = tile
+            mask[b, n, row_slice, col_slice] = 1.0
+    return folded, mask
+
+
 def test_periodicity_transform_period_length_consistency():
     """PeriodicityTransform should output a shared period length across channels."""
     B, T, N = 2, 200, 3
@@ -69,7 +108,8 @@ def test_periodicity_transform_period_length_consistency():
 
     k = 1
     transform = PeriodicityTransform(k, pmax=T)
-    folded, mask = transform(x)
+    groups = transform(x)
+    folded, mask = _groups_to_dense(groups, x, k, transform.pmax)
 
     assert folded.shape == mask.shape
     assert folded.shape[:2] == (B, N)
@@ -86,7 +126,8 @@ def test_periodicity_transform_matches_naive():
     pmax = T
     out_ref, mask_ref = _periodicity_transform_naive(x, k, pmax)
     transform = PeriodicityTransform(k, pmax=pmax)
-    out_vec, mask_vec = transform(x)
+    groups = transform(x)
+    out_vec, mask_vec = _groups_to_dense(groups, x, k, pmax)
     assert torch.allclose(out_vec, out_ref, atol=1e-6)
     assert torch.allclose(mask_vec, mask_ref, atol=1e-6)
 
@@ -104,8 +145,14 @@ def test_periodicity_transform_respects_history_mask():
     hist_mask[:, -valid_len:, :] = 1.0
 
     transform = PeriodicityTransform(k_periods=1, pmax=total_len)
-    folded_masked, mask_masked = transform(padded, mask=hist_mask)
-    folded_trim, mask_trim = transform(trimmed)
+    groups_masked = transform(padded, mask=hist_mask)
+    folded_masked, mask_masked = _groups_to_dense(
+        groups_masked, padded, transform.k, transform.pmax
+    )
+    groups_trim = transform(trimmed)
+    folded_trim, mask_trim = _groups_to_dense(
+        groups_trim, trimmed, transform.k, transform.pmax
+    )
 
     assert torch.allclose(folded_masked, folded_trim, atol=1e-6)
     assert torch.allclose(mask_masked, mask_trim, atol=1e-6)
@@ -122,8 +169,10 @@ def test_periodicity_transform_min_period_threshold_expands_period():
     low = FixedFreqTransform(k_periods=1, pmax=10, min_period_threshold=1)
     high = FixedFreqTransform(k_periods=1, pmax=10, min_period_threshold=6)
 
-    out_low, mask_low = low(x)
-    out_high, mask_high = high(x)
+    groups_low = low(x)
+    _, mask_low = _groups_to_dense(groups_low, x, low.k, low.pmax)
+    groups_high = high(x)
+    _, mask_high = _groups_to_dense(groups_high, x, high.k, high.pmax)
 
     # With the higher minimum period, more slots along P dimension remain populated.
     low_active = (mask_low > 0).any(dim=2).squeeze(0).squeeze(0)
@@ -142,44 +191,44 @@ def test_periodicity_transform_take_gt_T_with_compile():
     x = torch.randn(B, T, N)
 
     class DegenerateTransform(PeriodicityTransform):
-        def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:  # type: ignore[override]
+        def forward(self, x: torch.Tensor, mask=None):  # type: ignore[override]
             B, T, N = x.shape
-            seqs = x.permute(0, 2, 1).reshape(B * N, T)
-            kidx = torch.ones(B * N, self.k, dtype=torch.long, device=x.device)
-            K = kidx.size(1)
-            # Force P larger than T so that take > T
-            P = torch.full_like(kidx, self.pmax)
-            cycles = torch.ones_like(kidx)
-            take = cycles * P
-
-            Pmax = self.pmax
-            # Keep ``Cmax`` tensor-based to avoid `.item()` for GPU capture
-            Cmax_t = torch.clamp(cycles.max(), min=1)
-            idx_c = torch.arange(Cmax_t, device=x.device)
-            idx_p = torch.arange(Pmax, device=x.device)
-
-            base = torch.clamp(T - take, min=0)[..., None, None]
-            P_exp = P[..., None, None]
-            indices = base + idx_c.view(1, 1, -1, 1) * P_exp + idx_p.view(1, 1, 1, -1)
-            indices = indices.clamp(min=0, max=T - 1)
-
-            seqs_exp = (
-                seqs.unsqueeze(1).unsqueeze(2).expand(-1, K, idx_c.size(0), -1)
+            BN = B * N
+            if self.k <= 0:
+                return []
+            seqs = x.permute(0, 2, 1).reshape(BN, T)
+            tiles = []
+            batch = []
+            freq = []
+            for bn in range(BN):
+                seq = seqs[bn]
+                tile = seq.new_empty(self.pmax)
+                if T > 0:
+                    tile[:T] = seq
+                    tile[T:] = seq[-1]
+                else:
+                    tile.fill_(0.0)
+                tiles.append(tile.view(1, self.pmax))
+                batch.append(bn)
+                freq.append(0)
+            if not tiles:
+                return []
+            values = torch.stack(tiles, dim=0)
+            batch_idx = torch.tensor(batch, dtype=torch.long, device=x.device)
+            freq_idx = torch.tensor(freq, dtype=torch.long, device=x.device)
+            group = PeriodGroup(
+                values=values,
+                batch_indices=batch_idx,
+                frequency_indices=freq_idx,
+                cycles=1,
+                period=self.pmax,
             )
-            gathered = torch.gather(seqs_exp, dim=-1, index=indices)
-
-            mask_c = idx_c.view(1, 1, -1, 1) < cycles[..., None, None]
-            mask_p = idx_p.view(1, 1, 1, -1) < P[..., None, None]
-            mask = (mask_c & mask_p).to(gathered.dtype)
-            gathered = gathered * mask
-
-            gathered = gathered.reshape(B, N, K * gathered.size(2), Pmax)
-            flat_mask = mask.reshape(B, N, K * mask.size(2), Pmax)
-            return gathered, flat_mask
+            return [group]
 
     transform = DegenerateTransform(k_periods=1, pmax=T + 2)
     compiled = torch.compile(transform)
-    folded, mask = compiled(x)
-    assert folded.shape == mask.shape
-    assert folded.shape[-1] == T + 2
+    groups = compiled(x)
+    assert isinstance(groups, list)
+    assert len(groups) == 1
+    assert groups[0].period == transform.pmax
 

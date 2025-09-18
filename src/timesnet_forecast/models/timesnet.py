@@ -1,12 +1,22 @@
 from __future__ import annotations
 
-import math
-from typing import List, Tuple, Sequence
+from dataclasses import dataclass
+from typing import List, Sequence, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from torch.nn import init
+
+
+@dataclass
+class PeriodGroup:
+    """Container describing a batch of folded tiles sharing the same shape."""
+
+    values: torch.Tensor
+    batch_indices: torch.Tensor
+    frequency_indices: torch.Tensor
+    cycles: int
+    period: int
 
 
 class PeriodicityTransform(nn.Module):
@@ -46,29 +56,28 @@ class PeriodicityTransform(nn.Module):
 
     def forward(
         self, x: torch.Tensor, mask: torch.Tensor | None = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Vectorised period folding.
+    ) -> List[PeriodGroup]:
+        """Approximate period folding without dense padding.
 
         Args:
-            x: [B, T, N]
-            mask: optional mask aligned with ``x`` where values greater than zero
-                mark valid timesteps. When provided, leading padded entries are
-                ignored when estimating dominant frequencies.
+            x: Tensor shaped ``[B, T, N]`` containing the history.
+            mask: Optional tensor with the same shape as ``x`` marking valid
+                timesteps with values greater than zero. When provided, leading
+                padded entries are ignored when estimating dominant frequencies.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                folded tensor [B, N, K * C_max, P_max]
-                mask tensor   [B, N, K * C_max, P_max]
+            List of :class:`PeriodGroup` instances. Each group contains a batch of
+            folded tiles sharing the same ``(cycles, period)`` shape alongside the
+            indices of the originating series and their frequency ranks.
         """
+
         B, T, N = x.shape
-        # Flatten batch & channel for joint processing
-        seqs = x.permute(0, 2, 1).reshape(B * N, T)  # [BN, T]
+        BN = B * N
+        seqs = x.permute(0, 2, 1).reshape(BN, T)
 
         if self.k <= 0:
-            empty = x.new_zeros(B, N, 0, self.pmax)
-            return empty, empty
+            return []
 
-        BN = B * N
         if mask is not None:
             if mask.shape != x.shape:
                 raise ValueError("mask must match input shape")
@@ -81,7 +90,7 @@ class PeriodicityTransform(nn.Module):
             )
 
         if mask is None:
-            kidx = self._topk_freq(seqs, self.k)  # [BN, K]
+            kidx = self._topk_freq(seqs, self.k)
         else:
             cols = max(self.k, 1)
             kidx = torch.ones((BN, cols), dtype=torch.long, device=x.device)
@@ -109,117 +118,128 @@ class PeriodicityTransform(nn.Module):
 
         K = kidx.size(1)
         if K == 0 or kidx.numel() == 0:
-            empty = x.new_zeros(B, N, 0, self.pmax)
-            return empty, empty
+            return []
 
-        # Compute period lengths and cycles
         effective_lengths = torch.clamp(valid_lengths, min=1)
         lengths_exp = effective_lengths.view(BN, 1)
         kidx_clamped = torch.clamp(kidx, min=1)
-        P = lengths_exp // kidx_clamped
-        P = torch.clamp(P, max=self.pmax)
-        min_period = torch.full_like(P, self.min_period_threshold)
+        periods = lengths_exp // kidx_clamped
+        periods = torch.clamp(periods, max=self.pmax)
+        min_period = torch.full_like(periods, self.min_period_threshold)
         min_period = torch.minimum(min_period, lengths_exp)
-        P = torch.maximum(P, min_period)
-        P = torch.clamp(P, min=1)
+        periods = torch.maximum(periods, min_period)
+        periods = torch.clamp(periods, min=1)
+
         has_observations = (valid_lengths > 0).view(BN, 1)
         cycles = torch.where(
             has_observations,
-            torch.clamp(lengths_exp // torch.clamp(P, min=1), min=1),
-            torch.zeros_like(P),
+            torch.clamp(lengths_exp // torch.clamp(periods, min=1), min=1),
+            torch.zeros_like(periods),
         )
-        take = cycles * P
 
-        Pmax = self.pmax
-        # Keep ``Cmax`` as a tensor to avoid ``.item()`` which breaks GPU capture
-        Cmax_t = torch.clamp(cycles.max(), min=1)
-        idx_c = torch.arange(Cmax_t, device=x.device)
-        idx_p = torch.arange(Pmax, device=x.device)
+        groups: dict[tuple[int, int], dict[str, List[torch.Tensor] | List[int]]] = {}
+        for bn in range(BN):
+            seq = seqs[bn]
+            for freq_rank in range(K):
+                cycle_val = int(cycles[bn, freq_rank].item())
+                period_val = int(periods[bn, freq_rank].item())
+                if cycle_val <= 0 or period_val <= 0:
+                    continue
+                take = cycle_val * period_val
+                if take <= 0:
+                    continue
+                start = max(T - take, 0)
+                idx_range = torch.arange(take, device=x.device)
+                gather_idx = (start + idx_range).clamp(min=0, max=max(T - 1, 0))
+                tile = seq.index_select(0, gather_idx).view(cycle_val, period_val).contiguous()
+                key = (cycle_val, period_val)
+                payload = groups.setdefault(
+                    key,
+                    {"tiles": [], "batch": [], "freq": []},
+                )
+                payload["tiles"].append(tile)
+                payload["batch"].append(bn)
+                payload["freq"].append(freq_rank)
 
-        BN = B * N
-        base = torch.clamp(T - take, min=0)[..., None, None]
-        P_exp = P[..., None, None]
-        indices = base + idx_c.view(1, 1, -1, 1) * P_exp + idx_p.view(1, 1, 1, -1)
-        indices = indices.clamp(min=0, max=T - 1)
+        out: List[PeriodGroup] = []
+        for (cycle_val, period_val), payload in groups.items():
+            tiles = torch.stack(payload["tiles"], dim=0)
+            batch_idx = torch.as_tensor(
+                payload["batch"], dtype=torch.long, device=x.device
+            )
+            freq_idx = torch.as_tensor(
+                payload["freq"], dtype=torch.long, device=x.device
+            )
+            out.append(
+                PeriodGroup(
+                    values=tiles,
+                    batch_indices=batch_idx,
+                    frequency_indices=freq_idx,
+                    cycles=cycle_val,
+                    period=period_val,
+                )
+            )
 
-        seqs_exp = (
-            seqs.unsqueeze(1).unsqueeze(2).expand(BN, K, idx_c.size(0), -1)
-        )
-        gathered = torch.gather(seqs_exp, dim=-1, index=indices)
-
-        mask_c = idx_c.view(1, 1, -1, 1) < cycles[..., None, None]
-        mask_p = idx_p.view(1, 1, 1, -1) < P[..., None, None]
-        mask = (mask_c & mask_p).to(gathered.dtype)
-        gathered = gathered * mask
-
-        gathered = gathered.reshape(B, N, K * gathered.size(2), Pmax)
-        flat_mask = mask.reshape(B, N, K * mask.size(2), Pmax)
-        return gathered, flat_mask
+        return out
 
 
-class InceptionBlock(nn.Module):
+class TimesBlock(nn.Module):
+    """Multi-scale 2-D convolutional block inspired by TimesNet."""
+
     def __init__(
         self,
-        in_ch: int,
-        out_ch: int,
-        kernel_set: List[int],
+        channels: int,
+        kernel_set: Sequence[int],
         dropout: float,
-        act: str,
-        channels_last: bool = False,
+        activation: str,
     ) -> None:
         super().__init__()
-        self.channels_last = bool(channels_last)
+        kernels = list(kernel_set) if len(kernel_set) > 0 else [1]
         self.paths = nn.ModuleList()
-        for k in kernel_set:
-            pad = (k - 1) // 2 if self.channels_last else k // 2
-            if self.channels_last:
-                self.paths.append(
-                    nn.Conv2d(in_ch, out_ch, kernel_size=(k, 1), padding=(pad, 0))
+        for k in kernels:
+            k_int = max(int(k), 1)
+            pad = k_int // 2
+            self.paths.append(
+                nn.Sequential(
+                    nn.Conv2d(
+                        channels,
+                        channels,
+                        kernel_size=(k_int, 1),
+                        padding=(pad, 0),
+                    ),
+                    self._build_activation(activation),
+                    nn.Conv2d(
+                        channels,
+                        channels,
+                        kernel_size=(1, k_int),
+                        padding=(0, pad),
+                    ),
+                    self._build_activation(activation),
                 )
-            else:
-                self.paths.append(nn.Conv1d(in_ch, out_ch, kernel_size=k, padding=pad))
-        if self.channels_last:
-            self.proj = nn.Conv2d(out_ch * len(kernel_set), out_ch, kernel_size=1)
-        else:
-            self.proj = nn.Conv1d(out_ch * len(kernel_set), out_ch, kernel_size=1)
-        # Residual projection if channel dims differ
-        if in_ch != out_ch:
-            if self.channels_last:
-                self.res_proj = nn.Conv2d(in_ch, out_ch, kernel_size=1)
-            else:
-                self.res_proj = nn.Conv1d(in_ch, out_ch, kernel_size=1)
-        else:
-            self.res_proj = nn.Identity()
+            )
+        self.proj = nn.Conv2d(channels * len(self.paths), channels, kernel_size=1)
         self.dropout = nn.Dropout(dropout)
-        if act.lower() == "gelu":
-            self.act = nn.GELU()
-        elif act.lower() == "relu":
-            self.act = nn.ReLU()
-        else:
-            self.act = nn.GELU()
+        self.out_act = self._build_activation(activation)
+
+    @staticmethod
+    def _build_activation(name: str) -> nn.Module:
+        name_norm = name.lower()
+        if name_norm == "relu":
+            return nn.ReLU()
+        return nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply inception-style convolutions.
-
-        Args:
-            x: [B, C, L] when ``channels_last`` is ``False``
-               or [B, C, L, 1] when ``channels_last`` is ``True``
-        """
-        res = self.res_proj(x)
-        feats = [p(x) for p in self.paths]
+        res = x
+        feats = [path(x) for path in self.paths]
         z = torch.cat(feats, dim=1)
         z = self.proj(z)
-        z = self.act(z)
+        z = self.out_act(z)
         z = self.dropout(z)
         return z + res
 
 
 class TimesNet(nn.Module):
-    """
-    입력 [B, T, N] -> PeriodicityTransform -> [B, K, P, N]
-    채널/주기 축을 conv1d가 처리하기 쉽게 [B, N, K*P]로 변환 후 InceptionBlock 스택.
-    전역 풀링 후 선형 헤드가 pred_len 생성 (direct) 또는 1스텝 (recursive).
-    """
+    """TimesNet forecaster with grouped period folding and 2-D convolutions."""
     def __init__(
         self,
         input_len: int,
@@ -251,8 +271,9 @@ class TimesNet(nn.Module):
         self.k = int(k_periods)
         self.input_len = int(input_len)
         self.act = activation
-        # We don't know the period-length ``P`` at build time, so layers are built lazily
-        # during the first forward pass once the flattened length ``K*P`` is known.
+        # Blocks are instantiated lazily once we observe the input device/dtype.
+        self.frontend: nn.Module = nn.Identity()
+        self.raw_proj: nn.Module = nn.Identity()
         self.blocks: nn.ModuleList = nn.ModuleList()
         self.pool: nn.Module = nn.Identity()
         self.head: nn.Module = nn.Identity()
@@ -269,68 +290,41 @@ class TimesNet(nn.Module):
             min_sigma_tensor = torch.as_tensor(min_sigma_vector, dtype=torch.float32)
             self.min_sigma_vector = min_sigma_tensor.reshape(1, 1, -1)
 
-    def _build_lazy(self, x: torch.Tensor) -> None:
-        """Instantiate convolutional blocks on first use.
+    # ------------------------------------------------------------------
+    # Backwards compatibility hooks
+    # ------------------------------------------------------------------
+    def _resize_frontend(self, *args, **kwargs) -> None:
+        """Kept for compatibility with legacy patching in tests."""
 
-        Args:
-            x: reference tensor for device/dtype placement
-        """
-        if self.channels_last:
-            first = nn.Conv2d(self.k, self.d_model, kernel_size=(1, 1)).to(
-                device=x.device, dtype=x.dtype
-            )
-        else:
-            first = nn.Conv1d(self.k, self.d_model, kernel_size=1).to(
-                device=x.device, dtype=x.dtype
-            )
-        blocks = [first]
+        return None
+
+    def _build_lazy(self, x: torch.Tensor) -> None:
+        """Instantiate convolutional blocks on first use."""
+
+        device = x.device
+        dtype = x.dtype
+        self.frontend = nn.Conv2d(1, self.d_model, kernel_size=1).to(
+            device=device, dtype=dtype
+        )
+        self.raw_proj = nn.Conv1d(1, self.d_model, kernel_size=1).to(
+            device=device, dtype=dtype
+        )
+        blocks: List[nn.Module] = []
         for _ in range(self.n_layers):
             blocks.append(
-                InceptionBlock(
-                    self.d_model,
-                    self.d_model,
-                    self.kernel_set,
-                    self.dropout,
-                    self.act,
-                    channels_last=self.channels_last,
-                ).to(device=x.device, dtype=x.dtype)
+                TimesBlock(
+                    channels=self.d_model,
+                    kernel_set=self.kernel_set,
+                    dropout=self.dropout,
+                    activation=self.act,
+                ).to(device=device, dtype=dtype)
             )
         self.blocks = nn.ModuleList(blocks)
-        # Pool only over the temporal dimension; series dimension is preserved.
         self.pool = nn.AdaptiveAvgPool1d(self._out_steps)
-        # Lightweight 1x1 conv head emits (mu, log_sigma) per horizon step.
         self.head = nn.Conv1d(self.d_model, 2, kernel_size=1).to(
-            device=x.device, dtype=x.dtype
+            device=device, dtype=dtype
         )
         self._lazy_built = True
-
-    def _resize_frontend(
-        self, new_in_channels: int, device: torch.device, dtype: torch.dtype
-    ) -> None:
-        """Expand the input projection if additional cycles appear.
-
-        Args:
-            new_in_channels: desired number of input channels
-            device: target device for the resized layer
-            dtype: target dtype for the resized layer
-        """
-        if new_in_channels <= self.k:
-            return
-        conv = self.blocks[0]
-        old_weight = conv.weight.data
-        old_in = old_weight.size(1)
-        if new_in_channels <= old_in:
-            self.k = new_in_channels
-            return
-        new_shape = (old_weight.size(0), new_in_channels, *old_weight.shape[2:])
-        with torch.no_grad():
-            new_weight = torch.zeros(new_shape, device=device, dtype=dtype)
-            new_weight[:, :old_in, ...] = old_weight
-            if new_in_channels > old_in:
-                init.kaiming_uniform_(new_weight[:, old_in:, ...], a=math.sqrt(5))
-            conv.weight.data = new_weight
-        conv.in_channels = new_in_channels
-        self.k = new_in_channels
 
     def forward(
         self, x: torch.Tensor, mask: torch.Tensor | None = None
@@ -350,51 +344,95 @@ class TimesNet(nn.Module):
                     "min_sigma_vector length does not match number of series"
                 )
             sigma_floor = self.min_sigma_vector
-        z_all, mask_all = self.period(x, mask=mask)
+        groups = self.period(x, mask=mask)
         BN = B * N
-        KC = z_all.size(2)
-        z = z_all.reshape(BN, KC, z_all.size(-1))
-        mask = mask_all.reshape(BN, KC, mask_all.size(-1))
-        pooled_mask = F.adaptive_avg_pool1d(mask, self.input_len)
-        z = F.adaptive_avg_pool1d(z, self.input_len)
-        eps = torch.finfo(z.dtype).eps
-        z = z / (pooled_mask + eps)
-        mask = (pooled_mask > 0).to(z.dtype)
-        KC = z.size(1)
-        steps = z.size(-1)
-        if KC == 0:
+        if len(groups) == 0:
             out_steps = self._out_steps
             mu = x.new_zeros(B, out_steps, N)
             if sigma_floor is not None:
-                sigma = sigma_floor.to(dtype=x.dtype, device=x.device).expand(B, out_steps, -1).clone()
+                sigma = (
+                    sigma_floor.to(dtype=x.dtype, device=x.device)
+                    .expand(B, out_steps, -1)
+                    .clone()
+                )
             else:
                 sigma = x.new_full((B, out_steps, N), self.min_sigma)
             return mu, sigma
+
         if not self._lazy_built:
-            self.k = KC
-            self._build_lazy(x=z)
+            self._build_lazy(x=x)
+
+        features = x.new_zeros(BN, self.d_model, T)
+        coverage = x.new_zeros(BN, 1, T)
+        for group in groups:
+            if group.values.numel() == 0:
+                continue
+            tiles = group.values.unsqueeze(1)  # [M, 1, C, P]
+            tiles = self.frontend(tiles)
+            for blk in self.blocks:
+                tiles = (
+                    checkpoint(blk, tiles, use_reentrant=False)
+                    if self.use_checkpoint
+                    else blk(tiles)
+                )
+            flat = tiles.reshape(tiles.size(0), self.d_model, -1)
+            if flat.size(-1) == 0:
+                continue
+            if flat.size(-1) > T:
+                flat = flat[..., -T:]
+            length = flat.size(-1)
+            start = max(T - length, 0)
+            pad_left = start
+            pad_right = T - start - length
+            flat_padded = F.pad(flat, (pad_left, pad_right))
+            features.index_add_(0, group.batch_indices, flat_padded)
+            coverage_update = flat.new_ones((flat.size(0), 1, length))
+            coverage_update = F.pad(coverage_update, (pad_left, pad_right))
+            coverage.index_add_(0, group.batch_indices, coverage_update)
+
+        coverage_mask = coverage > 0
+        coverage_safe = torch.where(coverage_mask, coverage, torch.ones_like(coverage))
+        features = features / coverage_safe
+        step_mask = coverage_mask.to(features.dtype)
+        hist_mask_flat = None
+        if mask is not None:
+            hist_mask_flat = mask.permute(0, 2, 1).reshape(BN, T)
+            step_mask = torch.maximum(
+                step_mask,
+                (hist_mask_flat > 0).unsqueeze(1).to(features.dtype),
+            )
+
+        raw_input = x.permute(0, 2, 1).reshape(BN, T).unsqueeze(1)
+        if hist_mask_flat is not None:
+            raw_input = raw_input * hist_mask_flat.unsqueeze(1)
+        raw_features = self.raw_proj(raw_input)
+        features = features + raw_features
+        features = features * step_mask
+
+        if hist_mask_flat is not None:
+            valid_lengths = hist_mask_flat.to(torch.long).sum(dim=-1)
         else:
-            if KC > self.k:
-                self._resize_frontend(KC, device=z.device, dtype=z.dtype)
-            elif KC < self.k:
-                pad = self.k - KC
-                if pad > 0:
-                    pad_shape = (z.size(0), pad, steps)
-                    z = torch.cat([z, z.new_zeros(pad_shape)], dim=1)
-                    mask = torch.cat([mask, mask.new_zeros(pad_shape)], dim=1)
-                    KC = self.k
-        z = z * mask
-        step_mask = mask.amax(dim=1, keepdim=True).to(dtype=z.dtype)
-        if self.channels_last:
-            z = z.unsqueeze(-1).contiguous(memory_format=torch.channels_last)
-            step_mask = step_mask.unsqueeze(-1)
-        for blk in self.blocks:
-            z = checkpoint(blk, z, use_reentrant=False) if self.use_checkpoint else blk(z)
-        if self.channels_last:
-            z = z.squeeze(-1)
-            step_mask = step_mask.squeeze(-1)
-        z = z * step_mask
-        z = self.pool(z)
+            valid_lengths = torch.full((BN,), T, dtype=torch.long, device=x.device)
+
+        pooled_feats: List[torch.Tensor] = []
+        pooled_masks: List[torch.Tensor] = []
+        for idx in range(BN):
+            length = int(valid_lengths[idx].item())
+            length = max(min(length, features.size(-1)), 1)
+            start_idx = features.size(-1) - length
+            feat_slice = features[idx : idx + 1, :, start_idx:]
+            mask_slice = step_mask[idx : idx + 1, :, start_idx:]
+            pooled_feats.append(F.adaptive_avg_pool1d(feat_slice, self.input_len))
+            pooled_masks.append(F.adaptive_avg_pool1d(mask_slice, self.input_len))
+        features = torch.cat(pooled_feats, dim=0)
+        pooled_mask = torch.cat(pooled_masks, dim=0)
+
+        eps = torch.finfo(features.dtype).eps
+        features = features / (pooled_mask + eps)
+        mask_seq = (pooled_mask > 0).to(features.dtype)
+        features = features * mask_seq
+
+        z = self.pool(features)
         y_all = self.head(z)
         out_steps = self._out_steps
         params = (
