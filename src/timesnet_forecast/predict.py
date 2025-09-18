@@ -114,16 +114,24 @@ def predict_once(cfg: Dict) -> str:
         min_sigma=min_sigma_scalar,
         min_sigma_vector=min_sigma_vector_tensor,
     ).to(device)
-    # Lazily construct layers (independent of number of series now).
-    dummy = torch.zeros(1, 1, 1, device=device)
-    model._build_lazy(x=dummy)
+    # Lazily construct layers by mirroring the training warm-up.
+    with torch.no_grad():
+        dummy = torch.zeros(
+            1,
+            int(cfg_used["model"]["input_len"]),
+            len(ids),
+            device=device,
+        )
+        if cfg_used["train"]["channels_last"]:
+            dummy = dummy.unsqueeze(-1).to(memory_format=torch.channels_last).squeeze(-1)
+        model(dummy)
     state = torch.load(model_file, map_location="cpu")
     # Checkpoints saved with torch.compile or DataParallel may prefix parameter names.
     clean_state = {
         k.replace("_orig_mod.", "").replace("module.", ""): v
         for k, v in state.items()
     }
-    model.load_state_dict(clean_state)
+    model.load_state_dict(clean_state, strict=True)
     if cfg_used["train"]["channels_last"]:
         model.to(memory_format=torch.channels_last)
     model.eval()
