@@ -44,11 +44,16 @@ class PeriodicityTransform(nn.Module):
         topk = torch.clamp(topk, min=1)
         return topk
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Vectorised period folding.
 
         Args:
             x: [B, T, N]
+            mask: optional mask aligned with ``x`` where values greater than zero
+                mark valid timesteps. When provided, leading padded entries are
+                ignored when estimating dominant frequencies.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
@@ -63,18 +68,66 @@ class PeriodicityTransform(nn.Module):
             empty = x.new_zeros(B, N, 0, self.pmax)
             return empty, empty
 
-        kidx = self._topk_freq(seqs, self.k)  # [BN, K]
+        BN = B * N
+        if mask is not None:
+            if mask.shape != x.shape:
+                raise ValueError("mask must match input shape")
+            mask_flat = mask.permute(0, 2, 1).reshape(BN, T)
+            mask_bool = mask_flat > 0
+            valid_lengths = mask_bool.to(torch.long).sum(dim=-1)
+        else:
+            valid_lengths = torch.full(
+                (BN,), T, dtype=torch.long, device=x.device
+            )
+
+        if mask is None:
+            kidx = self._topk_freq(seqs, self.k)  # [BN, K]
+        else:
+            cols = max(self.k, 1)
+            kidx = torch.ones((BN, cols), dtype=torch.long, device=x.device)
+            has_data = valid_lengths > 0
+            if has_data.any():
+                uniq = torch.unique(valid_lengths[has_data])
+                for length_val in uniq.tolist():
+                    length_int = int(length_val)
+                    if length_int <= 0:
+                        continue
+                    idxs = torch.nonzero(valid_lengths == length_int, as_tuple=False).squeeze(-1)
+                    if idxs.numel() == 0:
+                        continue
+                    seq_subset = seqs.index_select(0, idxs)
+                    seq_trim = seq_subset[:, T - length_int :]
+                    subset_kidx = self._topk_freq(seq_trim, self.k)
+                    if subset_kidx.size(1) < cols:
+                        pad = torch.ones(
+                            (subset_kidx.size(0), cols - subset_kidx.size(1)),
+                            dtype=torch.long,
+                            device=x.device,
+                        )
+                        subset_kidx = torch.cat([subset_kidx, pad], dim=1)
+                    kidx.index_copy_(0, idxs, subset_kidx[:, :cols])
+
         K = kidx.size(1)
         if K == 0 or kidx.numel() == 0:
             empty = x.new_zeros(B, N, 0, self.pmax)
             return empty, empty
 
         # Compute period lengths and cycles
-        P = T // torch.clamp(kidx, min=1)
-        P = torch.clamp(
-            P, min=self.min_period_threshold, max=self.pmax
-        )  # [BN, K]
-        cycles = torch.clamp(T // P, min=1)  # [BN, K]
+        effective_lengths = torch.clamp(valid_lengths, min=1)
+        lengths_exp = effective_lengths.view(BN, 1)
+        kidx_clamped = torch.clamp(kidx, min=1)
+        P = lengths_exp // kidx_clamped
+        P = torch.clamp(P, max=self.pmax)
+        min_period = torch.full_like(P, self.min_period_threshold)
+        min_period = torch.minimum(min_period, lengths_exp)
+        P = torch.maximum(P, min_period)
+        P = torch.clamp(P, min=1)
+        has_observations = (valid_lengths > 0).view(BN, 1)
+        cycles = torch.where(
+            has_observations,
+            torch.clamp(lengths_exp // torch.clamp(P, min=1), min=1),
+            torch.zeros_like(P),
+        )
         take = cycles * P
 
         Pmax = self.pmax
@@ -279,7 +332,9 @@ class TimesNet(nn.Module):
         conv.in_channels = new_in_channels
         self.k = new_in_channels
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         x: [B, T, N]
         returns:
@@ -295,7 +350,7 @@ class TimesNet(nn.Module):
                     "min_sigma_vector length does not match number of series"
                 )
             sigma_floor = self.min_sigma_vector
-        z_all, mask_all = self.period(x)
+        z_all, mask_all = self.period(x, mask=mask)
         BN = B * N
         KC = z_all.size(2)
         z = z_all.reshape(BN, KC, z_all.size(-1))

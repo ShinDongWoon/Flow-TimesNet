@@ -20,34 +20,47 @@ def _select_device(req: str) -> torch.device:
     return torch.device("cpu")
 
 
-def _pad_left_zeros(arr: np.ndarray, need_len: int) -> np.ndarray:
+def _pad_left_zeros(arr: np.ndarray, need_len: int) -> Tuple[np.ndarray, np.ndarray]:
     """
     arr: [T, N], pad zeros at top to reach need_len
     """
     T, N = arr.shape
     if T >= need_len:
-        return arr[-need_len:, :]
+        trimmed = arr[-need_len:, :]
+        mask = np.ones((need_len, N), dtype=np.float32)
+        return trimmed, mask
     pad = np.zeros((need_len - T, N), dtype=arr.dtype)
-    return np.concatenate([pad, arr], axis=0)
+    mask = np.zeros((need_len, N), dtype=np.float32)
+    mask[-T:, :] = 1.0
+    return np.concatenate([pad, arr], axis=0), mask
 
 
 def forecast_direct_batch(
-    model: TimesNet, last_seq: torch.Tensor
+    model: TimesNet,
+    last_seq: torch.Tensor,
+    history_mask: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    return model(last_seq)
+    return model(last_seq, mask=history_mask)
 
 
 def forecast_recursive_batch(
-    model: TimesNet, last_seq: torch.Tensor, H: int
+    model: TimesNet,
+    last_seq: torch.Tensor,
+    history_mask: torch.Tensor | None,
+    H: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     mus: List[torch.Tensor] = []
     sigmas: List[torch.Tensor] = []
     seq = last_seq
+    mask = history_mask
     for _ in range(H):
-        mu_step, sigma_step = model(seq)
+        mu_step, sigma_step = model(seq, mask=mask)
         mus.append(mu_step)
         sigmas.append(sigma_step)
         seq = torch.cat([seq[:, 1:, :], mu_step], dim=1)
+        if mask is not None:
+            next_mask = mask.new_ones(mask.size(0), 1, mask.size(2))
+            mask = torch.cat([mask[:, 1:, :], next_mask], dim=1)
     return torch.cat(mus, dim=1), torch.cat(sigmas, dim=1)
 
 
@@ -194,8 +207,9 @@ def predict_once(cfg: Dict) -> str:
         # take last pmax (model focuses internally on input_len) with left zero padding if needed
         P = int(cfg_used["model"]["pmax"])
         H = int(cfg_used["model"]["pred_len"])
-        last_seq = _pad_left_zeros(Xn, need_len=P)  # [P, N]
+        last_seq, hist_mask_np = _pad_left_zeros(Xn, need_len=P)  # [P, N]
         xb = torch.from_numpy(last_seq).unsqueeze(0)
+        hist_mask = torch.from_numpy(hist_mask_np).unsqueeze(0)
         if cfg_used["train"]["channels_last"]:
             xb = xb.unsqueeze(-1).to(
                 device=device,
@@ -204,12 +218,13 @@ def predict_once(cfg: Dict) -> str:
             ).squeeze(-1)
         else:
             xb = xb.to(device, non_blocking=True)
+        hist_mask = hist_mask.to(device, non_blocking=True)
 
         with torch.inference_mode(), amp_autocast(cfg_used["train"]["amp"] and device.type == "cuda"):
             if cfg_used["model"]["mode"] == "direct":
-                mu_pred, _ = forecast_direct_batch(model, xb)
+                mu_pred, _ = forecast_direct_batch(model, xb, hist_mask)
             else:
-                mu_pred, _ = forecast_recursive_batch(model, xb, H)
+                mu_pred, _ = forecast_recursive_batch(model, xb, hist_mask, H)
 
         Pn = mu_pred.squeeze(0).float().cpu().numpy()  # [H, N]
         # inverse transform & clip

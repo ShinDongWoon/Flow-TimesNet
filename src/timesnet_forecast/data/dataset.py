@@ -64,7 +64,7 @@ class SlidingWindowDataset(Dataset):
     def __len__(self) -> int:
         return int(len(self.idxs))
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         s = int(self.idxs[idx])
         if self.time_shift > 0:
             delta = np.random.randint(-self.time_shift, self.time_shift + 1)
@@ -72,6 +72,7 @@ class SlidingWindowDataset(Dataset):
         e = s + self.L
         start = int(max(0, e - self.P))
         x = self.X[start:e, :]  # [<=P, N]
+        x_mask = self.M[start:e, :]
         y = self.X[e : e + self.H, :]  # [H, N] or [1, N]
         mask = self.M[e : e + self.H, :]
         if self.add_noise_std > 0:
@@ -79,8 +80,22 @@ class SlidingWindowDataset(Dataset):
         if x.shape[0] < self.P:
             pad_len = self.P - x.shape[0]
             pad = np.zeros((pad_len, self.N), dtype=np.float32)
+            x_mask_pad = np.zeros((pad_len, self.N), dtype=np.float32)
             x = np.concatenate([pad, x.astype(np.float32, copy=False)], axis=0)
+            x_mask = np.concatenate(
+                [x_mask_pad, x_mask.astype(np.float32, copy=False)], axis=0
+            )
+        else:
+            x_mask = x_mask.astype(np.float32, copy=False)
         x = x.astype(np.float32, copy=False)
         y = y.astype(np.float32, copy=False)
         mask = mask.astype(np.float32, copy=False)
-        return torch.from_numpy(x), torch.from_numpy(y), torch.from_numpy(mask)
+        x_mask = x_mask.astype(np.float32, copy=False)
+        if x_mask.shape[0] < self.P:
+            raise RuntimeError("history mask length mismatch after padding")
+        return (
+            torch.from_numpy(x),
+            torch.from_numpy(y),
+            torch.from_numpy(mask),
+            torch.from_numpy(x_mask),
+        )

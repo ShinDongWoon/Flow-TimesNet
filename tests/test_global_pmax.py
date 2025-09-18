@@ -219,7 +219,7 @@ def test_short_periods_clamped_to_input_len(tmp_path):
         pmax_global=int(cfg["model"]["pmax"]),
     )
 
-    xb, _, _ = next(iter(dl))
+    xb, _, _, _ = next(iter(dl))
     assert xb.shape[1] == input_len
     assert xb.shape[1] == int(cfg["model"]["pmax"])
 
