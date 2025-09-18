@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import math
 from typing import List, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from torch.nn import init
 
 
 class PeriodicityTransform(nn.Module):
@@ -243,7 +245,9 @@ class TimesNet(nn.Module):
         self.head = nn.Linear(self.d_model, out_steps * 2).to(device=x.device, dtype=x.dtype)
         self._lazy_built = True
 
-    def _resize_frontend(self, new_in_channels: int, device: torch.device, dtype: torch.dtype) -> None:
+    def _resize_frontend(
+        self, new_in_channels: int, device: torch.device, dtype: torch.dtype
+    ) -> None:
         """Expand the input projection if additional cycles appear.
 
         Args:
@@ -251,29 +255,22 @@ class TimesNet(nn.Module):
             device: target device for the resized layer
             dtype: target dtype for the resized layer
         """
-        if new_in_channels == self.k:
+        if new_in_channels <= self.k:
             return
-        if self.channels_last:
-            old = self.blocks[0]
-            conv = nn.Conv2d(new_in_channels, self.d_model, kernel_size=(1, 1)).to(
-                device=device, dtype=dtype
-            )
-            with torch.no_grad():
-                copy = min(old.weight.size(1), conv.weight.size(1))
-                conv.weight[:, :copy].copy_(old.weight[:, :copy])
-                if old.bias is not None and conv.bias is not None:
-                    conv.bias.copy_(old.bias)
-        else:
-            old = self.blocks[0]
-            conv = nn.Conv1d(new_in_channels, self.d_model, kernel_size=1).to(
-                device=device, dtype=dtype
-            )
-            with torch.no_grad():
-                copy = min(old.weight.size(1), conv.weight.size(1))
-                conv.weight[:, :copy].copy_(old.weight[:, :copy])
-                if old.bias is not None and conv.bias is not None:
-                    conv.bias.copy_(old.bias)
-        self.blocks[0] = conv
+        conv = self.blocks[0]
+        old_weight = conv.weight.data
+        old_in = old_weight.size(1)
+        if new_in_channels <= old_in:
+            self.k = new_in_channels
+            return
+        new_shape = (old_weight.size(0), new_in_channels, *old_weight.shape[2:])
+        with torch.no_grad():
+            new_weight = torch.zeros(new_shape, device=device, dtype=dtype)
+            new_weight[:, :old_in, ...] = old_weight
+            if new_in_channels > old_in:
+                init.kaiming_uniform_(new_weight[:, old_in:, ...], a=math.sqrt(5))
+            conv.weight.data = new_weight
+        conv.in_channels = new_in_channels
         self.k = new_in_channels
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
