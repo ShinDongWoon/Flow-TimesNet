@@ -1,5 +1,5 @@
-import sys
 from pathlib import Path
+import sys
 
 import numpy as np
 import pytest
@@ -22,20 +22,28 @@ def test_sliding_window_left_pads_to_pmax():
         pmax_global=5,
     )
 
-    x0, y0, m0 = ds[0]
+    x0, y0, m0, hist0 = ds[0]
     assert x0.shape == (5, 1)
     assert y0.shape == (1, 1)
     np.testing.assert_allclose(x0.squeeze(-1).numpy(), np.array([0.0, 0.0, 1.0, 2.0, 3.0], dtype=np.float32))
     np.testing.assert_allclose(y0.squeeze(-1).numpy(), np.array([4.0], dtype=np.float32))
     np.testing.assert_allclose(m0.squeeze(-1).numpy(), np.array([1.0], dtype=np.float32))
+    np.testing.assert_allclose(
+        hist0.squeeze(-1).numpy(),
+        np.array([0.0, 0.0, 1.0, 1.0, 1.0], dtype=np.float32),
+    )
 
-    x_last, _, m_last = ds[len(ds) - 1]
+    x_last, _, m_last, hist_last = ds[len(ds) - 1]
     assert x_last.shape == (5, 1)
     np.testing.assert_allclose(
         x_last.squeeze(-1).numpy(),
         np.array([2.0, 3.0, 4.0, 5.0, 6.0], dtype=np.float32),
     )
     np.testing.assert_allclose(m_last.squeeze(-1).numpy(), np.array([1.0], dtype=np.float32))
+    np.testing.assert_allclose(
+        hist_last.squeeze(-1).numpy(),
+        np.ones(5, dtype=np.float32),
+    )
 
 
 def test_sliding_window_requires_pmax_at_least_input_len():

@@ -346,20 +346,23 @@ def _eval_wsmape(
     ys: List[np.ndarray] = []
     ps: List[np.ndarray] = []
     with torch.inference_mode(), amp_autocast(True if device.type == "cuda" else False):
-        for xb, yb, mask in loader:
+        for xb, yb, target_mask, hist_mask in loader:
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
-            loss_mask = move_to_device(mask, device) if use_loss_mask else None
+            hist_mask = move_to_device(hist_mask, device)
+            loss_mask = (
+                move_to_device(target_mask, device) if use_loss_mask else None
+            )
             if loss_mask is not None:
                 loss_mask = loss_mask.to(yb.dtype)
             if channels_last and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
             _assert_min_len(xb, model.period.pmax)
             if mode == "direct":
-                mu, _ = model(xb)
+                mu, _ = model(xb, mask=hist_mask)
             else:
                 # recursive multi-step forecast during validation
-                mu, _ = forecast_recursive_batch(model, xb, pred_len)
+                mu, _ = forecast_recursive_batch(model, xb, hist_mask, pred_len)
                 mu = mu[:, : yb.shape[1], :]
             if loss_mask is not None:
                 yb_eval = yb * loss_mask
@@ -391,19 +394,22 @@ def _eval_metrics(
     nll_num = 0.0
     nll_den = 0.0
     with torch.inference_mode(), amp_autocast(True if device.type == "cuda" else False):
-        for xb, yb, mask in loader:
+        for xb, yb, target_mask, hist_mask in loader:
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
-            loss_mask = move_to_device(mask, device) if use_loss_mask else None
+            hist_mask = move_to_device(hist_mask, device)
+            loss_mask = (
+                move_to_device(target_mask, device) if use_loss_mask else None
+            )
             if loss_mask is not None:
                 loss_mask = loss_mask.to(yb.dtype)
             if channels_last and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
             _assert_min_len(xb, model.period.pmax)
             if mode == "direct":
-                mu, sigma = model(xb)
+                mu, sigma = model(xb, mask=hist_mask)
             else:
-                mu, sigma = forecast_recursive_batch(model, xb, pred_len)
+                mu, sigma = forecast_recursive_batch(model, xb, hist_mask, pred_len)
                 mu = mu[:, : yb.shape[1], :]
                 sigma = sigma[:, : yb.shape[1], :]
             if loss_mask is not None:
@@ -687,11 +693,12 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         train_iter = iter(dl_train)
         for w in range(warmup_iters):
             try:
-                xb_w, yb_w, mb_w = next(train_iter)
+                xb_w, yb_w, mb_w, hb_w = next(train_iter)
             except StopIteration:
                 break
             xb_w = xb_w.to(device, non_blocking=True)
             yb_w = yb_w.to(device, non_blocking=True)
+            hb_w = hb_w.to(device, non_blocking=True)
             if use_loss_masking:
                 mb_w = mb_w.to(device, non_blocking=True).to(yb_w.dtype)
             else:
@@ -700,7 +707,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 xb_w = xb_w.to(memory_format=torch.channels_last)
             _assert_min_len(xb_w, model.period.pmax)
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
-                mu_w, sigma_w = model(xb_w)
+                mu_w, sigma_w = model(xb_w, mask=hb_w)
                 loss_tensor = gaussian_nll_loss(mu_w, sigma_w, yb_w, min_sigma=min_sigma)
                 loss_w = _masked_mean(loss_tensor, mb_w) / accum_steps
             grad_scaler.scale(loss_w).backward()
@@ -712,9 +719,10 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 grad_scaler.update()
                 optim.zero_grad(set_to_none=True)
 
-        xb0, yb0, mb0 = next(train_iter)
+        xb0, yb0, mb0, hb0 = next(train_iter)
         xb0 = xb0.to(device, non_blocking=True)
         yb0 = yb0.to(device, non_blocking=True)
+        hb0 = hb0.to(device, non_blocking=True)
         if use_loss_masking:
             mb0 = mb0.to(device, non_blocking=True).to(yb0.dtype)
         else:
@@ -724,9 +732,11 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         static_x = torch.empty_like(xb0)
         static_y = torch.empty_like(yb0)
         static_m = torch.empty_like(mb0)
+        static_hist = torch.empty_like(hb0)
         static_x.copy_(xb0)
         static_y.copy_(yb0)
         static_m.copy_(mb0)
+        static_hist.copy_(hb0)
         capture_stream = torch.cuda.Stream()
         graph = torch.cuda.CUDAGraph()
         optim.zero_grad(set_to_none=True)
@@ -735,7 +745,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             graph.capture_begin()
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                 _assert_min_len(static_x, model.period.pmax)
-                static_mu, static_sigma = model(static_x)
+                static_mu, static_sigma = model(static_x, mask=static_hist)
                 static_loss_tensor = gaussian_nll_loss(
                     static_mu, static_sigma, static_y, min_sigma=min_sigma
                 )
@@ -747,10 +757,13 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         model.train()
         optim.zero_grad(set_to_none=True)
 
-        def graph_step(xb: torch.Tensor, yb: torch.Tensor, mb: torch.Tensor) -> float:
+        def graph_step(
+            xb: torch.Tensor, yb: torch.Tensor, mb: torch.Tensor, hb: torch.Tensor
+        ) -> float:
             static_x.copy_(xb)
             static_y.copy_(yb)
             static_m.copy_(mb)
+            static_hist.copy_(hb)
             graph.replay()
             return float(static_loss.item())
 
@@ -760,9 +773,12 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         losses: List[float] = []
         optim.zero_grad(set_to_none=True)
         num_batches = len(dl_train)
-        for i, (xb, yb, mb) in enumerate(tqdm(dl_train, desc=f"Epoch {ep}/{epochs}", leave=False)):
+        for i, (xb, yb, mb, hb) in enumerate(
+            tqdm(dl_train, desc=f"Epoch {ep}/{epochs}", leave=False)
+        ):
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
+            hb = hb.to(device, non_blocking=True)
             if use_loss_masking:
                 mb = mb.to(device, non_blocking=True).to(yb.dtype)
             else:
@@ -771,10 +787,10 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 xb = xb.to(memory_format=torch.channels_last)
             _assert_min_len(xb, model.period.pmax)
             if use_graphs:
-                loss_val = graph_step(xb, yb, mb)
+                loss_val = graph_step(xb, yb, mb, hb)
             else:
                 with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
-                    mu, sigma = model(xb)
+                    mu, sigma = model(xb, mask=hb)
                     loss_tensor = gaussian_nll_loss(mu, sigma, yb, min_sigma=min_sigma)
                     masked_loss = _masked_mean(loss_tensor, mb)
                     loss = masked_loss / accum_steps

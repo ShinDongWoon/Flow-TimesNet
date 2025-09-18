@@ -91,6 +91,26 @@ def test_periodicity_transform_matches_naive():
     assert torch.allclose(mask_vec, mask_ref, atol=1e-6)
 
 
+def test_periodicity_transform_respects_history_mask():
+    period = 4
+    valid_len = 16
+    total_len = 32
+    t_valid = torch.arange(valid_len, dtype=torch.float32)
+    signal = torch.sin(2 * math.pi * t_valid / period)
+    trimmed = signal.view(1, valid_len, 1)
+    padded_prefix = torch.zeros((1, total_len - valid_len, 1), dtype=torch.float32)
+    padded = torch.cat([padded_prefix, trimmed], dim=1)
+    hist_mask = torch.zeros_like(padded)
+    hist_mask[:, -valid_len:, :] = 1.0
+
+    transform = PeriodicityTransform(k_periods=1, pmax=total_len)
+    folded_masked, mask_masked = transform(padded, mask=hist_mask)
+    folded_trim, mask_trim = transform(trimmed)
+
+    assert torch.allclose(folded_masked, folded_trim, atol=1e-6)
+    assert torch.allclose(mask_masked, mask_trim, atol=1e-6)
+
+
 def test_periodicity_transform_min_period_threshold_expands_period():
     class FixedFreqTransform(PeriodicityTransform):
         def _topk_freq(self, x: torch.Tensor, k: int) -> torch.Tensor:  # type: ignore[override]

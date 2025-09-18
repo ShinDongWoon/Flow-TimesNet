@@ -91,7 +91,9 @@ def test_eval_metrics_returns_masked_nll():
             self.register_buffer("sigma_buf", sigma)
             self.period = SimpleNamespace(pmax=1)
 
-        def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        def forward(
+            self, x: torch.Tensor, mask: torch.Tensor | None = None
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             batch = x.shape[0]
             mu = self.mu_buf.expand(batch, -1, -1)
             sigma = self.sigma_buf.expand(batch, -1, -1)
@@ -99,7 +101,8 @@ def test_eval_metrics_returns_masked_nll():
 
     model = DummyModel(mu, sigma)
     xb = torch.zeros((1, 3, 2), dtype=torch.float32)
-    loader = [(xb, target, mask)]
+    hist_mask = torch.ones_like(xb)
+    loader = [(xb, target, mask, hist_mask)]
     metrics = _eval_metrics(
         model,
         loader,
