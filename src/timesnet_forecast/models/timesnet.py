@@ -750,7 +750,11 @@ class TimesNet(nn.Module):
                 (BN,), input_window, dtype=torch.long, device=x.device
             )
 
-        if input_window != self.input_len:
+        needs_pooling = input_window != self.input_len
+        if not needs_pooling:
+            needs_pooling = bool(torch.any(valid_lengths < input_window).item())
+
+        if needs_pooling:
             features, pooled_mask = _adaptive_pool_valid_lengths(
                 features=features,
                 mask=step_mask,

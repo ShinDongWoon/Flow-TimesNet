@@ -131,6 +131,48 @@ def test_timesnet_respects_history_mask():
     assert torch.allclose(sigma_mask, sigma_trim, atol=1e-5)
 
 
+def test_timesnet_pools_when_mask_shortens_valid_history(monkeypatch):
+    import timesnet_forecast.models.timesnet as timesnet_mod
+
+    B, L, H, N = 1, 12, 2, 2
+    valid = 3
+    torch.manual_seed(2)
+    model = TimesNet(
+        input_len=L,
+        pred_len=H,
+        d_model=8,
+        n_layers=1,
+        k_periods=2,
+        pmax=L,
+        kernel_set=[3],
+        dropout=0.0,
+        activation="gelu",
+        mode="direct",
+    )
+    with torch.no_grad():
+        model(torch.randn(1, L, N))
+
+    padded = torch.randn(B, L, N)
+    mask = torch.zeros_like(padded)
+    mask[:, -valid:, :] = 1.0
+
+    calls = {}
+    original_pool = timesnet_mod._adaptive_pool_valid_lengths
+
+    def capture_pooling(**kwargs):
+        calls["valid_lengths"] = kwargs["valid_lengths"].clone()
+        calls["target_len"] = kwargs["target_len"]
+        return original_pool(**kwargs)
+    monkeypatch.setattr(timesnet_mod, "_adaptive_pool_valid_lengths", capture_pooling)
+
+    model.eval()
+    model(padded, mask=mask)
+
+    assert calls, "Expected adaptive pooling to run when mask shortens history"
+    assert calls["target_len"] == model.input_len
+    assert torch.all(calls["valid_lengths"] == valid)
+
+
 def test_pool_trailing_sums_matches_adaptive_pool():
     torch.manual_seed(123)
     B, C, T = 4, 3, 19
