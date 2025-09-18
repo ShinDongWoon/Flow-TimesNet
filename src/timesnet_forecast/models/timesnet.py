@@ -284,18 +284,22 @@ class TimesNet(nn.Module):
         """
         B, T, N = x.shape
         z_all, mask_all = self.period(x)
-        if z_all.size(2) == 0:
+        BN = B * N
+        KC = z_all.size(2)
+        z = z_all.reshape(BN, KC, z_all.size(-1))
+        mask = mask_all.reshape(BN, KC, mask_all.size(-1))
+        pooled_mask = F.adaptive_avg_pool1d(mask, self.input_len)
+        z = F.adaptive_avg_pool1d(z, self.input_len)
+        eps = torch.finfo(z.dtype).eps
+        z = z / (pooled_mask + eps)
+        mask = (pooled_mask > 0).to(z.dtype)
+        KC = z.size(1)
+        steps = z.size(-1)
+        if KC == 0:
             out_steps = self._out_steps
             mu = x.new_zeros(B, out_steps, N)
             sigma = x.new_full((B, out_steps, N), self.min_sigma)
             return mu, sigma
-
-        steps = min(self.input_len, z_all.size(-1))
-        z = z_all[..., :steps]
-        mask = mask_all[..., :steps]
-        KC = z.size(2)
-        z = z.reshape(B * N, KC, steps)
-        mask = mask.reshape(B * N, KC, steps)
         if not self._lazy_built:
             self.k = KC
             self._build_lazy(x=z)
