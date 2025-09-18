@@ -616,7 +616,10 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
 
     # Lazily build model parameters so that downstream utilities see them
     with torch.no_grad():
-        dummy = torch.zeros(1, input_len, len(ids), device=device)
+        warmup_len = int(cfg["model"]["pmax"])
+        dummy = torch.zeros(1, warmup_len, len(ids), device=device)
+        if cfg["train"]["channels_last"]:
+            dummy = dummy.unsqueeze(-1).to(memory_format=torch.channels_last).squeeze(-1)
         model(dummy)
         if cfg["train"]["channels_last"]:
             model.to(memory_format=torch.channels_last)
