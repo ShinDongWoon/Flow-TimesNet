@@ -116,9 +116,10 @@ def predict_once(cfg: Dict) -> str:
     ).to(device)
     # Lazily construct layers by mirroring the training warm-up.
     with torch.no_grad():
+        warmup_len = int(cfg_used["model"]["pmax"])
         dummy = torch.zeros(
             1,
-            int(cfg_used["model"]["input_len"]),
+            warmup_len,
             len(ids),
             device=device,
         )
