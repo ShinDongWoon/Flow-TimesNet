@@ -239,10 +239,11 @@ class TimesNet(nn.Module):
             )
         self.blocks = nn.ModuleList(blocks)
         # Pool only over the temporal dimension; series dimension is preserved.
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        out_steps = self._out_steps
-        # Linear head operates independently for each series on the feature dimension.
-        self.head = nn.Linear(self.d_model, out_steps * 2).to(device=x.device, dtype=x.dtype)
+        self.pool = nn.AdaptiveAvgPool1d(self._out_steps)
+        # Lightweight 1x1 conv head emits (mu, log_sigma) per horizon step.
+        self.head = nn.Conv1d(self.d_model, 2, kernel_size=1).to(
+            device=x.device, dtype=x.dtype
+        )
         self._lazy_built = True
 
     def _resize_frontend(
@@ -319,11 +320,12 @@ class TimesNet(nn.Module):
             z = z.squeeze(-1)
             step_mask = step_mask.squeeze(-1)
         z = z * step_mask
-        z = self.pool(z).squeeze(-1)
-        z = z.view(B, N, self.d_model)
+        z = self.pool(z)
         y_all = self.head(z)
         out_steps = self._out_steps
-        params = y_all.view(B, N, out_steps, 2)
+        params = (
+            y_all.reshape(B, N, 2, out_steps).permute(0, 1, 3, 2).contiguous()
+        )
         mu = params[..., 0].permute(0, 2, 1).contiguous()
         log_sigma = params[..., 1]
         sigma = F.softplus(log_sigma).permute(0, 2, 1).contiguous() + self.min_sigma
