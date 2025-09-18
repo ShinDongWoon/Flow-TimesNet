@@ -35,6 +35,23 @@ def test_gaussian_nll_respects_min_sigma():
     assert torch.allclose(loss_clamped, loss_reference)
 
 
+def test_gaussian_nll_tensor_min_sigma_clamps_each_series():
+    mu = torch.zeros((1, 1, 3), dtype=torch.float32)
+    sigma = torch.full((1, 1, 3), 1e-4, dtype=torch.float32)
+    target = torch.zeros((1, 1, 3), dtype=torch.float32)
+
+    min_sigma = torch.tensor([[[1.0, 0.5, 2.5]]], dtype=torch.float32)
+    loss_tensor = gaussian_nll_loss(mu, sigma, target, min_sigma=min_sigma)
+
+    clamped = min_sigma
+    manual = 0.5 * (
+        ((target - mu) / clamped) ** 2
+        + 2.0 * torch.log(clamped)
+        + math.log(2.0 * math.pi)
+    )
+    assert torch.allclose(loss_tensor, manual)
+
+
 def test_gaussian_nll_autocast_stability():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":

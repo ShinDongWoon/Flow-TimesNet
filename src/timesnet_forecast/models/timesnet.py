@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import List, Tuple
+from typing import List, Tuple, Sequence
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -183,6 +183,7 @@ class TimesNet(nn.Module):
         channels_last: bool = False,
         use_checkpoint: bool = True,
         min_sigma: float = 1e-3,
+        min_sigma_vector: torch.Tensor | Sequence[float] | None = None,
     ) -> None:
         super().__init__()
         assert mode in ("direct", "recursive")
@@ -210,6 +211,10 @@ class TimesNet(nn.Module):
         self.channels_last = bool(channels_last)
         self.use_checkpoint = bool(use_checkpoint)
         self.min_sigma = float(min_sigma)
+        self.register_buffer("min_sigma_vector", None)
+        if min_sigma_vector is not None:
+            min_sigma_tensor = torch.as_tensor(min_sigma_vector, dtype=torch.float32)
+            self.min_sigma_vector = min_sigma_tensor.reshape(1, 1, -1)
 
     def _build_lazy(self, x: torch.Tensor) -> None:
         """Instantiate convolutional blocks on first use.
@@ -283,6 +288,13 @@ class TimesNet(nn.Module):
             recursive: [B, 1, N]
         """
         B, T, N = x.shape
+        sigma_floor = None
+        if isinstance(self.min_sigma_vector, torch.Tensor) and self.min_sigma_vector.numel() > 0:
+            if self.min_sigma_vector.shape[-1] != N:
+                raise ValueError(
+                    "min_sigma_vector length does not match number of series"
+                )
+            sigma_floor = self.min_sigma_vector
         z_all, mask_all = self.period(x)
         BN = B * N
         KC = z_all.size(2)
@@ -298,7 +310,10 @@ class TimesNet(nn.Module):
         if KC == 0:
             out_steps = self._out_steps
             mu = x.new_zeros(B, out_steps, N)
-            sigma = x.new_full((B, out_steps, N), self.min_sigma)
+            if sigma_floor is not None:
+                sigma = sigma_floor.to(dtype=x.dtype, device=x.device).expand(B, out_steps, -1).clone()
+            else:
+                sigma = x.new_full((B, out_steps, N), self.min_sigma)
             return mu, sigma
         if not self._lazy_built:
             self.k = KC
@@ -332,5 +347,9 @@ class TimesNet(nn.Module):
         )
         mu = params[..., 0].permute(0, 2, 1).contiguous()
         log_sigma = params[..., 1]
-        sigma = F.softplus(log_sigma).permute(0, 2, 1).contiguous() + self.min_sigma
+        sigma = F.softplus(log_sigma).permute(0, 2, 1).contiguous()
+        if sigma_floor is not None:
+            sigma = sigma + sigma_floor.to(dtype=sigma.dtype, device=sigma.device)
+        else:
+            sigma = sigma + self.min_sigma
         return mu, sigma
