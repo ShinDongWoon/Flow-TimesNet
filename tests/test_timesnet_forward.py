@@ -1,3 +1,4 @@
+import math
 import sys
 from pathlib import Path
 
@@ -232,6 +233,122 @@ def test_period_group_chunk_helper_caps_size(monkeypatch):
     finally:
         model.period_group_max_chunk_bytes = max_bytes_backup
         model.period_group_chunk = chunk_backup
+
+
+def test_period_group_chunk_helper_stable_without_explicit_budget():
+    torch.manual_seed(0)
+    B, L, H, N = 1, 64, 4, 1
+    model = TimesNet(
+        input_len=L,
+        pred_len=H,
+        d_model=16,
+        n_layers=2,
+        k_periods=1,
+        pmax=L,
+        kernel_set=[3, 5],
+        dropout=0.0,
+        activation="gelu",
+        mode="direct",
+        use_checkpoint=False,
+    )
+    model.eval()
+
+    tile_count = 256
+    cycles = 32
+    period = 32
+    dtype = torch.float32
+    values = torch.randn(tile_count, cycles, period, dtype=dtype)
+    batch_indices = torch.zeros(tile_count, dtype=torch.long)
+    freq_indices = torch.zeros(tile_count, dtype=torch.long)
+    fake_group = PeriodGroup(
+        values=values,
+        batch_indices=batch_indices,
+        frequency_indices=freq_indices,
+        cycles=cycles,
+        period=period,
+    )
+
+    element_size = torch.tensor(0, dtype=dtype).element_size()
+    base_elements = float(model.d_model) * float(cycles) * float(period)
+    kernel_paths = max(len(model.kernel_set), 1)
+    block_multiplier = max(model.n_layers, 1) * kernel_paths
+    estimated_elements = base_elements * (1.0 + float(block_multiplier))
+    bytes_per_tile = int(
+        max(math.ceil(estimated_elements * element_size * 4.0), 1)
+    )
+    model.period_group_max_chunk_bytes = bytes_per_tile * 4
+
+    first_chunk = model._resolve_period_group_chunk(fake_group, dtype=dtype)
+    assert first_chunk > 0
+    processed_steps = [0, first_chunk, first_chunk * 2]
+    chunk_sizes = [
+        model._resolve_period_group_chunk(
+            fake_group, dtype=dtype, processed_tiles=processed
+        )
+        for processed in processed_steps
+    ]
+
+    assert all(size == first_chunk for size in chunk_sizes)
+
+
+def test_period_group_chunk_helper_shrinks_with_explicit_budget():
+    torch.manual_seed(0)
+    B, L, H, N = 1, 64, 4, 1
+    model = TimesNet(
+        input_len=L,
+        pred_len=H,
+        d_model=16,
+        n_layers=2,
+        k_periods=1,
+        pmax=L,
+        kernel_set=[3, 5],
+        dropout=0.0,
+        activation="gelu",
+        mode="direct",
+        use_checkpoint=False,
+    )
+    model.eval()
+
+    tile_count = 256
+    cycles = 32
+    period = 32
+    dtype = torch.float32
+    values = torch.randn(tile_count, cycles, period, dtype=dtype)
+    batch_indices = torch.zeros(tile_count, dtype=torch.long)
+    freq_indices = torch.zeros(tile_count, dtype=torch.long)
+    fake_group = PeriodGroup(
+        values=values,
+        batch_indices=batch_indices,
+        frequency_indices=freq_indices,
+        cycles=cycles,
+        period=period,
+    )
+
+    element_size = torch.tensor(0, dtype=dtype).element_size()
+    base_elements = float(model.d_model) * float(cycles) * float(period)
+    kernel_paths = max(len(model.kernel_set), 1)
+    block_multiplier = max(model.n_layers, 1) * kernel_paths
+    estimated_elements = base_elements * (1.0 + float(block_multiplier))
+    bytes_per_tile = int(
+        max(math.ceil(estimated_elements * element_size * 4.0), 1)
+    )
+    budget_bytes = bytes_per_tile * 12
+
+    first_chunk = model._resolve_period_group_chunk(
+        fake_group, dtype=dtype, budget_bytes=budget_bytes
+    )
+    assert first_chunk > 1
+    processed = first_chunk
+    assert processed < tile_count
+
+    second_chunk = model._resolve_period_group_chunk(
+        fake_group,
+        dtype=dtype,
+        processed_tiles=processed,
+        budget_bytes=budget_bytes,
+    )
+    assert second_chunk >= 1
+    assert second_chunk < first_chunk
 
 
 def test_adaptive_pool_matches_reference_for_variable_lengths():

@@ -423,14 +423,28 @@ class TimesNet(nn.Module):
         self.period_group_max_chunk_bytes: Optional[int] = max_bytes_override
 
     def _resolve_period_group_chunk(
-        self, group: PeriodGroup, dtype: torch.dtype | None
+        self,
+        group: PeriodGroup,
+        dtype: torch.dtype | None,
+        *,
+        processed_tiles: int = 0,
+        budget_bytes: int | None = None,
     ) -> int:
         total_tiles = int(group.values.size(0))
         if total_tiles <= 0:
             return 0
 
+        try:
+            processed_tiles = int(processed_tiles)
+        except (TypeError, ValueError, OverflowError):
+            processed_tiles = 0
+        processed_tiles = max(processed_tiles, 0)
+        remaining_tiles = max(total_tiles - processed_tiles, 0)
+        if remaining_tiles <= 0:
+            return 0
+
         if self.period_group_chunk is not None:
-            chunk = max(1, min(total_tiles, int(self.period_group_chunk)))
+            chunk = max(1, min(remaining_tiles, int(self.period_group_chunk)))
             return chunk
 
         dtype_obj = dtype or group.values.dtype
@@ -450,36 +464,63 @@ class TimesNet(nn.Module):
         bytes_per_tile = int(
             max(math.ceil(estimated_elements * element_size * safety_factor), 1)
         )
+        if bytes_per_tile <= 0:
+            return max(remaining_tiles, 1)
+
+        explicit_budget = budget_bytes is not None
+        if explicit_budget:
+            try:
+                budget_value = int(budget_bytes)  # type: ignore[arg-type]
+            except (TypeError, ValueError, OverflowError):
+                budget_value = None
+                explicit_budget = False
+            else:
+                budget_value = max(budget_value, 0)
+        else:
+            budget_value = None
 
         ratio = self.period_group_memory_ratio
         if ratio is None or not math.isfinite(ratio) or ratio <= 0.0:
             ratio = 0.5
         ratio = min(max(ratio, 1e-4), 1.0)
 
-        budget_bytes: int | None = None
-        if group.values.is_cuda and torch.cuda.is_available():
-            try:
-                free_bytes, _ = torch.cuda.mem_get_info(group.values.device)
-            except Exception:
-                free_bytes = None
-            if free_bytes is not None:
-                budget_bytes = int(max(free_bytes * ratio, 0))
+        if budget_value is None:
+            budget_value = None
+            if group.values.is_cuda and torch.cuda.is_available():
+                try:
+                    free_bytes, _ = torch.cuda.mem_get_info(group.values.device)
+                except Exception:
+                    free_bytes = None
+                else:
+                    if free_bytes is not None:
+                        budget_value = int(max(free_bytes * ratio, 0))
 
-        if budget_bytes is None or budget_bytes <= 0:
-            default_cpu_budget = 256 * 1024 * 1024  # 256 MiB
-            budget_bytes = int(default_cpu_budget * ratio)
+            if budget_value is None or budget_value <= 0:
+                default_cpu_budget = 256 * 1024 * 1024  # 256 MiB
+                budget_value = int(default_cpu_budget * ratio)
+
+        if explicit_budget:
+            spent_bytes = processed_tiles * bytes_per_tile
+            budget_value = max(budget_value - spent_bytes, 0)
 
         max_bytes = self.period_group_max_chunk_bytes
+        per_chunk_cap = budget_value
         if max_bytes is not None:
-            budget_bytes = max(1, min(budget_bytes, max_bytes))
+            per_chunk_cap = max(0, min(per_chunk_cap, max_bytes))
 
-        if bytes_per_tile <= 0:
-            return max(total_tiles, 1)
+        if per_chunk_cap <= 0:
+            chunk = 1
+            return max(1, min(remaining_tiles, chunk))
 
-        chunk = budget_bytes // bytes_per_tile
+        if per_chunk_cap > bytes_per_tile:
+            headroom = bytes_per_tile
+            per_chunk_cap = max(per_chunk_cap - headroom, bytes_per_tile)
+
+        chunk = per_chunk_cap // bytes_per_tile
         if chunk <= 0:
             chunk = 1
-        return max(1, min(total_tiles, chunk))
+
+        return max(1, min(remaining_tiles, chunk))
 
     # ------------------------------------------------------------------
     # Backwards compatibility hooks
@@ -556,7 +597,7 @@ class TimesNet(nn.Module):
         features = x.new_zeros(BN, self.d_model, T)
         coverage = x.new_zeros(BN, 1, T)
         for group in groups:
-            total_tiles = group.values.size(0)
+            total_tiles = int(group.values.size(0))
             if total_tiles == 0:
                 continue
             chunk_dtype = (
@@ -564,13 +605,18 @@ class TimesNet(nn.Module):
                 if isinstance(group.values, torch.Tensor)
                 else x.dtype
             )
-            chunk_size = self._resolve_period_group_chunk(
-                group=group, dtype=chunk_dtype
-            )
-            if chunk_size <= 0:
-                chunk_size = int(total_tiles)
-            chunk_size = max(1, min(int(chunk_size), int(total_tiles)))
-            for start_idx in range(0, total_tiles, chunk_size):
+            processed_tiles = 0
+            while processed_tiles < total_tiles:
+                chunk_size = self._resolve_period_group_chunk(
+                    group=group,
+                    dtype=chunk_dtype,
+                    processed_tiles=processed_tiles,
+                )
+                remaining_tiles = total_tiles - processed_tiles
+                if chunk_size <= 0:
+                    chunk_size = remaining_tiles
+                chunk_size = max(1, min(int(chunk_size), int(remaining_tiles)))
+                start_idx = processed_tiles
                 end_idx = min(start_idx + chunk_size, total_tiles)
                 values_chunk = group.values[start_idx:end_idx]
                 if values_chunk.numel() == 0:
@@ -616,6 +662,8 @@ class TimesNet(nn.Module):
                         "coverage_update and coverage must reside on the same device"
                     )
                 coverage.index_add_(0, batch_chunk, coverage_update)
+
+                processed_tiles = end_idx
 
         coverage_mask = coverage > 0
         coverage_safe = torch.where(coverage_mask, coverage, torch.ones_like(coverage))
