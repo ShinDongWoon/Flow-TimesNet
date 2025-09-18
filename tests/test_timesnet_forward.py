@@ -126,6 +126,52 @@ def test_timesnet_respects_history_mask():
     assert torch.allclose(sigma_mask, sigma_trim, atol=1e-5)
 
 
+def test_period_group_chunk_preserves_outputs():
+    torch.manual_seed(42)
+    B, L, H, N = 2, 24, 5, 3
+    base = TimesNet(
+        input_len=L,
+        pred_len=H,
+        d_model=16,
+        n_layers=1,
+        k_periods=3,
+        pmax=L,
+        kernel_set=[3, 5],
+        dropout=0.0,
+        activation="gelu",
+        mode="direct",
+        use_checkpoint=False,
+    )
+    chunked = TimesNet(
+        input_len=L,
+        pred_len=H,
+        d_model=16,
+        n_layers=1,
+        k_periods=3,
+        pmax=L,
+        kernel_set=[3, 5],
+        dropout=0.0,
+        activation="gelu",
+        mode="direct",
+        use_checkpoint=False,
+    )
+    with torch.no_grad():
+        base(torch.randn(1, L, N))
+        chunked(torch.randn(1, L, N))
+    chunked.load_state_dict(base.state_dict())
+
+    x = torch.randn(B, L, N)
+    base.eval()
+    chunked.eval()
+    chunked.period_group_chunk = 1
+
+    mu_full, sigma_full = base(x)
+    mu_chunk, sigma_chunk = chunked(x)
+
+    torch.testing.assert_close(mu_chunk, mu_full, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(sigma_chunk, sigma_full, atol=1e-6, rtol=1e-6)
+
+
 def test_adaptive_pool_matches_reference_for_variable_lengths():
     torch.manual_seed(0)
     BN, C, T = 7, 5, 23
