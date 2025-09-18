@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -350,6 +351,9 @@ class TimesNet(nn.Module):
         use_checkpoint: bool = True,
         min_sigma: float = 1e-3,
         min_sigma_vector: torch.Tensor | Sequence[float] | None = None,
+        period_group_chunk: int | None = None,
+        period_group_memory_ratio: float | None = None,
+        period_group_max_chunk_bytes: int | None = None,
     ) -> None:
         super().__init__()
         assert mode in ("direct", "recursive")
@@ -384,7 +388,98 @@ class TimesNet(nn.Module):
             self.min_sigma_vector = min_sigma_tensor.reshape(1, 1, -1)
         # Maximum number of tiles processed from a period group at once. ``None``
         # preserves the historical behaviour of processing the full group.
-        self.period_group_chunk: int | None = None
+        if period_group_chunk is not None:
+            try:
+                chunk_override = int(period_group_chunk)
+            except (TypeError, ValueError, OverflowError):
+                chunk_override = None
+            else:
+                if chunk_override <= 0:
+                    chunk_override = None
+        else:
+            chunk_override = None
+        self.period_group_chunk: Optional[int] = chunk_override
+        if period_group_memory_ratio is not None:
+            try:
+                ratio_override = float(period_group_memory_ratio)
+            except (TypeError, ValueError):
+                ratio_override = None
+            else:
+                if not math.isfinite(ratio_override):
+                    ratio_override = None
+        else:
+            ratio_override = None
+        if period_group_max_chunk_bytes is not None:
+            try:
+                max_bytes_override = int(period_group_max_chunk_bytes)
+            except (TypeError, ValueError, OverflowError):
+                max_bytes_override = None
+            else:
+                if max_bytes_override <= 0:
+                    max_bytes_override = None
+        else:
+            max_bytes_override = None
+        self.period_group_memory_ratio: Optional[float] = ratio_override
+        self.period_group_max_chunk_bytes: Optional[int] = max_bytes_override
+
+    def _resolve_period_group_chunk(
+        self, group: PeriodGroup, dtype: torch.dtype | None
+    ) -> int:
+        total_tiles = int(group.values.size(0))
+        if total_tiles <= 0:
+            return 0
+
+        if self.period_group_chunk is not None:
+            chunk = max(1, min(total_tiles, int(self.period_group_chunk)))
+            return chunk
+
+        dtype_obj = dtype or group.values.dtype
+        try:
+            element_size = torch.tensor(0, dtype=dtype_obj).element_size()
+        except TypeError:
+            element_size = torch.tensor(0, dtype=group.values.dtype).element_size()
+        element_size = max(int(element_size), 1)
+
+        cycles = max(int(group.cycles), 1)
+        period = max(int(group.period), 1)
+        base_elements = float(self.d_model) * float(cycles) * float(period)
+        kernel_paths = max(len(self.kernel_set), 1)
+        block_multiplier = max(self.n_layers, 1) * kernel_paths
+        estimated_elements = base_elements * (1.0 + float(block_multiplier))
+        safety_factor = 4.0
+        bytes_per_tile = int(
+            max(math.ceil(estimated_elements * element_size * safety_factor), 1)
+        )
+
+        ratio = self.period_group_memory_ratio
+        if ratio is None or not math.isfinite(ratio) or ratio <= 0.0:
+            ratio = 0.5
+        ratio = min(max(ratio, 1e-4), 1.0)
+
+        budget_bytes: int | None = None
+        if group.values.is_cuda and torch.cuda.is_available():
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(group.values.device)
+            except Exception:
+                free_bytes = None
+            if free_bytes is not None:
+                budget_bytes = int(max(free_bytes * ratio, 0))
+
+        if budget_bytes is None or budget_bytes <= 0:
+            default_cpu_budget = 256 * 1024 * 1024  # 256 MiB
+            budget_bytes = int(default_cpu_budget * ratio)
+
+        max_bytes = self.period_group_max_chunk_bytes
+        if max_bytes is not None:
+            budget_bytes = max(1, min(budget_bytes, max_bytes))
+
+        if bytes_per_tile <= 0:
+            return max(total_tiles, 1)
+
+        chunk = budget_bytes // bytes_per_tile
+        if chunk <= 0:
+            chunk = 1
+        return max(1, min(total_tiles, chunk))
 
     # ------------------------------------------------------------------
     # Backwards compatibility hooks
@@ -464,17 +559,17 @@ class TimesNet(nn.Module):
             total_tiles = group.values.size(0)
             if total_tiles == 0:
                 continue
-            chunk_limit = self.period_group_chunk
-            if chunk_limit is None or chunk_limit <= 0:
-                chunk_limit = total_tiles
-            try:
-                chunk_int = int(chunk_limit)
-            except (TypeError, ValueError, OverflowError):
-                chunk_int = total_tiles
-            if chunk_int <= 0:
-                chunk_int = total_tiles
-            chunk_size = min(chunk_int, total_tiles)
-            chunk_size = max(chunk_size, 1)
+            chunk_dtype = (
+                group.values.dtype
+                if isinstance(group.values, torch.Tensor)
+                else x.dtype
+            )
+            chunk_size = self._resolve_period_group_chunk(
+                group=group, dtype=chunk_dtype
+            )
+            if chunk_size <= 0:
+                chunk_size = int(total_tiles)
+            chunk_size = max(1, min(int(chunk_size), int(total_tiles)))
             for start_idx in range(0, total_tiles, chunk_size):
                 end_idx = min(start_idx + chunk_size, total_tiles)
                 values_chunk = group.values[start_idx:end_idx]

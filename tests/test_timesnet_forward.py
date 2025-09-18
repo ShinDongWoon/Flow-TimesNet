@@ -7,7 +7,11 @@ import torch.nn.functional as F
 # Ensure the project src is on the path for imports
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
-from timesnet_forecast.models.timesnet import TimesNet, _adaptive_pool_valid_lengths
+from timesnet_forecast.models.timesnet import (
+    PeriodGroup,
+    TimesNet,
+    _adaptive_pool_valid_lengths,
+)
 
 
 def test_forward_shape_and_head_processing():
@@ -170,6 +174,64 @@ def test_period_group_chunk_preserves_outputs():
 
     torch.testing.assert_close(mu_chunk, mu_full, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(sigma_chunk, sigma_full, atol=1e-6, rtol=1e-6)
+
+
+def test_period_group_chunk_helper_caps_size(monkeypatch):
+    torch.manual_seed(0)
+    B, L, H, N = 1, 128, 4, 1
+    model = TimesNet(
+        input_len=L,
+        pred_len=H,
+        d_model=32,
+        n_layers=2,
+        k_periods=1,
+        pmax=L,
+        kernel_set=[3, 5, 7],
+        dropout=0.0,
+        activation="gelu",
+        mode="direct",
+        use_checkpoint=False,
+    )
+    model.eval()
+
+    tile_count = 256
+    cycles = 64
+    period = 64
+    dtype = torch.float32
+    values = torch.randn(tile_count, cycles, period, dtype=dtype)
+    batch_indices = torch.zeros(tile_count, dtype=torch.long)
+    freq_indices = torch.zeros(tile_count, dtype=torch.long)
+    fake_group = PeriodGroup(
+        values=values,
+        batch_indices=batch_indices,
+        frequency_indices=freq_indices,
+        cycles=cycles,
+        period=period,
+    )
+
+    monkeypatch.setattr(model.period, "forward", lambda *args, **kwargs: [fake_group])
+
+    x = torch.randn(B, L, N, dtype=dtype)
+    max_bytes_backup = model.period_group_max_chunk_bytes
+    chunk_backup = model.period_group_chunk
+    model.period_group_max_chunk_bytes = 1 << 20  # 1 MiB budget
+
+    try:
+        with torch.no_grad():
+            model.period_group_chunk = tile_count
+            mu_full, sigma_full = model(x)
+
+            model.period_group_chunk = None
+            chunk_size = model._resolve_period_group_chunk(fake_group, dtype=dtype)
+            assert chunk_size < tile_count
+
+            mu_chunk, sigma_chunk = model(x)
+
+        torch.testing.assert_close(mu_chunk, mu_full, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(sigma_chunk, sigma_full, atol=1e-6, rtol=1e-6)
+    finally:
+        model.period_group_max_chunk_bytes = max_bytes_backup
+        model.period_group_chunk = chunk_backup
 
 
 def test_adaptive_pool_matches_reference_for_variable_lengths():

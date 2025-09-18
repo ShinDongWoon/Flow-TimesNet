@@ -612,6 +612,9 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         use_checkpoint=use_checkpoint,
         min_sigma=min_sigma_scalar,
         min_sigma_vector=min_sigma_vector_tensor,
+        period_group_chunk=cfg["model"].get("period_group_chunk"),
+        period_group_memory_ratio=cfg["model"].get("period_group_memory_ratio"),
+        period_group_max_chunk_bytes=cfg["model"].get("period_group_max_chunk_bytes"),
     ).to(device)
 
     # Lazily build model parameters so that downstream utilities see them
