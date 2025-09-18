@@ -132,6 +132,16 @@ def predict_once(cfg: Dict) -> str:
         k.replace("_orig_mod.", "").replace("module.", ""): v
         for k, v in state.items()
     }
+    expected_frontend = clean_state.get("blocks.0.weight")
+    if expected_frontend is not None:
+        required_in_channels = int(expected_frontend.shape[1])
+        current_in_channels = int(model.blocks[0].weight.shape[1])
+        if current_in_channels != required_in_channels:
+            model._resize_frontend(
+                required_in_channels,
+                device=model.blocks[0].weight.device,
+                dtype=model.blocks[0].weight.dtype,
+            )
     model.load_state_dict(clean_state, strict=True)
     if cfg_used["train"]["channels_last"]:
         model.to(memory_format=torch.channels_last)
