@@ -175,38 +175,121 @@ def _masked_mean(loss_tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (loss_tensor * mask).sum() / denom
 
 
-def _masked_std(arrays: List[np.ndarray], masks: List[np.ndarray]) -> float:
-    """Compute the standard deviation across ``arrays`` given element-wise masks."""
+def _masked_std(
+    arrays: List[np.ndarray],
+    masks: List[np.ndarray],
+    method: str = "global",
+) -> float:
+    """Compute a standard deviation summary over ``arrays`` respecting ``masks``.
+
+    Args:
+        arrays: Sequence of arrays shaped ``[T, N]`` containing observations.
+        masks: Sequence of masks with the same shapes as ``arrays`` where values
+            greater than zero mark valid entries.
+        method: Aggregation strategy used to summarise the variability. ``"global"``
+            reproduces the historical behaviour by computing a single standard
+            deviation over all valid points. ``"per_series_median"`` computes the
+            per-series standard deviation (again using the mask) and returns the
+            median across series, providing a robust alternative that down-weights
+            outlier series.
+
+    Returns:
+        A scalar ``float`` describing the spread of the valid targets.
+    """
 
     if len(arrays) == 0:
         return 0.0
 
-    total = 0.0
-    total_sq = 0.0
-    count = 0
-    for arr, mask in zip(arrays, masks):
-        if arr.size == 0:
-            continue
-        if mask is None:
-            values = arr.reshape(-1)
-        else:
-            valid = mask > 0.0
-            if not np.any(valid):
+    method_normalized = method.lower()
+
+    if method_normalized == "global":
+        total = 0.0
+        total_sq = 0.0
+        count = 0
+        for arr, mask in zip(arrays, masks):
+            if arr.size == 0:
                 continue
-            values = arr[valid]
-        if values.size == 0:
-            continue
-        values64 = values.astype(np.float64, copy=False)
-        total += float(values64.sum())
-        total_sq += float(np.square(values64).sum())
-        count += int(values.size)
+            if mask is None:
+                values = arr.reshape(-1)
+            else:
+                valid = mask > 0.0
+                if not np.any(valid):
+                    continue
+                values = arr[valid]
+            if values.size == 0:
+                continue
+            values64 = values.astype(np.float64, copy=False)
+            total += float(values64.sum())
+            total_sq += float(np.square(values64).sum())
+            count += int(values.size)
 
-    if count == 0:
-        return 0.0
+        if count == 0:
+            return 0.0
 
-    mean = total / count
-    variance = max(total_sq / count - mean * mean, 0.0)
-    return float(math.sqrt(variance))
+        mean = total / count
+        variance = max(total_sq / count - mean * mean, 0.0)
+        return float(math.sqrt(variance))
+
+    if method_normalized == "per_series_median":
+        n_series: int | None = None
+        per_sum: np.ndarray | None = None
+        per_sum_sq: np.ndarray | None = None
+        per_count: np.ndarray | None = None
+
+        for arr, mask in zip(arrays, masks):
+            if arr.size == 0:
+                continue
+            arr2d = np.asarray(arr)
+            if arr2d.ndim == 1:
+                arr2d = arr2d.reshape(-1, 1)
+            if arr2d.shape[0] == 0 or arr2d.shape[1] == 0:
+                continue
+
+            if mask is None:
+                mask_bool = np.ones(arr2d.shape, dtype=bool)
+            else:
+                mask_arr = np.asarray(mask)
+                if mask_arr.shape != arr2d.shape:
+                    raise ValueError("Mask shape must match array shape for per-series std computation")
+                mask_bool = mask_arr > 0.0
+            if not np.any(mask_bool):
+                continue
+
+            arr64 = arr2d.astype(np.float64, copy=False)
+            mask_float = mask_bool.astype(np.float64, copy=False)
+
+            if n_series is None:
+                n_series = arr2d.shape[1]
+                per_sum = np.zeros(n_series, dtype=np.float64)
+                per_sum_sq = np.zeros(n_series, dtype=np.float64)
+                per_count = np.zeros(n_series, dtype=np.float64)
+            elif n_series != arr2d.shape[1]:
+                raise ValueError("All arrays must have the same number of series")
+
+            per_sum += (arr64 * mask_float).sum(axis=0)
+            per_sum_sq += (np.square(arr64) * mask_float).sum(axis=0)
+            per_count += mask_float.sum(axis=0)
+
+        if n_series is None or per_sum is None or per_sum_sq is None or per_count is None:
+            return 0.0
+
+        valid_series = per_count > 0.0
+        if not np.any(valid_series):
+            return 0.0
+
+        means = np.zeros_like(per_sum)
+        means[valid_series] = per_sum[valid_series] / per_count[valid_series]
+        variances = np.zeros_like(per_sum)
+        variances[valid_series] = np.maximum(
+            per_sum_sq[valid_series] / per_count[valid_series] - means[valid_series] ** 2,
+            0.0,
+        )
+        stds = np.sqrt(variances[valid_series])
+        if stds.size == 0:
+            return 0.0
+        return float(np.median(stds))
+
+    raise ValueError(f"Unsupported min_sigma_method '{method}'. Expected 'global' or 'per_series_median'.")
 
 
 def _transform_dataframe(
@@ -453,7 +536,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
 
     use_loss_masking = bool(cfg["train"].get("use_loss_masking", False))
 
-    target_std = _masked_std(train_arrays, train_mask_arrays)
+    min_sigma_method = str(cfg["train"].get("min_sigma_method", "global"))
+    target_std = _masked_std(train_arrays, train_mask_arrays, method=min_sigma_method)
     min_sigma_cfg = float(cfg["train"].get("min_sigma", 1e-3))
     min_sigma_scale = float(cfg["train"].get("min_sigma_scale", 0.1))
     scaled_min_sigma = target_std * min_sigma_scale if target_std > 0.0 else 0.0
