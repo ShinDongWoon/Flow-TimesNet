@@ -382,6 +382,9 @@ class TimesNet(nn.Module):
         if min_sigma_vector is not None:
             min_sigma_tensor = torch.as_tensor(min_sigma_vector, dtype=torch.float32)
             self.min_sigma_vector = min_sigma_tensor.reshape(1, 1, -1)
+        # Maximum number of tiles processed from a period group at once. ``None``
+        # preserves the historical behaviour of processing the full group.
+        self.period_group_chunk: int | None = None
 
     # ------------------------------------------------------------------
     # Backwards compatibility hooks
@@ -458,45 +461,65 @@ class TimesNet(nn.Module):
         features = x.new_zeros(BN, self.d_model, T)
         coverage = x.new_zeros(BN, 1, T)
         for group in groups:
-            if group.values.numel() == 0:
+            total_tiles = group.values.size(0)
+            if total_tiles == 0:
                 continue
-            tiles = group.values.unsqueeze(1)  # [M, 1, C, P]
-            tiles = self.frontend(tiles)
-            for blk in self.blocks:
-                tiles = (
-                    checkpoint(blk, tiles, use_reentrant=False)
-                    if self.use_checkpoint
-                    else blk(tiles)
-                )
-            flat = tiles.reshape(tiles.size(0), self.d_model, -1)
-            if flat.size(-1) == 0:
-                continue
-            if flat.size(-1) > T:
-                flat = flat[..., -T:]
-            length = flat.size(-1)
-            start = max(T - length, 0)
-            pad_left = start
-            pad_right = T - start - length
-            flat_padded = F.pad(flat, (pad_left, pad_right))
-            if flat_padded.dtype != features.dtype:
-                # Mixed precision autocast can yield lower precision tiles; align the
-                # accumulation buffers with the tile dtype to avoid redundant casts.
-                features = features.to(dtype=flat_padded.dtype)
-            if flat_padded.dtype != coverage.dtype:
-                coverage = coverage.to(dtype=flat_padded.dtype)
-            if flat_padded.device != features.device:
-                raise RuntimeError("flat_padded and features must reside on the same device")
-            features.index_add_(0, group.batch_indices, flat_padded)
-            coverage_update = flat.new_ones((flat.size(0), 1, length))
-            coverage_update = F.pad(coverage_update, (pad_left, pad_right))
-            if coverage_update.dtype != coverage.dtype:
-                coverage = coverage.to(dtype=coverage_update.dtype)
-                features = features.to(dtype=coverage_update.dtype)
-            if coverage_update.device != coverage.device:
-                raise RuntimeError(
-                    "coverage_update and coverage must reside on the same device"
-                )
-            coverage.index_add_(0, group.batch_indices, coverage_update)
+            chunk_limit = self.period_group_chunk
+            if chunk_limit is None or chunk_limit <= 0:
+                chunk_limit = total_tiles
+            try:
+                chunk_int = int(chunk_limit)
+            except (TypeError, ValueError, OverflowError):
+                chunk_int = total_tiles
+            if chunk_int <= 0:
+                chunk_int = total_tiles
+            chunk_size = min(chunk_int, total_tiles)
+            chunk_size = max(chunk_size, 1)
+            for start_idx in range(0, total_tiles, chunk_size):
+                end_idx = min(start_idx + chunk_size, total_tiles)
+                values_chunk = group.values[start_idx:end_idx]
+                if values_chunk.numel() == 0:
+                    continue
+                tiles = values_chunk.unsqueeze(1)  # [M, 1, C, P]
+                tiles = self.frontend(tiles)
+                for blk in self.blocks:
+                    tiles = (
+                        checkpoint(blk, tiles, use_reentrant=False)
+                        if self.use_checkpoint
+                        else blk(tiles)
+                    )
+                flat = tiles.reshape(tiles.size(0), self.d_model, -1)
+                if flat.size(-1) == 0:
+                    continue
+                if flat.size(-1) > T:
+                    flat = flat[..., -T:]
+                length = flat.size(-1)
+                start = max(T - length, 0)
+                pad_left = start
+                pad_right = T - start - length
+                flat_padded = F.pad(flat, (pad_left, pad_right))
+                if flat_padded.dtype != features.dtype:
+                    # Mixed precision autocast can yield lower precision tiles; align the
+                    # accumulation buffers with the tile dtype to avoid redundant casts.
+                    features = features.to(dtype=flat_padded.dtype)
+                if flat_padded.dtype != coverage.dtype:
+                    coverage = coverage.to(dtype=flat_padded.dtype)
+                if flat_padded.device != features.device:
+                    raise RuntimeError(
+                        "flat_padded and features must reside on the same device"
+                    )
+                batch_chunk = group.batch_indices[start_idx:end_idx]
+                features.index_add_(0, batch_chunk, flat_padded)
+                coverage_update = flat.new_ones((flat.size(0), 1, length))
+                coverage_update = F.pad(coverage_update, (pad_left, pad_right))
+                if coverage_update.dtype != coverage.dtype:
+                    coverage = coverage.to(dtype=coverage_update.dtype)
+                    features = features.to(dtype=coverage_update.dtype)
+                if coverage_update.device != coverage.device:
+                    raise RuntimeError(
+                        "coverage_update and coverage must reside on the same device"
+                    )
+                coverage.index_add_(0, batch_chunk, coverage_update)
 
         coverage_mask = coverage > 0
         coverage_safe = torch.where(coverage_mask, coverage, torch.ones_like(coverage))
