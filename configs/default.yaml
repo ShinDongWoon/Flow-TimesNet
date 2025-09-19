@@ -65,6 +65,7 @@ model:
   min_period_threshold: 7  # 최소 주기 하한선
   kernel_set: [3, 5, 7]
   activation: "gelu"
+  period_group_recompute: null  # defaults to True on CUDA devices
 
 tuning:
   enabled: true

@@ -126,6 +126,7 @@ def predict_once(cfg: Dict) -> str:
         use_checkpoint=use_checkpoint,
         min_sigma=min_sigma_scalar,
         min_sigma_vector=min_sigma_vector_tensor,
+        period_group_recompute=cfg_used["model"].get("period_group_recompute"),
     ).to(device)
     # Lazily construct layers by mirroring the training warm-up.
     with torch.no_grad():

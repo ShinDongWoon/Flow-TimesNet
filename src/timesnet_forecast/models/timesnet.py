@@ -594,6 +594,7 @@ class TimesNet(nn.Module):
         min_period_threshold: int = 1,
         channels_last: bool = False,
         use_checkpoint: bool = True,
+        period_group_recompute: bool | None = None,
         min_sigma: float = 1e-3,
         min_sigma_vector: torch.Tensor | Sequence[float] | None = None,
         period_group_chunk: int | None = None,
@@ -626,6 +627,13 @@ class TimesNet(nn.Module):
         self.n_layers = int(n_layers)
         self.channels_last = bool(channels_last)
         self.use_checkpoint = bool(use_checkpoint)
+        if period_group_recompute is None:
+            period_group_recompute = bool(
+                torch.cuda.is_available() and torch.cuda.device_count() > 0
+            )
+        else:
+            period_group_recompute = bool(period_group_recompute)
+        self.period_group_recompute = period_group_recompute
         self.min_sigma = float(min_sigma)
         self.register_buffer("min_sigma_vector", None)
         if min_sigma_vector is not None:
@@ -816,6 +824,57 @@ class TimesNet(nn.Module):
 
         return int(chunk)
 
+    def _summarize_values_chunk(
+        self,
+        values_chunk: torch.Tensor,
+        total_steps: int,
+        target_len: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Convert a folded tile chunk into pooled trailing sums."""
+
+        if values_chunk.ndim != 3:
+            raise ValueError("values_chunk must be a 3D tensor")
+
+        tiles = values_chunk.contiguous().unsqueeze(1)
+        tiles = self.frontend(tiles)
+        for blk in self.blocks:
+            tiles = (
+                checkpoint(blk, tiles, use_reentrant=False)
+                if self.use_checkpoint
+                else blk(tiles)
+            )
+
+        flat = tiles.reshape(tiles.size(0), self.d_model, -1)
+        time_steps = flat.size(-1)
+        target_steps = max(int(target_len), 1)
+
+        if time_steps == 0:
+            zero_sum = flat.new_zeros(flat.size(0), flat.size(1), target_steps)
+            zero_counts = torch.zeros(
+                flat.size(0),
+                target_steps,
+                dtype=torch.long,
+                device=flat.device,
+            )
+            return zero_sum, zero_counts
+
+        if time_steps > total_steps:
+            flat = flat[..., -total_steps:]
+            time_steps = flat.size(-1)
+
+        tile_lengths = torch.full(
+            (flat.size(0),),
+            time_steps,
+            dtype=torch.long,
+            device=flat.device,
+        )
+        flat_sum, tile_counts = _pool_trailing_sums(
+            values=flat,
+            valid_lengths=tile_lengths,
+            target_len=target_steps,
+        )
+        return flat_sum, tile_counts
+
     # ------------------------------------------------------------------
     # Backwards compatibility hooks
     # ------------------------------------------------------------------
@@ -936,32 +995,26 @@ class TimesNet(nn.Module):
                     dtype=conv_dtype,
                     non_blocking=copy_non_blocking,
                 )
-                values_chunk = values_chunk.contiguous()
-                tiles = values_chunk.unsqueeze(1)  # [M, 1, C, P]
-                tiles = self.frontend(tiles)
-                for blk in self.blocks:
-                    tiles = (
-                        checkpoint(blk, tiles, use_reentrant=False)
-                        if self.use_checkpoint
-                        else blk(tiles)
+                chunk_values = values_chunk
+                should_checkpoint_chunk = (
+                    self.period_group_recompute and not self.use_checkpoint
+                )
+
+                def summarize(chunk_tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                    return self._summarize_values_chunk(
+                        chunk_tensor,
+                        total_steps=T,
+                        target_len=input_window,
                     )
-                flat = tiles.reshape(tiles.size(0), self.d_model, -1)
-                if flat.size(-1) == 0:
-                    continue
-                if flat.size(-1) > T:
-                    flat = flat[..., -T:]
-                tile_len = flat.size(-1)
-                tile_lengths = torch.full(
-                    (flat.size(0),),
-                    tile_len,
-                    dtype=torch.long,
-                    device=flat.device,
-                )
-                flat_sum, tile_counts = _pool_trailing_sums(
-                    values=flat,
-                    valid_lengths=tile_lengths,
-                    target_len=input_window,
-                )
+
+                if should_checkpoint_chunk:
+                    if not chunk_values.requires_grad:
+                        chunk_values.requires_grad_()
+                    flat_sum, tile_counts = checkpoint(
+                        summarize, chunk_values, use_reentrant=False
+                    )
+                else:
+                    flat_sum, tile_counts = summarize(chunk_values)
                 coverage_update = tile_counts.to(dtype=flat_sum.dtype).unsqueeze(1)
                 if features.dtype != flat_sum.dtype:
                     # Mixed precision autocast can yield lower precision tiles; align the

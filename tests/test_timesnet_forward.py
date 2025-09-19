@@ -1,6 +1,7 @@
 import math
 import sys
 from pathlib import Path
+from types import MethodType
 
 import pytest
 import torch
@@ -322,6 +323,84 @@ def test_period_group_chunk_preserves_outputs():
 
     torch.testing.assert_close(mu_chunk, mu_full, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(sigma_chunk, sigma_full, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_period_group_recompute_caps_vram_growth(monkeypatch):
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.float32
+    B, L, H, N = 1, 96, 4, 1
+    tile_count = 64
+    cycles = 64
+    period = 96
+
+    values = torch.randn(tile_count, cycles, period, dtype=dtype)
+    batch_indices = torch.zeros(tile_count, dtype=torch.long)
+    freq_indices = torch.zeros(tile_count, dtype=torch.long)
+
+    def make_group() -> PeriodGroup:
+        return PeriodGroup(
+            values=values,
+            batch_indices=batch_indices,
+            frequency_indices=freq_indices,
+            cycles=cycles,
+            period=period,
+            source_device=torch.device("cpu"),
+            source_dtype=dtype,
+        )
+
+    memory_usage: dict[bool, int] = {}
+    base_kwargs = dict(
+        input_len=L,
+        pred_len=H,
+        d_model=128,
+        n_layers=2,
+        k_periods=1,
+        pmax=L,
+        kernel_set=[3, 5, 7],
+        dropout=0.0,
+        activation="gelu",
+        mode="direct",
+        use_checkpoint=False,
+        period_group_chunk=4,
+    )
+
+    for enable_recompute in (False, True):
+        model = TimesNet(
+            **base_kwargs,
+            period_group_recompute=enable_recompute,
+        ).to(device)
+        model.train()
+        with torch.no_grad():
+            warmup = torch.zeros(1, L, N, device=device, dtype=dtype)
+            model(warmup)
+
+        group = make_group()
+
+        def constant_period(self, *args, **kwargs):
+            return [group]
+
+        monkeypatch.setattr(
+            model.period,
+            "forward",
+            MethodType(constant_period, model.period),
+        )
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+
+        x = torch.randn(B, L, N, device=device, dtype=dtype)
+        mu, sigma = model(x)
+        loss = mu.mean() + sigma.mean()
+        loss.backward()
+        torch.cuda.synchronize(device)
+        memory_usage[enable_recompute] = torch.cuda.max_memory_allocated(device)
+        model.zero_grad(set_to_none=True)
+
+    assert memory_usage[True] < memory_usage[False]
+    reduction = 1.0 - (memory_usage[True] / memory_usage[False])
+    assert reduction > 0.2
 
 
 def test_period_group_chunk_helper_caps_size(monkeypatch):
