@@ -456,6 +456,7 @@ def test_period_group_chunk_helper_caps_size(monkeypatch):
             chunk_size = model._resolve_period_group_chunk(
                 fake_group,
                 target_device=target_device,
+                target_dtype=dtype,
             )
             assert chunk_size < tile_count
 
