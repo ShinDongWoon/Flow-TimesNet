@@ -490,12 +490,13 @@ class PeriodicityTransform(nn.Module):
             tiles = tiles.reshape(-1, cycles_int, period_int).contiguous()
             source_device = tiles.device
             source_dtype = tiles.dtype
-            tiles = tiles.to("cpu", non_blocking=True)
-            if tiles.device.type == "cpu" and torch.cuda.is_available():
-                try:
-                    tiles = tiles.pin_memory()
-                except RuntimeError:
-                    pass
+            if source_device.type == "cpu":
+                tiles = tiles.to("cpu", non_blocking=True)
+                if torch.cuda.is_available():
+                    try:
+                        tiles = tiles.pin_memory()
+                    except RuntimeError:
+                        pass
             tiles = tiles.contiguous()
             out.append(
                 PeriodGroup(
@@ -679,10 +680,33 @@ class TimesNet(nn.Module):
         self,
         group: PeriodGroup,
         target_device: torch.device | None,
+        target_dtype: torch.dtype | None = None,
         running_budget: dict[str, int] | None = None,
         remaining_tiles: int | None = None,
     ) -> int:
         total_tiles = int(group.values.size(0))
+        values_device = torch.device(group.values.device)
+        values_dtype = group.values.dtype
+        if target_dtype is not None and not isinstance(target_dtype, torch.dtype):
+            target_dtype = None
+        dtype_obj = getattr(group, "source_dtype", None)
+        if not isinstance(dtype_obj, torch.dtype):
+            dtype_obj = values_dtype
+        target_dtype_obj = target_dtype if target_dtype is not None else values_dtype
+        resolved_device: torch.device | None
+        if target_device is not None:
+            resolved_device = torch.device(target_device)
+        else:
+            resolved_device = getattr(group, "source_device", None)
+            if resolved_device is not None:
+                resolved_device = torch.device(resolved_device)
+        if resolved_device is None:
+            resolved_device = values_device
+        requires_migration = (values_device != resolved_device) or (
+            values_dtype != target_dtype_obj
+        )
+        if running_budget is not None:
+            running_budget["requires_migration"] = int(bool(requires_migration))
         if total_tiles <= 0:
             if running_budget is not None:
                 running_budget.setdefault("bytes_per_tile", 0)
@@ -700,9 +724,6 @@ class TimesNet(nn.Module):
         if self.period_group_chunk is not None:
             chunk_limit = max(1, min(chunk_limit, int(self.period_group_chunk)))
 
-        dtype_obj = getattr(group, "source_dtype", None)
-        if not isinstance(dtype_obj, torch.dtype):
-            dtype_obj = group.values.dtype
         try:
             element_size = torch.tensor(0, dtype=dtype_obj).element_size()
         except TypeError:
@@ -968,6 +989,7 @@ class TimesNet(nn.Module):
                 chunk_size = self._resolve_period_group_chunk(
                     group=group,
                     target_device=conv_device,
+                    target_dtype=conv_dtype,
                     running_budget=budget_state,
                     remaining_tiles=remaining_tiles,
                 )
@@ -984,17 +1006,34 @@ class TimesNet(nn.Module):
                 start_idx = end_idx
                 if values_chunk.numel() == 0:
                     continue
-                copy_non_blocking = (
-                    conv_device.type == "cuda"
-                    and torch.cuda.is_available()
-                    and values_chunk.device.type == "cpu"
-                    and values_chunk.is_pinned()
-                )
-                values_chunk = values_chunk.to(
-                    device=conv_device,
-                    dtype=conv_dtype,
-                    non_blocking=copy_non_blocking,
-                )
+                requires_migration = bool(budget_state.get("requires_migration", 1))
+                if requires_migration:
+                    if (
+                        values_chunk.device == conv_device
+                        and values_chunk.dtype == conv_dtype
+                    ):
+                        budget_state["requires_migration"] = 0
+                        requires_migration = False
+                else:
+                    if (
+                        values_chunk.device != conv_device
+                        or values_chunk.dtype != conv_dtype
+                    ):
+                        budget_state["requires_migration"] = 1
+                        requires_migration = True
+
+                if requires_migration:
+                    copy_non_blocking = (
+                        conv_device.type == "cuda"
+                        and torch.cuda.is_available()
+                        and values_chunk.device.type == "cpu"
+                        and values_chunk.is_pinned()
+                    )
+                    values_chunk = values_chunk.to(
+                        device=conv_device,
+                        dtype=conv_dtype,
+                        non_blocking=copy_non_blocking,
+                    )
                 chunk_values = values_chunk
                 should_checkpoint_chunk = (
                     self.period_group_recompute and not self.use_checkpoint
