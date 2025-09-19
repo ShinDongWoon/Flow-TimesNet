@@ -36,6 +36,8 @@ train:
   min_sigma: 1.0e-3
   min_sigma_method: "per_series_median"   # global|per_series_median aggregation for target std
   min_sigma_scale: 0.1       # floor multiplier applied to train target std
+  logging:
+    progress: true
   lr_scheduler:
     type: "cosine"
     T_max: ${train.epochs}   # or explicit integer

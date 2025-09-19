@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import time
 import math
 from typing import Dict, List, Tuple, Optional
 import numpy as np
@@ -10,10 +9,9 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, ConcatDataset
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from tqdm import tqdm
 
 from .config import Config, save_yaml
-from .utils.logging import console, print_config
+from .utils.logging import console, print_config, TrainingProgressTracker
 from .utils.seed import seed_everything
 from .utils.torch_opt import (
     amp_autocast,
@@ -433,455 +431,629 @@ def _eval_metrics(
 
 
 def train_once(cfg: Dict) -> Tuple[float, Dict]:
-    # --- bootstrap
-    device = _select_device(cfg["train"]["device"])
-    torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision(cfg["train"]["matmul_precision"])
-    seed_everything(int(cfg.get("tuning", {}).get("seed", 2025)))
-    console().print(f"[bold green]Device:[/bold green] {device}")
+    logging_cfg = cfg.get("train", {}).get("logging", {})
+    progress_enabled = bool(logging_cfg.get("progress", True))
 
-    use_graphs = _should_use_cuda_graphs(cfg["train"], device)
-    requested_checkpoint = bool(cfg["train"].get("use_checkpoint", False))
-    use_checkpoint = requested_checkpoint
-    if use_graphs and use_checkpoint:
-        console().print(
-            "[yellow]train.use_checkpoint disabled because train.cuda_graphs is enabled.[/yellow]"
-        )
-        use_checkpoint = False
-    cfg["train"]["use_checkpoint"] = bool(use_checkpoint)
+    with TrainingProgressTracker(enabled=progress_enabled) as tracker:
+        # --- bootstrap
+        device = _select_device(cfg["train"]["device"])
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision(cfg["train"]["matmul_precision"])
+        seed_everything(int(cfg.get("tuning", {}).get("seed", 2025)))
+        console().print(f"[bold green]Device:[/bold green] {device}")
 
-    # --- data loading
-    schema = io_utils.resolve_schema(cfg)
-    enc = cfg["data"]["encoding"]
-    train_path = cfg["data"]["train_csv"]
-    df = pd.read_csv(train_path, encoding=enc)
-    wide_raw = io_utils.pivot_long_to_wide(
-        df, date_col=schema["date"], id_col=schema["id"], target_col=schema["target"],
-        fill_missing_dates=cfg["data"]["fill_missing_dates"], fillna0=False
-    )
-    mask_wide = (~wide_raw.isna()).astype(np.float32)
-    wide = wide_raw.fillna(0.0)
-    if cfg.get("preprocess", {}).get("clip_negative", False):
-        wide = wide.clip(lower=0.0)
-    ids = list(wide.columns)
-
-    # --- normalization (FIT ONLY ON TRAIN PART to avoid leakage)
-    # We'll split first to determine train-only fit.
-    norm_method = cfg["preprocess"]["normalize"]
-    norm_per_series = cfg["preprocess"]["normalize_per_series"]
-    eps = cfg["preprocess"]["eps"]
-
-    if cfg["train"]["val"]["strategy"] == "holdout":
-        trn_df, val_df = make_holdout_slices(wide, cfg["train"]["val"]["holdout_days"])
-        trn_mask_df, val_mask_df = make_holdout_slices(mask_wide, cfg["train"]["val"]["holdout_days"])
-        if norm_method == "none":
-            scaler = None
-            trn_norm = trn_df.copy()
-            val_norm = val_df.copy()
-        else:
-            scaler, trn_norm = io_utils.fit_series_scaler(
-                trn_df, norm_method, norm_per_series, eps
+        use_graphs = _should_use_cuda_graphs(cfg["train"], device)
+        requested_checkpoint = bool(cfg["train"].get("use_checkpoint", False))
+        use_checkpoint = requested_checkpoint
+        if use_graphs and use_checkpoint:
+            console().print(
+                "[yellow]train.use_checkpoint disabled because train.cuda_graphs is enabled.[/yellow]"
             )
-            val_norm = _transform_dataframe(val_df, ids, scaler, norm_method)
-        train_arrays = [trn_norm.to_numpy(dtype=np.float32, copy=False)]
-        val_arrays = [val_norm.to_numpy(dtype=np.float32, copy=False)]
-        train_mask_arrays = [trn_mask_df.to_numpy(dtype=np.float32, copy=False)]
-        val_mask_arrays = [val_mask_df.to_numpy(dtype=np.float32, copy=False)]
-    else:
-        val_cfg = cfg["train"]["val"]
-        fold_iter = make_rolling_slices(
-            wide, val_cfg["rolling_folds"], val_cfg["rolling_step_days"], val_cfg["holdout_days"]
-        )
-        try:
-            first_tr, _ = next(fold_iter)
-        except StopIteration:
-            raise ValueError("No folds produced; check rolling validation configuration")
+            use_checkpoint = False
+        cfg["train"]["use_checkpoint"] = bool(use_checkpoint)
 
-        if norm_method == "none":
-            scaler = None
-            wide_norm = wide.copy()
+        # --- data preparation
+        data_steps = 9
+        tracker.add_task("data", "데이터 준비: 스키마 확인", total=data_steps)
+
+        schema = io_utils.resolve_schema(cfg)
+        tracker.advance("data", description="데이터 준비: CSV 읽기")
+        enc = cfg["data"]["encoding"]
+        train_path = cfg["data"]["train_csv"]
+        df = pd.read_csv(train_path, encoding=enc)
+
+        tracker.advance("data", description="데이터 준비: 와이드 변환")
+        wide_raw = io_utils.pivot_long_to_wide(
+            df,
+            date_col=schema["date"],
+            id_col=schema["id"],
+            target_col=schema["target"],
+            fill_missing_dates=cfg["data"]["fill_missing_dates"],
+            fillna0=False,
+        )
+        mask_wide = (~wide_raw.isna()).astype(np.float32)
+        wide = wide_raw.fillna(0.0)
+
+        clip_enabled = bool(cfg.get("preprocess", {}).get("clip_negative", False))
+        clip_desc = "데이터 준비: 음수 클립 적용" if clip_enabled else "데이터 준비: 음수 클립 건너뜀"
+        tracker.advance("data", description=clip_desc)
+        if clip_enabled:
+            wide = wide.clip(lower=0.0)
+
+        tracker.advance("data", description="데이터 준비: 정규화 설정")
+        ids = list(wide.columns)
+        norm_method = cfg["preprocess"]["normalize"]
+        norm_per_series = cfg["preprocess"]["normalize_per_series"]
+        eps = cfg["preprocess"]["eps"]
+        scaler = None
+
+        train_arrays: List[np.ndarray]
+        val_arrays: List[np.ndarray]
+        train_mask_arrays: List[np.ndarray]
+        val_mask_arrays: List[np.ndarray]
+
+        if cfg["train"]["val"]["strategy"] == "holdout":
+            holdout_days = cfg["train"]["val"]["holdout_days"]
+            trn_df, val_df = make_holdout_slices(wide, holdout_days)
+            trn_mask_df, val_mask_df = make_holdout_slices(mask_wide, holdout_days)
+            if norm_method == "none":
+                scaler = None
+                trn_norm = trn_df.copy()
+                val_norm = val_df.copy()
+            else:
+                scaler, trn_norm = io_utils.fit_series_scaler(
+                    trn_df, norm_method, norm_per_series, eps
+                )
+                val_norm = _transform_dataframe(val_df, ids, scaler, norm_method)
+            tracker.advance("data", description="데이터 준비: 훈련/검증 분리")
+            train_arrays = [trn_norm.to_numpy(dtype=np.float32, copy=False)]
+            val_arrays = [val_norm.to_numpy(dtype=np.float32, copy=False)]
+            train_mask_arrays = [trn_mask_df.to_numpy(dtype=np.float32, copy=False)]
+            val_mask_arrays = [val_mask_df.to_numpy(dtype=np.float32, copy=False)]
         else:
-            scaler, _ = io_utils.fit_series_scaler(
-                first_tr, norm_method, norm_per_series, eps
+            val_cfg = cfg["train"]["val"]
+            fold_iter = make_rolling_slices(
+                wide,
+                val_cfg["rolling_folds"],
+                val_cfg["rolling_step_days"],
+                val_cfg["holdout_days"],
             )
-
-            wide_norm = _transform_dataframe(wide, ids, scaler, norm_method)
-        train_arrays: List[np.ndarray] = []
-        val_arrays: List[np.ndarray] = []
-        train_mask_arrays: List[np.ndarray] = []
-        val_mask_arrays: List[np.ndarray] = []
-        for (tr_df, va_df), (tr_mask_df, va_mask_df) in zip(
-            make_rolling_slices(
-                wide_norm, val_cfg["rolling_folds"], val_cfg["rolling_step_days"], val_cfg["holdout_days"]
-            ),
-            make_rolling_slices(
-                mask_wide, val_cfg["rolling_folds"], val_cfg["rolling_step_days"], val_cfg["holdout_days"]
-            ),
-        ):
-            train_arrays.append(tr_df.to_numpy(dtype=np.float32, copy=False))
-            val_arrays.append(va_df.to_numpy(dtype=np.float32, copy=False))
-            train_mask_arrays.append(tr_mask_df.to_numpy(dtype=np.float32, copy=False))
-            val_mask_arrays.append(va_mask_df.to_numpy(dtype=np.float32, copy=False))
-
-    # --- compute global period length
-    cfg.setdefault("model", {})
-    input_len = int(cfg["model"]["input_len"])
-    k_periods = int(cfg["model"].get("k_periods", 0))
-    pmax_cap = int(cfg["model"].get("pmax_cap", 730))
-    if input_len > pmax_cap:
-        raise ValueError(
-            "model.input_len cannot exceed model.pmax_cap; increase the cap to retain full history"
-        )
-    pmax_global = _compute_pmax_global(train_arrays, k_periods, pmax_cap)
-    pmax_global = max(pmax_global, input_len)
-    cfg["model"]["pmax"] = int(pmax_global)
-    min_period_threshold = int(cfg["model"].get("min_period_threshold", 1))
-    cfg["model"]["min_period_threshold"] = min_period_threshold
-
-    # --- dataloaders
-    pred_len = int(cfg["model"]["pred_len"])
-    mode = cfg["model"]["mode"]
-    dl_train = _build_dataloader(
-        train_arrays, train_mask_arrays, input_len, pred_len, mode, cfg["train"]["batch_size"],
-        cfg["train"]["num_workers"], cfg["train"]["pin_memory"], cfg["train"]["persistent_workers"],
-        cfg["train"]["prefetch_factor"], shuffle=True, drop_last=True,
-        augment=cfg["data"].get("augment"), pmax_global=pmax_global,
-    )
-    dl_val = _build_dataloader(
-        val_arrays, val_mask_arrays, input_len, pred_len, mode, batch_size=cfg["train"]["batch_size"],
-        num_workers=cfg["train"]["num_workers"], pin_memory=cfg["train"]["pin_memory"],
-        persistent_workers=cfg["train"]["persistent_workers"], prefetch_factor=cfg["train"]["prefetch_factor"],
-        shuffle=False, drop_last=False,
-        recursive_pred_len=(pred_len if mode == "recursive" else None),
-        augment=None, pmax_global=pmax_global,
-    )
-    if len(dl_val.dataset) == 0:
-        raise ValueError("Validation split has no windows; increase train.val.holdout_days or adjust model.input_len/pred_len.")
-
-    use_loss_masking = bool(cfg["train"].get("use_loss_masking", False))
-
-    min_sigma_method = str(cfg["train"].get("min_sigma_method", "global"))
-    target_std, per_series_std = _masked_std(
-        train_arrays, train_mask_arrays, method=min_sigma_method
-    )
-    min_sigma_cfg = float(cfg["train"].get("min_sigma", 1e-3))
-    min_sigma_scale = float(cfg["train"].get("min_sigma_scale", 0.1))
-    scaled_min_sigma = target_std * min_sigma_scale if target_std > 0.0 else 0.0
-    min_sigma_scalar = max(min_sigma_cfg, scaled_min_sigma)
-
-    cfg.setdefault("train", {})
-    per_series_floor_list: List[float] | None = None
-    if per_series_std is not None and per_series_std.size > 0:
-        per_series_scaled = np.asarray(per_series_std, dtype=np.float64) * min_sigma_scale
-        per_series_scaled = np.maximum(per_series_scaled, min_sigma_scalar)
-        per_series_floor_list = [float(x) for x in per_series_scaled]
-        cfg["train"]["min_sigma_vector"] = per_series_floor_list
-    else:
-        cfg["train"].pop("min_sigma_vector", None)
-
-    cfg["train"]["min_sigma_effective"] = float(min_sigma_scalar)
-    msg = (
-        "[bold green]min_sigma calibrated:[/bold green] "
-        f"{min_sigma_scalar:.6f} (target std={target_std:.6f}, scale={min_sigma_scale})"
-    )
-    if per_series_floor_list:
-        msg += f"  per-series max={max(per_series_floor_list):.6f}"
-    console().print(msg)
-
-    if per_series_floor_list is not None:
-        min_sigma_vector_tensor = torch.tensor(
-            per_series_floor_list, dtype=torch.float32
-        ).view(1, 1, -1)
-    else:
-        min_sigma_vector_tensor = None
-
-    # --- model
-    model = TimesNet(
-        input_len=input_len,
-        pred_len=pred_len,
-        d_model=int(cfg["model"]["d_model"]),
-        n_layers=int(cfg["model"]["n_layers"]),
-        k_periods=int(cfg["model"]["k_periods"]),
-        pmax=int(cfg["model"]["pmax"]),
-        min_period_threshold=min_period_threshold,
-        kernel_set=list(cfg["model"]["kernel_set"]),
-        dropout=float(cfg["model"]["dropout"]),
-        activation=str(cfg["model"]["activation"]),
-        mode=mode,
-        channels_last=cfg["train"]["channels_last"],
-        use_checkpoint=use_checkpoint,
-        min_sigma=min_sigma_scalar,
-        min_sigma_vector=min_sigma_vector_tensor,
-        period_group_chunk=cfg["model"].get("period_group_chunk"),
-        period_group_memory_ratio=cfg["model"].get("period_group_memory_ratio"),
-        period_group_max_chunk_bytes=cfg["model"].get("period_group_max_chunk_bytes"),
-        period_group_recompute=cfg["model"].get("period_group_recompute"),
-    ).to(device)
-
-    # Lazily build model parameters so that downstream utilities see them
-    with torch.no_grad():
-        warmup_len = int(cfg["model"]["pmax"])
-        dummy = torch.zeros(1, warmup_len, len(ids), device=device)
-        if cfg["train"]["channels_last"]:
-            dummy = dummy.unsqueeze(-1).to(memory_format=torch.channels_last).squeeze(-1)
-        model(dummy)
-        if cfg["train"]["channels_last"]:
-            model.to(memory_format=torch.channels_last)
-    if cfg["train"]["compile"]:
-        model = maybe_compile(model, True, warmup_args=(dummy,))
-
-    if isinstance(getattr(model, "min_sigma_vector", None), torch.Tensor) and model.min_sigma_vector.numel() > 0:
-        min_sigma: float | torch.Tensor = model.min_sigma_vector
-    else:
-        min_sigma = min_sigma_scalar
-
-    # --- optimizer / scheduler / loss
-    optim = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(cfg["train"]["lr"]),
-        weight_decay=float(cfg["train"]["weight_decay"]),
-    )
-
-    epochs = int(cfg["train"]["epochs"])
-
-    sched_cfg = cfg["train"].get("lr_scheduler", {})
-    scheduler: torch.optim.lr_scheduler._LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None
-    sched_type = sched_cfg.get("type")
-    if sched_type == "ReduceLROnPlateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optim,
-            mode="min",
-            factor=float(sched_cfg.get("factor", 0.1)),
-            patience=int(sched_cfg.get("patience", 10)),
-            threshold=float(sched_cfg.get("threshold", 1e-4)),
-            min_lr=float(sched_cfg.get("min_lr", 0.0)),
-        )
-    elif sched_type == "StepLR":
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optim,
-            step_size=int(sched_cfg.get("step_size", 10)),
-            gamma=float(sched_cfg.get("gamma", 0.1)),
-        )
-    elif sched_type == "cosine":
-        t_max_val = sched_cfg.get("T_max", epochs)
-        try:
-            t_max = int(t_max_val)
-        except (TypeError, ValueError):
-            t_max = epochs
-        scheduler = CosineAnnealingLR(
-            optim,
-            T_max=t_max,
-            eta_min=float(sched_cfg.get("eta_min", 1e-5)),
-        )
-
-    try:
-        grad_scaler = torch.amp.GradScaler(
-            device_type=device.type,
-            enabled=cfg["train"]["amp"] and device.type == "cuda",
-        )
-    except TypeError:
-        # For older PyTorch versions where ``device_type`` is unsupported.
-        grad_scaler = torch.amp.GradScaler(
-            device=device.type,
-            enabled=cfg["train"]["amp"] and device.type == "cuda",
-        )
-    # --- training loop
-    best_nll = float("inf")
-    best_smape = float("inf")
-    best_state = None
-    grad_clip = float(cfg["train"]["grad_clip_norm"]) if cfg["train"]["grad_clip_norm"] else 0.0
-    patience_limit = cfg["train"].get("early_stopping_patience")
-    patience = 0
-    best_epoch = 0
-    accum_steps = int(cfg["train"].get("accumulation_steps", 1))
-
-    if use_graphs:
-        warmup_iters = 3
-        train_iter = iter(dl_train)
-        for w in range(warmup_iters):
             try:
-                xb_w, yb_w, mb_w, hb_w = next(train_iter)
+                first_tr, _ = next(fold_iter)
             except StopIteration:
-                break
-            xb_w = xb_w.to(device, non_blocking=True)
-            yb_w = yb_w.to(device, non_blocking=True)
-            hb_w = hb_w.to(device, non_blocking=True)
-            if use_loss_masking:
-                mb_w = mb_w.to(device, non_blocking=True).to(yb_w.dtype)
-            else:
-                mb_w = torch.ones_like(yb_w)
-            if cfg["train"]["channels_last"] and xb_w.dim() == 4:
-                xb_w = xb_w.to(memory_format=torch.channels_last)
-            _assert_min_len(xb_w, model.period.pmax)
-            with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
-                mu_w, sigma_w = model(xb_w, mask=hb_w)
-                loss_tensor = gaussian_nll_loss(mu_w, sigma_w, yb_w, min_sigma=min_sigma)
-                loss_w = _masked_mean(loss_tensor, mb_w) / accum_steps
-            grad_scaler.scale(loss_w).backward()
-            if (w + 1) % accum_steps == 0:
-                if grad_clip and grad_clip > 0:
-                    grad_scaler.unscale_(optim)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                grad_scaler.step(optim)
-                grad_scaler.update()
-                optim.zero_grad(set_to_none=True)
+                raise ValueError("No folds produced; check rolling validation configuration")
 
-        xb0, yb0, mb0, hb0 = next(train_iter)
-        xb0 = xb0.to(device, non_blocking=True)
-        yb0 = yb0.to(device, non_blocking=True)
-        hb0 = hb0.to(device, non_blocking=True)
-        if use_loss_masking:
-            mb0 = mb0.to(device, non_blocking=True).to(yb0.dtype)
-        else:
-            mb0 = torch.ones_like(yb0)
-        if cfg["train"]["channels_last"] and xb0.dim() == 4:
-            xb0 = xb0.to(memory_format=torch.channels_last)
-        static_x = torch.empty_like(xb0)
-        static_y = torch.empty_like(yb0)
-        static_m = torch.empty_like(mb0)
-        static_hist = torch.empty_like(hb0)
-        static_x.copy_(xb0)
-        static_y.copy_(yb0)
-        static_m.copy_(mb0)
-        static_hist.copy_(hb0)
-        capture_stream = torch.cuda.Stream()
-        graph = torch.cuda.CUDAGraph()
-        optim.zero_grad(set_to_none=True)
-        model.eval()
-        with torch.cuda.stream(capture_stream):
-            graph.capture_begin()
-            with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
-                _assert_min_len(static_x, model.period.pmax)
-                static_mu, static_sigma = model(static_x, mask=static_hist)
-                static_loss_tensor = gaussian_nll_loss(
-                    static_mu, static_sigma, static_y, min_sigma=min_sigma
+            if norm_method == "none":
+                scaler = None
+                wide_norm = wide.copy()
+            else:
+                scaler, _ = io_utils.fit_series_scaler(
+                    first_tr, norm_method, norm_per_series, eps
                 )
-                static_loss = _masked_mean(static_loss_tensor, static_m)
-                static_scaled = static_loss / accum_steps
-            grad_scaler.scale(static_scaled).backward()
-            graph.capture_end()
-        torch.cuda.current_stream().wait_stream(capture_stream)
-        model.train()
-        optim.zero_grad(set_to_none=True)
-
-        def graph_step(
-            xb: torch.Tensor, yb: torch.Tensor, mb: torch.Tensor, hb: torch.Tensor
-        ) -> float:
-            static_x.copy_(xb)
-            static_y.copy_(yb)
-            static_m.copy_(mb)
-            static_hist.copy_(hb)
-            graph.replay()
-            return float(static_loss.item())
-
-    print_config(cfg)
-    for ep in range(1, epochs + 1):
-        model.train()
-        losses: List[float] = []
-        optim.zero_grad(set_to_none=True)
-        num_batches = len(dl_train)
-        for i, (xb, yb, mb, hb) in enumerate(
-            tqdm(dl_train, desc=f"Epoch {ep}/{epochs}", leave=False)
-        ):
-            xb = xb.to(device, non_blocking=True)
-            yb = yb.to(device, non_blocking=True)
-            hb = hb.to(device, non_blocking=True)
-            if use_loss_masking:
-                mb = mb.to(device, non_blocking=True).to(yb.dtype)
-            else:
-                mb = torch.ones_like(yb)
-            if cfg["train"]["channels_last"] and xb.dim() == 4:
-                xb = xb.to(memory_format=torch.channels_last)
-            _assert_min_len(xb, model.period.pmax)
-            if use_graphs:
-                loss_val = graph_step(xb, yb, mb, hb)
-            else:
-                with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
-                    mu, sigma = model(xb, mask=hb)
-                    loss_tensor = gaussian_nll_loss(mu, sigma, yb, min_sigma=min_sigma)
-                    masked_loss = _masked_mean(loss_tensor, mb)
-                    loss = masked_loss / accum_steps
-                grad_scaler.scale(loss).backward()
-                loss_val = float(masked_loss.item())
-            if (i + 1) % accum_steps == 0 or (i + 1) == num_batches:
-                if grad_clip and grad_clip > 0:
-                    grad_scaler.unscale_(optim)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                grad_scaler.step(optim)
-                grad_scaler.update()
-                optim.zero_grad(set_to_none=True)
-            losses.append(float(loss_val))
-
-        eval_metrics = _eval_metrics(
-            model,
-            dl_val,
-            device,
-            mode,
-            ids,
-            pred_len,
-            cfg["train"]["channels_last"],
-            use_loss_mask=use_loss_masking,
-            min_sigma=min_sigma,
-        )
-        val_nll = eval_metrics["nll"]
-        val_smape = eval_metrics["smape"]
-        console().print(
-            f"[bold]Epoch {ep}[/bold] loss={np.mean(losses):.6f}  val_nll={val_nll:.6f}  val_smape={val_smape:.6f}"
-        )
-        if scheduler is not None:
-            if sched_type == "ReduceLROnPlateau":
-                scheduler.step(val_nll)
-            else:
-                scheduler.step()
-        if val_nll < best_nll:
-            best_nll = val_nll
-            best_smape = val_smape
-            best_state = clean_state_dict(
-                {k: v.detach().cpu() for k, v in model.state_dict().items()}
+                wide_norm = _transform_dataframe(wide, ids, scaler, norm_method)
+            tracker.advance("data", description="데이터 준비: 훈련/검증 분리")
+            train_arrays = []
+            val_arrays = []
+            train_mask_arrays = []
+            val_mask_arrays = []
+            fold_count = int(val_cfg["rolling_folds"])
+            fold_total = fold_count if fold_count > 0 else 1
+            tracker.add_task(
+                "data_folds",
+                f"데이터 준비: 롤링 폴드 1/{fold_total}",
+                total=fold_total,
             )
-            best_epoch = ep
-            patience = 0
-        else:
-            patience += 1
-            if patience_limit is not None and patience > patience_limit:
-                console().print(
-                    f"[yellow]Early stopping at epoch {ep}; best epoch was {best_epoch} with val_nll={best_nll:.6f} (val_smape={best_smape:.6f})[/yellow]"
+            processed_folds = 0
+            for (tr_df, va_df), (tr_mask_df, va_mask_df) in zip(
+                make_rolling_slices(
+                    wide_norm,
+                    val_cfg["rolling_folds"],
+                    val_cfg["rolling_step_days"],
+                    val_cfg["holdout_days"],
+                ),
+                make_rolling_slices(
+                    mask_wide,
+                    val_cfg["rolling_folds"],
+                    val_cfg["rolling_step_days"],
+                    val_cfg["holdout_days"],
+                ),
+            ):
+                train_arrays.append(tr_df.to_numpy(dtype=np.float32, copy=False))
+                val_arrays.append(va_df.to_numpy(dtype=np.float32, copy=False))
+                train_mask_arrays.append(tr_mask_df.to_numpy(dtype=np.float32, copy=False))
+                val_mask_arrays.append(va_mask_df.to_numpy(dtype=np.float32, copy=False))
+                processed_folds += 1
+                next_desc = (
+                    f"데이터 준비: 롤링 폴드 {processed_folds + 1}/{fold_total}"
+                    if processed_folds < fold_total
+                    else "데이터 준비: 롤링 폴드 완료"
                 )
+                tracker.advance("data_folds", description=next_desc)
+            tracker.complete("data_folds", description="데이터 준비: 롤링 폴드 완료")
+
+        tracker.advance("data", description="데이터 준비: 글로벌 주기 계산")
+        cfg.setdefault("model", {})
+        input_len = int(cfg["model"]["input_len"])
+        k_periods = int(cfg["model"].get("k_periods", 0))
+        pmax_cap = int(cfg["model"].get("pmax_cap", 730))
+        if input_len > pmax_cap:
+            raise ValueError(
+                "model.input_len cannot exceed model.pmax_cap; increase the cap to retain full history"
+            )
+        pmax_global = _compute_pmax_global(train_arrays, k_periods, pmax_cap)
+        pmax_global = max(pmax_global, input_len)
+        cfg["model"]["pmax"] = int(pmax_global)
+        min_period_threshold = int(cfg["model"].get("min_period_threshold", 1))
+        cfg["model"]["min_period_threshold"] = min_period_threshold
+
+        tracker.advance("data", description="데이터 준비: 데이터로더 생성")
+        pred_len = int(cfg["model"]["pred_len"])
+        mode = cfg["model"]["mode"]
+        dl_train = _build_dataloader(
+            train_arrays,
+            train_mask_arrays,
+            input_len,
+            pred_len,
+            mode,
+            cfg["train"]["batch_size"],
+            cfg["train"]["num_workers"],
+            cfg["train"]["pin_memory"],
+            cfg["train"]["persistent_workers"],
+            cfg["train"]["prefetch_factor"],
+            shuffle=True,
+            drop_last=True,
+            augment=cfg["data"].get("augment"),
+            pmax_global=pmax_global,
+        )
+        dl_val = _build_dataloader(
+            val_arrays,
+            val_mask_arrays,
+            input_len,
+            pred_len,
+            mode,
+            batch_size=cfg["train"]["batch_size"],
+            num_workers=cfg["train"]["num_workers"],
+            pin_memory=cfg["train"]["pin_memory"],
+            persistent_workers=cfg["train"]["persistent_workers"],
+            prefetch_factor=cfg["train"]["prefetch_factor"],
+            shuffle=False,
+            drop_last=False,
+            recursive_pred_len=(pred_len if mode == "recursive" else None),
+            augment=None,
+            pmax_global=pmax_global,
+        )
+        if len(dl_val.dataset) == 0:
+            raise ValueError(
+                "Validation split has no windows; increase train.val.holdout_days or adjust model.input_len/pred_len."
+            )
+
+        tracker.advance("data", description="데이터 준비: 손실 마스크 및 min_sigma 보정")
+        use_loss_masking = bool(cfg["train"].get("use_loss_masking", False))
+        min_sigma_method = str(cfg["train"].get("min_sigma_method", "global"))
+        target_std, per_series_std = _masked_std(
+            train_arrays, train_mask_arrays, method=min_sigma_method
+        )
+        min_sigma_cfg = float(cfg["train"].get("min_sigma", 1e-3))
+        min_sigma_scale = float(cfg["train"].get("min_sigma_scale", 0.1))
+        scaled_min_sigma = target_std * min_sigma_scale if target_std > 0.0 else 0.0
+        min_sigma_scalar = max(min_sigma_cfg, scaled_min_sigma)
+
+        cfg.setdefault("train", {})
+        per_series_floor_list: List[float] | None = None
+        if per_series_std is not None and per_series_std.size > 0:
+            per_series_scaled = np.asarray(per_series_std, dtype=np.float64) * min_sigma_scale
+            per_series_scaled = np.maximum(per_series_scaled, min_sigma_scalar)
+            per_series_floor_list = [float(x) for x in per_series_scaled]
+            cfg["train"]["min_sigma_vector"] = per_series_floor_list
+        else:
+            cfg["train"].pop("min_sigma_vector", None)
+
+        cfg["train"]["min_sigma_effective"] = float(min_sigma_scalar)
+        msg = (
+            "[bold green]min_sigma calibrated:[/bold green] "
+            f"{min_sigma_scalar:.6f} (target std={target_std:.6f}, scale={min_sigma_scale})"
+        )
+        if per_series_floor_list:
+            msg += f"  per-series max={max(per_series_floor_list):.6f}"
+        console().print(msg)
+        tracker.advance("data", description="데이터 준비 완료")
+        tracker.complete("data", description="데이터 준비 완료")
+
+        if per_series_floor_list is not None:
+            min_sigma_vector_tensor = torch.tensor(
+                per_series_floor_list, dtype=torch.float32
+            ).view(1, 1, -1)
+        else:
+            min_sigma_vector_tensor = None
+
+        # --- model configuration
+        tracker.add_task("model", "모델 준비: 인스턴스 생성", total=4)
+        model = TimesNet(
+            input_len=input_len,
+            pred_len=pred_len,
+            d_model=int(cfg["model"]["d_model"]),
+            n_layers=int(cfg["model"]["n_layers"]),
+            k_periods=int(cfg["model"]["k_periods"]),
+            pmax=int(cfg["model"]["pmax"]),
+            min_period_threshold=min_period_threshold,
+            kernel_set=list(cfg["model"]["kernel_set"]),
+            dropout=float(cfg["model"]["dropout"]),
+            activation=str(cfg["model"]["activation"]),
+            mode=mode,
+            channels_last=cfg["train"]["channels_last"],
+            use_checkpoint=use_checkpoint,
+            min_sigma=min_sigma_scalar,
+            min_sigma_vector=min_sigma_vector_tensor,
+            period_group_chunk=cfg["model"].get("period_group_chunk"),
+            period_group_memory_ratio=cfg["model"].get("period_group_memory_ratio"),
+            period_group_max_chunk_bytes=cfg["model"].get("period_group_max_chunk_bytes"),
+            period_group_recompute=cfg["model"].get("period_group_recompute"),
+        ).to(device)
+        tracker.advance("model", description="모델 준비: 워밍업/컴파일")
+
+        with torch.no_grad():
+            warmup_len = int(cfg["model"]["pmax"])
+            dummy = torch.zeros(1, warmup_len, len(ids), device=device)
+            if cfg["train"]["channels_last"]:
+                dummy = dummy.unsqueeze(-1).to(memory_format=torch.channels_last).squeeze(-1)
+            model(dummy)
+            if cfg["train"]["channels_last"]:
+                model.to(memory_format=torch.channels_last)
+        if cfg["train"]["compile"]:
+            model = maybe_compile(model, True, warmup_args=(dummy,))
+        tracker.advance("model", description="모델 준비: 옵티마이저/스케줄러 설정")
+
+        optim = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(cfg["train"]["lr"]),
+            weight_decay=float(cfg["train"]["weight_decay"]),
+        )
+
+        epochs = int(cfg["train"]["epochs"])
+        sched_cfg = cfg["train"].get("lr_scheduler", {})
+        scheduler: torch.optim.lr_scheduler._LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None
+        sched_type = sched_cfg.get("type")
+        if sched_type == "ReduceLROnPlateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optim,
+                mode="min",
+                factor=float(sched_cfg.get("factor", 0.1)),
+                patience=int(sched_cfg.get("patience", 10)),
+                threshold=float(sched_cfg.get("threshold", 1e-4)),
+                min_lr=float(sched_cfg.get("min_lr", 0.0)),
+            )
+        elif sched_type == "StepLR":
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optim,
+                step_size=int(sched_cfg.get("step_size", 10)),
+                gamma=float(sched_cfg.get("gamma", 0.1)),
+            )
+        elif sched_type == "cosine":
+            t_max_val = sched_cfg.get("T_max", epochs)
+            try:
+                t_max = int(t_max_val)
+            except (TypeError, ValueError):
+                t_max = epochs
+            scheduler = CosineAnnealingLR(
+                optim,
+                T_max=t_max,
+                eta_min=float(sched_cfg.get("eta_min", 1e-5)),
+            )
+        tracker.advance("model", description="모델 준비: AMP 스케일러 초기화")
+
+        try:
+            grad_scaler = torch.amp.GradScaler(
+                device_type=device.type,
+                enabled=cfg["train"]["amp"] and device.type == "cuda",
+            )
+        except TypeError:
+            grad_scaler = torch.amp.GradScaler(
+                device=device.type,
+                enabled=cfg["train"]["amp"] and device.type == "cuda",
+            )
+        tracker.advance("model", description="모델 준비 완료")
+        tracker.complete("model", description="모델 준비 완료")
+
+        if isinstance(getattr(model, "min_sigma_vector", None), torch.Tensor) and model.min_sigma_vector.numel() > 0:
+            min_sigma: float | torch.Tensor = model.min_sigma_vector
+        else:
+            min_sigma = min_sigma_scalar
+
+        grad_clip = float(cfg["train"]["grad_clip_norm"]) if cfg["train"]["grad_clip_norm"] else 0.0
+        # --- optional CUDA graph warm-up
+        accum_steps = int(cfg["train"].get("accumulation_steps", 1))
+        if use_graphs:
+            warmup_iters = 3
+            warmup_total = warmup_iters if len(dl_train) == 0 else min(warmup_iters, len(dl_train))
+            warmup_total = max(warmup_total, 1)
+            tracker.add_task(
+                "model_graph_warmup",
+                f"모델 준비: CUDA 그래프 워밍업 1/{warmup_total}",
+                total=warmup_total,
+            )
+            train_iter = iter(dl_train)
+            processed = 0
+            for _ in range(warmup_iters):
+                try:
+                    xb_w, yb_w, mb_w, hb_w = next(train_iter)
+                except StopIteration:
+                    break
+                xb_w = xb_w.to(device, non_blocking=True)
+                yb_w = yb_w.to(device, non_blocking=True)
+                hb_w = hb_w.to(device, non_blocking=True)
+                if use_loss_masking:
+                    mb_w = mb_w.to(device, non_blocking=True).to(yb_w.dtype)
+                else:
+                    mb_w = torch.ones_like(yb_w)
+                if cfg["train"]["channels_last"] and xb_w.dim() == 4:
+                    xb_w = xb_w.to(memory_format=torch.channels_last)
+                _assert_min_len(xb_w, model.period.pmax)
+                with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
+                    mu_w, sigma_w = model(xb_w, mask=hb_w)
+                    loss_tensor = gaussian_nll_loss(mu_w, sigma_w, yb_w, min_sigma=min_sigma)
+                    loss_w = _masked_mean(loss_tensor, mb_w) / accum_steps
+                grad_scaler.scale(loss_w).backward()
+                processed += 1
+                next_desc = (
+                    f"모델 준비: CUDA 그래프 워밍업 {processed + 1}/{warmup_total}"
+                    if processed < warmup_total
+                    else "모델 준비: CUDA 그래프 워밍업 완료"
+                )
+                tracker.advance("model_graph_warmup", description=next_desc)
+                if processed % accum_steps == 0:
+                    if grad_clip and grad_clip > 0:
+                        grad_scaler.unscale_(optim)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    grad_scaler.step(optim)
+                    grad_scaler.update()
+                    optim.zero_grad(set_to_none=True)
+
+            tracker.complete("model_graph_warmup", description="모델 준비: CUDA 그래프 워밍업 완료")
+            xb0, yb0, mb0, hb0 = next(train_iter)
+            xb0 = xb0.to(device, non_blocking=True)
+            yb0 = yb0.to(device, non_blocking=True)
+            hb0 = hb0.to(device, non_blocking=True)
+            if use_loss_masking:
+                mb0 = mb0.to(device, non_blocking=True).to(yb0.dtype)
+            else:
+                mb0 = torch.ones_like(yb0)
+            if cfg["train"]["channels_last"] and xb0.dim() == 4:
+                xb0 = xb0.to(memory_format=torch.channels_last)
+            static_x = torch.empty_like(xb0)
+            static_y = torch.empty_like(yb0)
+            static_m = torch.empty_like(mb0)
+            static_hist = torch.empty_like(hb0)
+            static_x.copy_(xb0)
+            static_y.copy_(yb0)
+            static_m.copy_(mb0)
+            static_hist.copy_(hb0)
+            capture_stream = torch.cuda.Stream()
+            graph = torch.cuda.CUDAGraph()
+            optim.zero_grad(set_to_none=True)
+            model.eval()
+            with torch.cuda.stream(capture_stream):
+                graph.capture_begin()
+                with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
+                    _assert_min_len(static_x, model.period.pmax)
+                    static_mu, static_sigma = model(static_x, mask=static_hist)
+                    static_loss_tensor = gaussian_nll_loss(
+                        static_mu, static_sigma, static_y, min_sigma=min_sigma
+                    )
+                    static_loss = _masked_mean(static_loss_tensor, static_m)
+                    static_scaled = static_loss / accum_steps
+                grad_scaler.scale(static_scaled).backward()
+                graph.capture_end()
+            torch.cuda.current_stream().wait_stream(capture_stream)
+            model.train()
+            optim.zero_grad(set_to_none=True)
+
+            def graph_step(
+                xb: torch.Tensor, yb: torch.Tensor, mb: torch.Tensor, hb: torch.Tensor
+            ) -> float:
+                static_x.copy_(xb)
+                static_y.copy_(yb)
+                static_m.copy_(mb)
+                static_hist.copy_(hb)
+                graph.replay()
+                return float(static_loss.item())
+        else:
+            graph_step = None
+
+        print_config(cfg)
+
+        best_nll = float("inf")
+        best_smape = float("inf")
+        best_state = None
+        patience_limit = cfg["train"].get("early_stopping_patience")
+        patience = 0
+        best_epoch = 0
+
+        tracker.add_task(
+            "train_loop",
+            "학습/검증: Epoch 1 준비" if epochs > 0 else "학습/검증: 에폭 없음",
+            total=epochs if epochs > 0 else 1,
+        )
+
+        stop_training = False
+        for ep in range(1, epochs + 1):
+            model.train()
+            losses: List[float] = []
+            optim.zero_grad(set_to_none=True)
+            num_batches = len(dl_train)
+            batch_total = num_batches if num_batches > 0 else 1
+            tracker.add_task(
+                f"train_epoch_{ep}_batches",
+                f"학습/검증: Epoch {ep} 배치 1/{batch_total}",
+                total=batch_total,
+            )
+            processed_batches = 0
+            for i, (xb, yb, mb, hb) in enumerate(dl_train):
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                hb = hb.to(device, non_blocking=True)
+                if use_loss_masking:
+                    mb = mb.to(device, non_blocking=True).to(yb.dtype)
+                else:
+                    mb = torch.ones_like(yb)
+                if cfg["train"]["channels_last"] and xb.dim() == 4:
+                    xb = xb.to(memory_format=torch.channels_last)
+                _assert_min_len(xb, model.period.pmax)
+                if use_graphs and graph_step is not None:
+                    loss_val = graph_step(xb, yb, mb, hb)
+                else:
+                    with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
+                        mu, sigma = model(xb, mask=hb)
+                        loss_tensor = gaussian_nll_loss(mu, sigma, yb, min_sigma=min_sigma)
+                        masked_loss = _masked_mean(loss_tensor, mb)
+                        loss = masked_loss / accum_steps
+                    grad_scaler.scale(loss).backward()
+                    loss_val = float(masked_loss.item())
+                if (i + 1) % accum_steps == 0 or (i + 1) == num_batches:
+                    if grad_clip and grad_clip > 0:
+                        grad_scaler.unscale_(optim)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    grad_scaler.step(optim)
+                    grad_scaler.update()
+                    optim.zero_grad(set_to_none=True)
+                losses.append(float(loss_val))
+                processed_batches += 1
+                next_batch_desc = (
+                    f"학습/검증: Epoch {ep} 배치 {processed_batches + 1}/{batch_total}"
+                    if processed_batches < batch_total
+                    else f"학습/검증: Epoch {ep} 배치 완료"
+                )
+                tracker.advance(
+                    f"train_epoch_{ep}_batches",
+                    description=next_batch_desc,
+                )
+            tracker.complete(
+                f"train_epoch_{ep}_batches",
+                description=f"학습/검증: Epoch {ep} 배치 완료",
+            )
+
+            tracker.add_task(
+                f"train_epoch_{ep}_post",
+                f"학습/검증: Epoch {ep} 검증",
+                total=3,
+            )
+            eval_metrics = _eval_metrics(
+                model,
+                dl_val,
+                device,
+                mode,
+                ids,
+                pred_len,
+                cfg["train"]["channels_last"],
+                use_loss_mask=use_loss_masking,
+                min_sigma=min_sigma,
+            )
+            val_nll = eval_metrics["nll"]
+            val_smape = eval_metrics["smape"]
+            tracker.advance(
+                f"train_epoch_{ep}_post",
+                description=f"학습/검증: Epoch {ep} 스케줄러 갱신",
+            )
+            console().print(
+                f"[bold]Epoch {ep}[/bold] loss={np.mean(losses):.6f}  val_nll={val_nll:.6f}  val_smape={val_smape:.6f}"
+            )
+            if scheduler is not None:
+                if sched_type == "ReduceLROnPlateau":
+                    scheduler.step(val_nll)
+                else:
+                    scheduler.step()
+                sched_desc = f"학습/검증: Epoch {ep} 스케줄러 갱신"
+            else:
+                sched_desc = f"학습/검증: Epoch {ep} 스케줄러 없음"
+            tracker.advance(
+                f"train_epoch_{ep}_post",
+                advance=0,
+                description=sched_desc,
+            )
+            tracker.advance(
+                f"train_epoch_{ep}_post",
+                description=f"학습/검증: Epoch {ep} 베스트 모델 평가",
+            )
+
+            if val_nll < best_nll:
+                best_nll = val_nll
+                best_smape = val_smape
+                best_state = clean_state_dict(
+                    {k: v.detach().cpu() for k, v in model.state_dict().items()}
+                )
+                best_epoch = ep
+                patience = 0
+                improvement_desc = f"학습/검증: Epoch {ep} 베스트 모델 갱신"
+            else:
+                patience += 1
+                improvement_desc = f"학습/검증: Epoch {ep} 베스트 모델 유지"
+                if patience_limit is not None and patience > patience_limit:
+                    console().print(
+                        f"[yellow]Early stopping at epoch {ep}; best epoch was {best_epoch} with val_nll={best_nll:.6f} (val_smape={best_smape:.6f})[/yellow]"
+                    )
+                    stop_training = True
+            tracker.advance(
+                f"train_epoch_{ep}_post",
+                description=improvement_desc,
+            )
+            tracker.complete(
+                f"train_epoch_{ep}_post",
+                description=improvement_desc,
+            )
+
+            next_epoch_desc = (
+                f"학습/검증: Epoch {ep + 1} 준비"
+                if ep < epochs and not stop_training
+                else "학습/검증 종료"
+            )
+            tracker.advance("train_loop", description=next_epoch_desc)
+            if stop_training:
                 break
 
-    console().print(
-        f"[bold]Best epoch {best_epoch} with val_nll={best_nll:.6f} (val_smape={best_smape:.6f})[/bold]"
-    )
+        tracker.complete("train_loop", description="학습/검증 종료")
 
-    # --- save artifacts
-    art_dir = cfg["artifacts"]["dir"]
-    os.makedirs(art_dir, exist_ok=True)
-    model_path = os.path.join(art_dir, cfg["artifacts"]["model_file"])
-    torch.save(
-        best_state if best_state is not None else clean_state_dict(model.state_dict()),
-        model_path,
-    )
+        # --- save artifacts
+        tracker.add_task("artifacts", "아티팩트 저장: 모델", total=4)
+        art_dir = cfg["artifacts"]["dir"]
+        os.makedirs(art_dir, exist_ok=True)
+        model_path = os.path.join(art_dir, cfg["artifacts"]["model_file"])
+        torch.save(
+            best_state if best_state is not None else clean_state_dict(model.state_dict()),
+            model_path,
+        )
+        tracker.advance("artifacts", description="아티팩트 저장: 스케일러")
 
-    # Save scaler/schema/config
-    scaler_path = os.path.join(art_dir, cfg["artifacts"]["scaler_file"])
-    schema_path = os.path.join(art_dir, cfg["artifacts"]["schema_file"])
-    cfg_path = os.path.join(art_dir, cfg["artifacts"]["config_file"])
-    io_utils.save_pickle(
-        {"scaler": scaler, "method": cfg["preprocess"]["normalize"], "ids": ids},
-        scaler_path,
-    )
-    io_utils.save_json({"date": schema["date"], "target": schema["target"], "id": schema["id"]}, schema_path)
-    save_yaml(cfg, cfg_path)
-    console().print(f"[green]Saved:[/green] {model_path}, {scaler_path}, {schema_path}, {cfg_path}")
-    return best_nll, {
-        "model": model_path,
-        "scaler": scaler_path,
-        "schema": schema_path,
-        "config": cfg_path,
-        "metrics": {"nll": best_nll, "smape": best_smape},
-    }
+        scaler_path = os.path.join(art_dir, cfg["artifacts"]["scaler_file"])
+        schema_path = os.path.join(art_dir, cfg["artifacts"]["schema_file"])
+        cfg_path = os.path.join(art_dir, cfg["artifacts"]["config_file"])
+        io_utils.save_pickle(
+            {"scaler": scaler, "method": cfg["preprocess"]["normalize"], "ids": ids},
+            scaler_path,
+        )
+        tracker.advance("artifacts", description="아티팩트 저장: 스키마")
 
+        io_utils.save_json(
+            {"date": schema["date"], "target": schema["target"], "id": schema["id"]},
+            schema_path,
+        )
+        tracker.advance("artifacts", description="아티팩트 저장: 설정")
 
+        save_yaml(cfg, cfg_path)
+        tracker.advance("artifacts", description="아티팩트 저장 완료")
+        tracker.complete("artifacts", description="아티팩트 저장 완료")
+
+        console().print(
+            f"[green]Saved:[/green] {model_path}, {scaler_path}, {schema_path}, {cfg_path}"
+        )
+        console().print(
+            f"[bold]Best epoch {best_epoch} with val_nll={best_nll:.6f} (val_smape={best_smape:.6f})[/bold]"
+        )
+        return best_nll, {
+            "model": model_path,
+            "scaler": scaler_path,
+            "schema": schema_path,
+            "config": cfg_path,
+            "metrics": {"nll": best_nll, "smape": best_smape},
+        }
 def main() -> None:
     import argparse
     from .config import Config
