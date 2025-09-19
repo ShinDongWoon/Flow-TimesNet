@@ -2,6 +2,7 @@ import math
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -193,6 +194,88 @@ def test_pool_trailing_sums_matches_adaptive_pool():
     )
 
     torch.testing.assert_close(averages, pooled, atol=1e-6, rtol=1e-5)
+
+
+def test_pool_trailing_sums_streaming_matches_reference_cpu(monkeypatch):
+    torch.manual_seed(7)
+    B, C, T = 8, 4, 31
+    target = 9
+    values = torch.randn(B, C, T)
+    valid_lengths = torch.randint(0, T + 1, (B,), dtype=torch.long)
+
+    monkeypatch.setenv("TIMESNET_POOL_MAX_BYTES", str(1_000_000_000))
+    ref_sums, ref_counts = _pool_trailing_sums(values, valid_lengths, target)
+
+    monkeypatch.setenv("TIMESNET_POOL_MAX_BYTES", "512")
+    stream_sums, stream_counts = _pool_trailing_sums(values, valid_lengths, target)
+
+    torch.testing.assert_close(stream_sums, ref_sums)
+    torch.testing.assert_close(stream_counts, ref_counts)
+
+
+def test_adaptive_pool_streaming_matches_reference_cpu(monkeypatch):
+    torch.manual_seed(11)
+    BN, C, T = 6, 3, 27
+    target = 5
+    features = torch.randn(BN, C, T)
+    mask = torch.randint(0, 2, (BN, 2, T), dtype=torch.int32).to(torch.bool)
+    valid_lengths = torch.randint(1, T + 1, (BN,), dtype=torch.long)
+
+    monkeypatch.setenv("TIMESNET_POOL_MAX_BYTES", str(1_000_000_000))
+    ref_feats, ref_masks = _adaptive_pool_valid_lengths(
+        features, mask, valid_lengths, target
+    )
+
+    monkeypatch.setenv("TIMESNET_POOL_MAX_BYTES", "512")
+    stream_feats, stream_masks = _adaptive_pool_valid_lengths(
+        features, mask, valid_lengths, target
+    )
+
+    torch.testing.assert_close(stream_feats, ref_feats, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(stream_masks, ref_masks)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_pool_trailing_sums_streaming_matches_reference_cuda(monkeypatch):
+    torch.manual_seed(21)
+    device = torch.device("cuda")
+    B, C, T = 5, 4, 28
+    target = 6
+    values = torch.randn(B, C, T, device=device, dtype=torch.float32)
+    valid_lengths = torch.randint(0, T + 1, (B,), dtype=torch.long)
+
+    monkeypatch.setenv("TIMESNET_POOL_MAX_BYTES", str(1_000_000_000))
+    ref_sums, ref_counts = _pool_trailing_sums(values, valid_lengths, target)
+
+    monkeypatch.setenv("TIMESNET_POOL_MAX_BYTES", "512")
+    stream_sums, stream_counts = _pool_trailing_sums(values, valid_lengths, target)
+
+    torch.testing.assert_close(stream_sums, ref_sums)
+    torch.testing.assert_close(stream_counts, ref_counts)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_adaptive_pool_streaming_matches_reference_cuda(monkeypatch):
+    torch.manual_seed(22)
+    device = torch.device("cuda")
+    BN, C, T = 7, 2, 30
+    target = 8
+    features = torch.randn(BN, C, T, device=device, dtype=torch.float32)
+    mask = torch.randint(0, 2, (BN, 2, T), device=device, dtype=torch.int32).to(torch.bool)
+    valid_lengths = torch.randint(1, T + 1, (BN,), dtype=torch.long)
+
+    monkeypatch.setenv("TIMESNET_POOL_MAX_BYTES", str(1_000_000_000))
+    ref_feats, ref_masks = _adaptive_pool_valid_lengths(
+        features, mask, valid_lengths, target
+    )
+
+    monkeypatch.setenv("TIMESNET_POOL_MAX_BYTES", "512")
+    stream_feats, stream_masks = _adaptive_pool_valid_lengths(
+        features, mask, valid_lengths, target
+    )
+
+    torch.testing.assert_close(stream_feats, ref_feats, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(stream_masks, ref_masks)
 
 
 def test_period_group_chunk_preserves_outputs():
