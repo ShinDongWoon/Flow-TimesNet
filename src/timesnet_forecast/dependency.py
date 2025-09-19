@@ -11,7 +11,8 @@ def bootstrap(cfg: dict) -> torch.device:
     if want == "cuda" and not torch.cuda.is_available():
         console().print("[yellow]CUDA not available; falling back to CPU.[/yellow]")
     device = torch.device("cuda:0" if (want == "cuda" and torch.cuda.is_available()) else "cpu")
-    torch.backends.cudnn.benchmark = True
+    cudnn_benchmark = bool(cfg["train"].get("cudnn_benchmark", False))
+    torch.backends.cudnn.benchmark = bool(device.type == "cuda" and cudnn_benchmark)
     torch.set_float32_matmul_precision(cfg["train"]["matmul_precision"])
     seed_everything(int(cfg.get("tuning", {}).get("seed", 2025)))
     return device

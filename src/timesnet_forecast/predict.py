@@ -77,7 +77,8 @@ def predict_once(cfg: Dict) -> str:
             cfg_used[k] = v
 
     device = _select_device(cfg_used["train"]["device"])
-    torch.backends.cudnn.benchmark = True
+    cudnn_benchmark = bool(cfg_used["train"].get("cudnn_benchmark", False))
+    torch.backends.cudnn.benchmark = bool(device.type == "cuda" and cudnn_benchmark)
     torch.set_float32_matmul_precision(cfg_used["train"]["matmul_precision"])
     console().print(f"[bold green]Predict device:[/bold green] {device}")
 

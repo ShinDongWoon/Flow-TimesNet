@@ -435,7 +435,8 @@ def _eval_metrics(
 def train_once(cfg: Dict) -> Tuple[float, Dict]:
     # --- bootstrap
     device = _select_device(cfg["train"]["device"])
-    torch.backends.cudnn.benchmark = True
+    cudnn_benchmark = bool(cfg["train"].get("cudnn_benchmark", False))
+    torch.backends.cudnn.benchmark = bool(device.type == "cuda" and cudnn_benchmark)
     torch.set_float32_matmul_precision(cfg["train"]["matmul_precision"])
     seed_everything(int(cfg.get("tuning", {}).get("seed", 2025)))
     console().print(f"[bold green]Device:[/bold green] {device}")

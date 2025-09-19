@@ -17,6 +17,7 @@
 - Configuration option `model.inception_kernel_set` has been renamed to `model.kernel_set`. The previous name is still accepted for backward compatibility.
 - Using CUDA Graphs (`train.cuda_graphs: true`) disables dropout because the model is placed in evaluation mode during graph capture. This trades regularization for faster execution.
 - Activation checkpointing can be toggled via `train.use_checkpoint`. Enabling it reduces memory usage at the cost of slower training throughput and is automatically turned off when CUDA graphs are active.
+- cuDNN benchmarking is disabled by default to keep memory usage stable across the many chunk shapes produced by TimesNet. Set `train.cudnn_benchmark: true` to opt into the higher-workspace algorithm search when you have sufficient GPU headroom.
 - Manual CUDA graph capture (`train.cuda_graphs`) and `torch.compile` (`train.compile`) are mutually exclusive. TorchDynamo already performs graph capture and its compiled modules cannot be re-captured safely.
 - `model.pmax_cap` limits the automatically inferred maximum period length. During training the dominant period across all series is detected and then clipped to this cap to avoid extremely long seasonal windows.
 - The model "telescopes" input sequences: `TimesNet.forward` always crops to the first `input_len` steps of the periodic canvas, so passing extra history at inference produces the same `[B, pred_len, N]` shaped output as training.
