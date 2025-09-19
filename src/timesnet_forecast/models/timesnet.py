@@ -20,6 +20,18 @@ class PeriodGroup:
     period: int
 
 
+def _accum_dtype(t: torch.Tensor) -> torch.dtype:
+    """Return a numerically stable accumulation dtype for ``t``.
+
+    Half-precision dtypes accumulate in ``float32`` while other tensors keep
+    their original dtype to preserve numerics.
+    """
+
+    if t.dtype in {torch.float16, torch.bfloat16}:
+        return torch.float32
+    return t.dtype
+
+
 def _adaptive_pool_valid_lengths(
     features: torch.Tensor,
     mask: torch.Tensor,
@@ -67,14 +79,23 @@ def _adaptive_pool_valid_lengths(
     end_idx = (end_rel + offsets).clamp(min=0, max=T)
     counts = (end_idx - start_idx).clamp(min=1)
 
-    feat_cumsum = torch.cumsum(features.to(torch.float64), dim=-1)
-    feat_cumsum = torch.cat(
-        [feat_cumsum.new_zeros(BN, features.size(1), 1), feat_cumsum], dim=-1
+    feat_accum_dtype = _accum_dtype(features)
+    feat_cumsum = torch.cumsum(features, dim=-1, dtype=feat_accum_dtype)
+    feat_prefix = torch.zeros(
+        BN, features.size(1), 1, device=features.device, dtype=feat_accum_dtype
     )
-    mask_cumsum = torch.cumsum(mask.to(torch.float64), dim=-1)
-    mask_cumsum = torch.cat(
-        [mask_cumsum.new_zeros(BN, mask.size(1), 1), mask_cumsum], dim=-1
+    feat_cumsum = torch.cat([feat_prefix, feat_cumsum], dim=-1)
+
+    mask_input = mask
+    if not mask.dtype.is_floating_point:
+        base_dtype = features.dtype if features.dtype.is_floating_point else torch.float32
+        mask_input = mask.to(base_dtype)
+    mask_accum_dtype = _accum_dtype(mask_input)
+    mask_cumsum = torch.cumsum(mask_input, dim=-1, dtype=mask_accum_dtype)
+    mask_prefix = torch.zeros(
+        BN, mask.size(1), 1, device=mask.device, dtype=mask_accum_dtype
     )
+    mask_cumsum = torch.cat([mask_prefix, mask_cumsum], dim=-1)
 
     start_idx_feat = start_idx.view(BN, 1, target_steps).expand(-1, features.size(1), -1)
     end_idx_feat = end_idx.view(BN, 1, target_steps).expand(-1, features.size(1), -1)
@@ -88,9 +109,10 @@ def _adaptive_pool_valid_lengths(
     mask_end = torch.gather(mask_cumsum, dim=-1, index=end_idx_mask)
     mask_sum = mask_end - mask_start
 
-    denom = counts.view(BN, 1, target_steps).to(torch.float64)
-    pooled_feats = (feat_sum / denom).to(features.dtype)
-    pooled_mask = (mask_sum / denom).to(mask.dtype)
+    feat_denom = counts.view(BN, 1, target_steps).to(feat_accum_dtype)
+    mask_denom = counts.view(BN, 1, target_steps).to(mask_accum_dtype)
+    pooled_feats = (feat_sum / feat_denom).to(features.dtype)
+    pooled_mask = (mask_sum / mask_denom).to(mask.dtype)
     return pooled_feats, pooled_mask
 
 
@@ -149,10 +171,10 @@ def _pool_trailing_sums(
     end_idx = (end_rel + offsets).clamp(min=0, max=T)
     counts = (end_idx - start_idx).clamp(min=1)
 
-    values_cumsum = torch.cumsum(values.to(torch.float64), dim=-1)
-    values_cumsum = torch.cat(
-        [values_cumsum.new_zeros(B, C, 1), values_cumsum], dim=-1
-    )
+    accum_dtype = _accum_dtype(values)
+    values_cumsum = torch.cumsum(values, dim=-1, dtype=accum_dtype)
+    values_prefix = torch.zeros(B, C, 1, device=device, dtype=accum_dtype)
+    values_cumsum = torch.cat([values_prefix, values_cumsum], dim=-1)
     start_idx_vals = start_idx.view(B, 1, target_steps).expand(-1, C, -1)
     end_idx_vals = end_idx.view(B, 1, target_steps).expand(-1, C, -1)
     start_vals = torch.gather(values_cumsum, dim=-1, index=start_idx_vals)
