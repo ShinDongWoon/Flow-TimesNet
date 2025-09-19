@@ -419,9 +419,19 @@ class TimesBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         res = x
-        feats = [path(x) for path in self.paths]
-        z = torch.cat(feats, dim=1)
-        z = self.proj(z)
+        weight = self.proj.weight
+        bias = self.proj.bias
+        channels = res.size(1)
+        z = torch.zeros_like(res)
+        start = 0
+        for path in self.paths:
+            end = start + channels
+            weight_slice = weight.narrow(1, start, channels)
+            path_out = path(x)
+            z = z + F.conv2d(path_out, weight_slice, bias=bias)
+            bias = None
+            del path_out
+            start = end
         z = self.out_act(z)
         z = self.dropout(z)
         return z + res
