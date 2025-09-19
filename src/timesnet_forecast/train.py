@@ -615,6 +615,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         period_group_chunk=cfg["model"].get("period_group_chunk"),
         period_group_memory_ratio=cfg["model"].get("period_group_memory_ratio"),
         period_group_max_chunk_bytes=cfg["model"].get("period_group_max_chunk_bytes"),
+        period_group_recompute=cfg["model"].get("period_group_recompute"),
     ).to(device)
 
     # Lazily build model parameters so that downstream utilities see them
