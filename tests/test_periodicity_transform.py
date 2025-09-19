@@ -317,6 +317,8 @@ def test_periodicity_transform_take_gt_T_with_compile():
                 frequency_indices=freq_idx,
                 cycles=1,
                 period=self.pmax,
+                source_device=values.device,
+                source_dtype=values.dtype,
             )
             return [group]
 
