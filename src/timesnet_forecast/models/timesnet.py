@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 import torch
@@ -22,16 +23,137 @@ class PeriodGroup:
     source_dtype: torch.dtype
 
 
-def _accum_dtype(t: torch.Tensor) -> torch.dtype:
+def _accum_dtype(t: torch.Tensor | torch.dtype) -> torch.dtype:
     """Return a numerically stable accumulation dtype for ``t``.
 
     Half-precision dtypes accumulate in ``float32`` while other tensors keep
     their original dtype to preserve numerics.
     """
 
-    if t.dtype in {torch.float16, torch.bfloat16}:
+    dtype = t if isinstance(t, torch.dtype) else t.dtype
+    if dtype in {torch.float16, torch.bfloat16}:
         return torch.float32
-    return t.dtype
+    return dtype
+
+
+def _dtype_size(dtype: torch.dtype) -> int:
+    """Return the size in bytes for ``dtype``."""
+
+    return torch.tensor([], dtype=dtype).element_size()
+
+
+def _streaming_limit_bytes(device: torch.device) -> int:
+    """Resolve the byte budget for streaming pool operations."""
+
+    env_value = os.environ.get("TIMESNET_POOL_MAX_BYTES")
+    if env_value is not None:
+        try:
+            parsed = int(env_value)
+            if parsed > 0:
+                limit = parsed
+            else:
+                limit = None
+        except ValueError:
+            limit = None
+    else:
+        limit = None
+
+    if limit is None:
+        limit = 256 * 1024 * 1024  # 256MB default budget
+
+    if device.type == "cuda" and torch.cuda.is_available():
+        try:
+            device_index = device.index
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            free_bytes, _ = torch.cuda.mem_get_info(device_index)
+        except RuntimeError:
+            pass
+        else:
+            gpu_budget = int(free_bytes * 0.8)
+            if gpu_budget > 0:
+                limit = min(limit, gpu_budget)
+
+    return max(int(limit), 1)
+
+
+def _resolve_pool_sub_batch_size(
+    batch: int,
+    channels: int,
+    time_steps: int,
+    target_steps: int,
+    value_dtype: torch.dtype,
+    accum_dtype: torch.dtype,
+    device: torch.device,
+) -> int:
+    """Determine the maximum chunk size for streaming trailing pool ops."""
+
+    if batch <= 0:
+        return 0
+
+    accum_size = _dtype_size(accum_dtype)
+    value_size = _dtype_size(value_dtype)
+    count_size = _dtype_size(torch.long)
+
+    per_sample_bytes = (
+        channels * (time_steps + 1) * accum_size
+        + 2 * channels * target_steps * accum_size
+        + channels * target_steps * value_size
+        + target_steps * count_size
+    )
+    per_sample_bytes = max(per_sample_bytes, 1)
+
+    limit_bytes = _streaming_limit_bytes(device)
+    max_samples = max(1, limit_bytes // per_sample_bytes)
+    return min(batch, max_samples)
+
+
+def _pool_trailing_sums_small_batch(
+    values: torch.Tensor,
+    lengths: torch.Tensor,
+    target_steps: int,
+    total_time: int,
+    steps: torch.Tensor,
+    time_idx: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pool trailing sums for a small batch without further chunking."""
+
+    batch = values.size(0)
+    channels = values.size(1)
+    has_valid = lengths > 0
+    lengths_safe = torch.where(has_valid, lengths, torch.ones_like(lengths))
+
+    if not torch.all(lengths_safe == total_time):
+        start = (total_time - lengths_safe).view(batch, 1, 1)
+        range_mask = (time_idx >= start).to(values.dtype)
+        values = values * range_mask
+
+    offsets = (total_time - lengths_safe).view(batch, 1)
+    scaled = lengths_safe.view(batch, 1) * steps.view(1, -1)
+    start_rel = scaled[:, :-1] // target_steps
+    end_rel = (scaled[:, 1:] + target_steps - 1) // target_steps
+
+    start_idx = (start_rel + offsets).clamp(min=0, max=total_time)
+    end_idx = (end_rel + offsets).clamp(min=0, max=total_time)
+    counts = (end_idx - start_idx).clamp(min=1)
+
+    accum_dtype = _accum_dtype(values)
+    values_cumsum = torch.cumsum(values, dim=-1, dtype=accum_dtype)
+    prefix = torch.zeros(batch, channels, 1, device=values.device, dtype=accum_dtype)
+    values_cumsum = torch.cat([prefix, values_cumsum], dim=-1)
+
+    start_idx_vals = start_idx.view(batch, 1, target_steps).expand(-1, channels, -1)
+    end_idx_vals = end_idx.view(batch, 1, target_steps).expand(-1, channels, -1)
+    start_vals = torch.gather(values_cumsum, dim=-1, index=start_idx_vals)
+    end_vals = torch.gather(values_cumsum, dim=-1, index=end_idx_vals)
+    sum_vals = (end_vals - start_vals).to(values.dtype)
+
+    if not torch.all(has_valid):
+        keep_mask = has_valid.view(batch, 1, 1).to(sum_vals.dtype)
+        sum_vals = sum_vals * keep_mask
+        counts = counts * has_valid.view(batch, 1).to(counts.dtype)
+
+    return sum_vals, counts
 
 
 def _adaptive_pool_valid_lengths(
@@ -61,60 +183,72 @@ def _adaptive_pool_valid_lengths(
         raise ValueError("features must have a non-empty time dimension")
 
     target_steps = max(int(target_len), 1)
+    device = features.device
 
-    lengths = valid_lengths.clamp(min=1, max=T)
-    if not torch.all(lengths == T):
-        time_idx = torch.arange(T, device=features.device, dtype=valid_lengths.dtype)
-        time_idx = time_idx.view(1, 1, T)
-        start = (T - lengths).view(BN, 1, 1)
-        range_mask = (time_idx >= start).to(features.dtype)
-        features = features * range_mask
-        mask = mask * range_mask
+    lengths = valid_lengths.to(device=device, dtype=torch.long)
+    lengths = lengths.clamp(min=1, max=T)
 
-    offsets = (T - lengths).view(BN, 1)
-    steps = torch.arange(target_steps + 1, device=features.device, dtype=valid_lengths.dtype)
-    scaled = lengths.view(BN, 1) * steps.view(1, -1)
-    start_rel = scaled[:, :-1] // target_steps
-    end_rel = (scaled[:, 1:] + target_steps - 1) // target_steps
+    steps = torch.arange(target_steps + 1, device=device, dtype=lengths.dtype)
+    time_idx = torch.arange(T, device=device, dtype=lengths.dtype).view(1, 1, T)
 
-    start_idx = (start_rel + offsets).clamp(min=0, max=T)
-    end_idx = (end_rel + offsets).clamp(min=0, max=T)
-    counts = (end_idx - start_idx).clamp(min=1)
+    feat_chunk = _resolve_pool_sub_batch_size(
+        BN, features.size(1), T, target_steps, features.dtype, _accum_dtype(features), device
+    )
+
+    if mask.dtype.is_floating_point:
+        mask_value_dtype = mask.dtype
+    else:
+        mask_value_dtype = features.dtype if features.dtype.is_floating_point else torch.float32
+
+    mask_chunk = _resolve_pool_sub_batch_size(
+        BN, mask.size(1), T, target_steps, mask_value_dtype, _accum_dtype(mask_value_dtype), device
+    )
+
+    chunk_size = min(feat_chunk, mask_chunk)
+    if chunk_size >= BN:
+        feat_sums, counts = _pool_trailing_sums_small_batch(
+            features, lengths, target_steps, T, steps, time_idx
+        )
+        mask_input = mask if mask.dtype == mask_value_dtype else mask.to(mask_value_dtype)
+        mask_sums, _ = _pool_trailing_sums_small_batch(
+            mask_input, lengths, target_steps, T, steps, time_idx
+        )
+    else:
+        feat_chunks: List[torch.Tensor] = []
+        mask_chunks: List[torch.Tensor] = []
+        count_chunks: List[torch.Tensor] = []
+
+        for feat_part, mask_part, length_part in zip(
+            torch.split(features, chunk_size, dim=0),
+            torch.split(mask, chunk_size, dim=0),
+            torch.split(lengths, chunk_size, dim=0),
+        ):
+            feat_sum_part, count_part = _pool_trailing_sums_small_batch(
+                feat_part, length_part, target_steps, T, steps, time_idx
+            )
+            mask_values = (
+                mask_part
+                if mask_part.dtype == mask_value_dtype
+                else mask_part.to(mask_value_dtype)
+            )
+            mask_sum_part, _ = _pool_trailing_sums_small_batch(
+                mask_values, length_part, target_steps, T, steps, time_idx
+            )
+            feat_chunks.append(feat_sum_part)
+            mask_chunks.append(mask_sum_part)
+            count_chunks.append(count_part)
+
+        feat_sums = torch.cat(feat_chunks, dim=0)
+        mask_sums = torch.cat(mask_chunks, dim=0)
+        counts = torch.cat(count_chunks, dim=0)
 
     feat_accum_dtype = _accum_dtype(features)
-    feat_cumsum = torch.cumsum(features, dim=-1, dtype=feat_accum_dtype)
-    feat_prefix = torch.zeros(
-        BN, features.size(1), 1, device=features.device, dtype=feat_accum_dtype
-    )
-    feat_cumsum = torch.cat([feat_prefix, feat_cumsum], dim=-1)
-
-    mask_input = mask
-    if not mask.dtype.is_floating_point:
-        base_dtype = features.dtype if features.dtype.is_floating_point else torch.float32
-        mask_input = mask.to(base_dtype)
-    mask_accum_dtype = _accum_dtype(mask_input)
-    mask_cumsum = torch.cumsum(mask_input, dim=-1, dtype=mask_accum_dtype)
-    mask_prefix = torch.zeros(
-        BN, mask.size(1), 1, device=mask.device, dtype=mask_accum_dtype
-    )
-    mask_cumsum = torch.cat([mask_prefix, mask_cumsum], dim=-1)
-
-    start_idx_feat = start_idx.view(BN, 1, target_steps).expand(-1, features.size(1), -1)
-    end_idx_feat = end_idx.view(BN, 1, target_steps).expand(-1, features.size(1), -1)
-    feat_start = torch.gather(feat_cumsum, dim=-1, index=start_idx_feat)
-    feat_end = torch.gather(feat_cumsum, dim=-1, index=end_idx_feat)
-    feat_sum = feat_end - feat_start
-
-    start_idx_mask = start_idx.view(BN, 1, target_steps).expand(-1, mask.size(1), -1)
-    end_idx_mask = end_idx.view(BN, 1, target_steps).expand(-1, mask.size(1), -1)
-    mask_start = torch.gather(mask_cumsum, dim=-1, index=start_idx_mask)
-    mask_end = torch.gather(mask_cumsum, dim=-1, index=end_idx_mask)
-    mask_sum = mask_end - mask_start
-
     feat_denom = counts.view(BN, 1, target_steps).to(feat_accum_dtype)
+    pooled_feats = (feat_sums.to(feat_accum_dtype) / feat_denom).to(features.dtype)
+
+    mask_accum_dtype = _accum_dtype(mask_value_dtype)
     mask_denom = counts.view(BN, 1, target_steps).to(mask_accum_dtype)
-    pooled_feats = (feat_sum / feat_denom).to(features.dtype)
-    pooled_mask = (mask_sum / mask_denom).to(mask.dtype)
+    pooled_mask = (mask_sums.to(mask_accum_dtype) / mask_denom).to(mask.dtype)
     return pooled_feats, pooled_mask
 
 
@@ -153,40 +287,34 @@ def _pool_trailing_sums(
     device = values.device
     lengths = valid_lengths.to(device=device, dtype=torch.long)
     lengths = lengths.clamp(min=0, max=T)
-    has_valid = lengths > 0
-    lengths_safe = torch.where(has_valid, lengths, torch.ones_like(lengths))
 
-    if not torch.all(lengths_safe == T):
-        time_idx = torch.arange(T, device=device, dtype=lengths_safe.dtype)
-        time_idx = time_idx.view(1, 1, T)
-        start = (T - lengths_safe).view(B, 1, 1)
-        range_mask = (time_idx >= start).to(values.dtype)
-        values = values * range_mask
+    steps = torch.arange(target_steps + 1, device=device, dtype=lengths.dtype)
+    time_idx = torch.arange(T, device=device, dtype=lengths.dtype).view(1, 1, T)
 
-    offsets = (T - lengths_safe).view(B, 1)
-    steps = torch.arange(target_steps + 1, device=device, dtype=lengths_safe.dtype)
-    scaled = lengths_safe.view(B, 1) * steps.view(1, -1)
-    start_rel = scaled[:, :-1] // target_steps
-    end_rel = (scaled[:, 1:] + target_steps - 1) // target_steps
+    chunk_size = _resolve_pool_sub_batch_size(
+        B, C, T, target_steps, values.dtype, _accum_dtype(values), device
+    )
 
-    start_idx = (start_rel + offsets).clamp(min=0, max=T)
-    end_idx = (end_rel + offsets).clamp(min=0, max=T)
-    counts = (end_idx - start_idx).clamp(min=1)
+    if chunk_size >= B:
+        sum_vals, counts = _pool_trailing_sums_small_batch(
+            values, lengths, target_steps, T, steps, time_idx
+        )
+    else:
+        sum_chunks: List[torch.Tensor] = []
+        count_chunks: List[torch.Tensor] = []
 
-    accum_dtype = _accum_dtype(values)
-    values_cumsum = torch.cumsum(values, dim=-1, dtype=accum_dtype)
-    values_prefix = torch.zeros(B, C, 1, device=device, dtype=accum_dtype)
-    values_cumsum = torch.cat([values_prefix, values_cumsum], dim=-1)
-    start_idx_vals = start_idx.view(B, 1, target_steps).expand(-1, C, -1)
-    end_idx_vals = end_idx.view(B, 1, target_steps).expand(-1, C, -1)
-    start_vals = torch.gather(values_cumsum, dim=-1, index=start_idx_vals)
-    end_vals = torch.gather(values_cumsum, dim=-1, index=end_idx_vals)
-    sum_vals = (end_vals - start_vals).to(values.dtype)
+        for values_part, length_part in zip(
+            torch.split(values, chunk_size, dim=0),
+            torch.split(lengths, chunk_size, dim=0),
+        ):
+            sum_part, count_part = _pool_trailing_sums_small_batch(
+                values_part, length_part, target_steps, T, steps, time_idx
+            )
+            sum_chunks.append(sum_part)
+            count_chunks.append(count_part)
 
-    if not torch.all(has_valid):
-        keep_mask = has_valid.view(B, 1, 1).to(sum_vals.dtype)
-        sum_vals = sum_vals * keep_mask
-        counts = counts * has_valid.view(B, 1).expand_as(counts).to(counts.dtype)
+        sum_vals = torch.cat(sum_chunks, dim=0)
+        counts = torch.cat(count_chunks, dim=0)
 
     return sum_vals, counts
 
