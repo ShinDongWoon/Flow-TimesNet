@@ -1,1 +1,3 @@
 tests/test_global_pmax.py
+tests/test_global_pmax.py
+*.py
