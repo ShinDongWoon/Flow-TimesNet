@@ -115,6 +115,7 @@ def test_pmax_cap_applied(tmp_path):
 
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
 
 def test_short_periods_clamped_to_input_len(tmp_path):
     periods = 40
@@ -225,6 +226,8 @@ def test_short_periods_clamped_to_input_len(tmp_path):
     assert xb.shape[1] == input_len
     assert xb.shape[1] == int(cfg["model"]["pmax"])
 
+=======
+>>>>>>> parent of 11c1c96 (Fix duplicate import in test_global_pmax)
 =======
 >>>>>>> parent of 11c1c96 (Fix duplicate import in test_global_pmax)
 =======
