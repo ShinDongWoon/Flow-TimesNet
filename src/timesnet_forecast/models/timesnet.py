@@ -18,6 +18,8 @@ class PeriodGroup:
     frequency_indices: torch.Tensor
     cycles: int
     period: int
+    source_device: torch.device
+    source_dtype: torch.dtype
 
 
 def _accum_dtype(t: torch.Tensor) -> torch.dtype:
@@ -358,7 +360,15 @@ class PeriodicityTransform(nn.Module):
             seq_subset = seqs.index_select(0, bn_sel)
             tiles = seq_subset.index_select(1, gather_idx)
             tiles = tiles.reshape(-1, cycles_int, period_int).contiguous()
-
+            source_device = tiles.device
+            source_dtype = tiles.dtype
+            tiles = tiles.to("cpu", non_blocking=True)
+            if tiles.device.type == "cpu" and torch.cuda.is_available():
+                try:
+                    tiles = tiles.pin_memory()
+                except RuntimeError:
+                    pass
+            tiles = tiles.contiguous()
             out.append(
                 PeriodGroup(
                     values=tiles,
@@ -366,6 +376,8 @@ class PeriodicityTransform(nn.Module):
                     frequency_indices=freq_sel,
                     cycles=cycles_int,
                     period=period_int,
+                    source_device=source_device,
+                    source_dtype=source_dtype,
                 )
             )
 
@@ -530,7 +542,7 @@ class TimesNet(nn.Module):
     def _resolve_period_group_chunk(
         self,
         group: PeriodGroup,
-        dtype: torch.dtype | None,
+        target_device: torch.device | None,
         running_budget: dict[str, int] | None = None,
         remaining_tiles: int | None = None,
     ) -> int:
@@ -552,7 +564,9 @@ class TimesNet(nn.Module):
         if self.period_group_chunk is not None:
             chunk_limit = max(1, min(chunk_limit, int(self.period_group_chunk)))
 
-        dtype_obj = dtype or group.values.dtype
+        dtype_obj = getattr(group, "source_dtype", None)
+        if not isinstance(dtype_obj, torch.dtype):
+            dtype_obj = group.values.dtype
         try:
             element_size = torch.tensor(0, dtype=dtype_obj).element_size()
         except TypeError:
@@ -599,9 +613,21 @@ class TimesNet(nn.Module):
         ratio = min(max(ratio, 1e-4), 1.0)
 
         budget_bytes: int | None = None
-        if group.values.is_cuda and torch.cuda.is_available():
+        resolved_device: torch.device | None
+        if target_device is not None:
+            resolved_device = torch.device(target_device)
+        else:
+            resolved_device = getattr(group, "source_device", None)
+            if resolved_device is not None:
+                resolved_device = torch.device(resolved_device)
+
+        if (
+            resolved_device is not None
+            and resolved_device.type == "cuda"
+            and torch.cuda.is_available()
+        ):
             try:
-                free_bytes, _ = torch.cuda.mem_get_info(group.values.device)
+                free_bytes, _ = torch.cuda.mem_get_info(resolved_device)
             except Exception:
                 free_bytes = None
             if free_bytes is not None:
@@ -737,22 +763,24 @@ class TimesNet(nn.Module):
         input_window = int(max(1, min(T, self.input_len)))
         features = x.new_zeros(BN, self.d_model, input_window)
         coverage = x.new_zeros(BN, 1, input_window)
+        frontend_param = next(iter(self.frontend.parameters()), None)
+        if frontend_param is not None:
+            conv_device = frontend_param.device
+            conv_dtype = frontend_param.dtype
+        else:
+            conv_device = features.device
+            conv_dtype = features.dtype
         for group in groups:
             total_tiles = group.values.size(0)
             if total_tiles == 0:
                 continue
-            chunk_dtype = (
-                group.values.dtype
-                if isinstance(group.values, torch.Tensor)
-                else x.dtype
-            )
             budget_state: dict[str, int] = {}
             start_idx = 0
             while start_idx < total_tiles:
                 remaining_tiles = total_tiles - start_idx
                 chunk_size = self._resolve_period_group_chunk(
                     group=group,
-                    dtype=chunk_dtype,
+                    target_device=conv_device,
                     running_budget=budget_state,
                     remaining_tiles=remaining_tiles,
                 )
@@ -769,6 +797,18 @@ class TimesNet(nn.Module):
                 start_idx = end_idx
                 if values_chunk.numel() == 0:
                     continue
+                copy_non_blocking = (
+                    conv_device.type == "cuda"
+                    and torch.cuda.is_available()
+                    and values_chunk.device.type == "cpu"
+                    and values_chunk.is_pinned()
+                )
+                values_chunk = values_chunk.to(
+                    device=conv_device,
+                    dtype=conv_dtype,
+                    non_blocking=copy_non_blocking,
+                )
+                values_chunk = values_chunk.contiguous()
                 tiles = values_chunk.unsqueeze(1)  # [M, 1, C, P]
                 tiles = self.frontend(tiles)
                 for blk in self.blocks:

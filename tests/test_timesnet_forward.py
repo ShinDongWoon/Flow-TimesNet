@@ -272,6 +272,8 @@ def test_period_group_chunk_helper_caps_size(monkeypatch):
         frequency_indices=freq_indices,
         cycles=cycles,
         period=period,
+        source_device=values.device,
+        source_dtype=values.dtype,
     )
 
     monkeypatch.setattr(model.period, "forward", lambda *args, **kwargs: [fake_group])
@@ -287,7 +289,12 @@ def test_period_group_chunk_helper_caps_size(monkeypatch):
             mu_full, sigma_full = model(x)
 
             model.period_group_chunk = None
-            chunk_size = model._resolve_period_group_chunk(fake_group, dtype=dtype)
+            frontend_param = next(iter(model.frontend.parameters()), None)
+            target_device = frontend_param.device if frontend_param is not None else x.device
+            chunk_size = model._resolve_period_group_chunk(
+                fake_group,
+                target_device=target_device,
+            )
             assert chunk_size < tile_count
 
             mu_chunk, sigma_chunk = model(x)
@@ -331,6 +338,8 @@ def test_period_group_chunks_shrink_with_budget(monkeypatch):
         frequency_indices=freq_indices,
         cycles=cycles,
         period=period,
+        source_device=values.device,
+        source_dtype=values.dtype,
     )
 
     monkeypatch.setattr(model.period, "forward", lambda *args, **kwargs: [fake_group])
