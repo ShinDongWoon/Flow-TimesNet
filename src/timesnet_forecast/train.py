@@ -524,21 +524,16 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             val_mask_arrays.append(va_mask_df.to_numpy(dtype=np.float32, copy=False))
 
     # --- compute global period length
-    cfg.setdefault("model", {})
-    input_len = int(cfg["model"]["input_len"])
     k_periods = int(cfg["model"].get("k_periods", 0))
     pmax_cap = int(cfg["model"].get("pmax_cap", 730))
-    if input_len > pmax_cap:
-        raise ValueError(
-            "model.input_len cannot exceed model.pmax_cap; increase the cap to retain full history"
-        )
     pmax_global = _compute_pmax_global(train_arrays, k_periods, pmax_cap)
-    pmax_global = max(pmax_global, input_len)
+    cfg.setdefault("model", {})
     cfg["model"]["pmax"] = int(pmax_global)
     min_period_threshold = int(cfg["model"].get("min_period_threshold", 1))
     cfg["model"]["min_period_threshold"] = min_period_threshold
 
     # --- dataloaders
+    input_len = int(cfg["model"]["input_len"])
     pred_len = int(cfg["model"]["pred_len"])
     mode = cfg["model"]["mode"]
     dl_train = _build_dataloader(
