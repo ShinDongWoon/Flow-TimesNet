@@ -184,15 +184,18 @@ class TimesBlock(nn.Module):
 
     def _build(self, device: torch.device, dtype: torch.dtype) -> None:
         self.paths = nn.ModuleList()
+        self.pad_specs: list[tuple[int, int]] = []
         for k in self.kernel_set:
-            pad_h = max((k - 1) // 2, 0)
+            pad_top = max(k // 2, 0)
+            pad_bottom = max(k - 1 - pad_top, 0)
             conv = nn.Conv2d(
                 1,
                 self.d_model,
                 kernel_size=(k, 1),
-                padding=(pad_h, 0),
+                padding=(0, 0),
             ).to(device=device, dtype=dtype)
             self.paths.append(conv)
+            self.pad_specs.append((pad_top, pad_bottom))
         proj_in = self.d_model * (len(self.kernel_set) + 1)
         self.proj = nn.Conv1d(proj_in, self.d_model, kernel_size=1).to(
             device=device, dtype=dtype
@@ -215,8 +218,12 @@ class TimesBlock(nn.Module):
         mask = mask.to(dtype=folded.dtype)
         mask2d = mask.unsqueeze(1)
         feats = []
-        for path in self.paths:
-            feats.append(path(base))  # [B, d_model, KC, L]
+        for path, (pad_top, pad_bottom) in zip(self.paths, self.pad_specs):
+            if pad_top or pad_bottom:
+                padded = F.pad(base, (0, 0, pad_top, pad_bottom))
+            else:
+                padded = base
+            feats.append(path(padded))  # [B, d_model, KC, L]
         if feats:
             z_paths = torch.cat(feats, dim=1)
             mask_exp = mask2d.expand(-1, z_paths.size(1), -1, -1)
