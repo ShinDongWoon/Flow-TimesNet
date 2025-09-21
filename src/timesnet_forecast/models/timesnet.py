@@ -193,9 +193,10 @@ class TimesBlock(nn.Module):
                 padding=(pad_h, 0),
             ).to(device=device, dtype=dtype)
             self.paths.append(conv)
-        self.proj = nn.Conv1d(
-            self.d_model * len(self.kernel_set), self.d_model, kernel_size=1
-        ).to(device=device, dtype=dtype)
+        proj_in = self.d_model * (len(self.kernel_set) + 1)
+        self.proj = nn.Conv1d(proj_in, self.d_model, kernel_size=1).to(
+            device=device, dtype=dtype
+        )
         self.inner_dropout = nn.Dropout(self.dropout_p)
         self._built = True
 
@@ -216,13 +217,18 @@ class TimesBlock(nn.Module):
         feats = []
         for path in self.paths:
             feats.append(path(base))  # [B, d_model, KC, L]
-        z = torch.cat(feats, dim=1)
-        mask_exp = mask2d.expand(-1, z.size(1), -1, -1)
-        z = z * mask_exp
-        eps = torch.finfo(z.dtype).eps
-        denom = mask.sum(dim=1, keepdim=True)  # [B, 1, L]
-        z = z.sum(dim=2) / (denom + eps)
-        z = self.proj(z)
+        if feats:
+            z_paths = torch.cat(feats, dim=1)
+            mask_exp = mask2d.expand(-1, z_paths.size(1), -1, -1)
+            z_paths = z_paths * mask_exp
+            eps = torch.finfo(z_paths.dtype).eps
+            denom = mask.sum(dim=1, keepdim=True)  # [B, 1, L]
+            z_paths = z_paths.sum(dim=2) / (denom + eps)
+        else:
+            steps = folded.size(-1)
+            z_paths = folded.new_zeros(folded.size(0), 0, steps)
+        combined = torch.cat([z_paths, features], dim=1)
+        z = self.proj(combined)
         z = self.act_layer(z)
         z = self.inner_dropout(z)
         if step_mask is not None:
