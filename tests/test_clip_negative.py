@@ -52,7 +52,7 @@ def test_clip_negative(tmp_path, monkeypatch):
         "model.n_layers=1",
         "model.dropout=0.0",
         "model.k_periods=2",
-        "model.kernel_set=[3]",
+        "model.kernel_set=[[3,3]]",
         "train.lr=1e-3",
         "train.weight_decay=0.0",
         "train.grad_clip_norm=0.0",

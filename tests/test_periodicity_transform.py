@@ -4,7 +4,6 @@ import sys
 from typing import Tuple
 
 import torch
-import torch.nn.functional as F
 
 # Ensure the project src is on the path for imports
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
@@ -18,14 +17,14 @@ def _periodicity_transform_naive(
     """Reference implementation using explicit loops for verification."""
     B, T, N = x.shape
     if k <= 0:
-        empty = x.new_zeros(B, N, 0, pmax)
+        empty = x.new_zeros(B, N, 0, 1, pmax)
         return empty, empty
 
     seqs = x.permute(0, 2, 1).reshape(B * N, T)
     kidx = PeriodicityTransform._topk_freq(seqs, k)
     K = kidx.size(1)
     if K == 0 or kidx.numel() == 0:
-        empty = x.new_zeros(B, N, 0, pmax)
+        empty = x.new_zeros(B, N, max(k, 0), 1, pmax)
         return empty, empty
 
     kidx = kidx.view(B, N, K)
@@ -34,7 +33,7 @@ def _periodicity_transform_naive(
     cycles = torch.clamp(T // P, min=1)
     Cmax = int(torch.clamp(cycles.max(), min=1).item())
 
-    folded = x.new_zeros(B, N, K * Cmax, pmax)
+    folded = x.new_zeros(B, N, K, Cmax, pmax)
     mask = torch.zeros_like(folded)
     for b in range(B):
         for n in range(N):
@@ -45,14 +44,17 @@ def _periodicity_transform_naive(
                     continue
                 take = cycle * period
                 base = max(T - take, 0)
-                slot = ki * Cmax
                 for c in range(Cmax):
                     for p in range(pmax):
                         if c < cycle and p < period:
                             idx = base + c * period + p
                             idx = min(max(idx, 0), T - 1)
-                            folded[b, n, slot + c, p] = x[b, idx, n]
-                            mask[b, n, slot + c, p] = 1.0
+                            folded[b, n, ki, c, p] = x[b, idx, n]
+                            mask[b, n, ki, c, p] = 1.0
+    if K < k:
+        pad_shape = (B, N, k - K, Cmax, pmax)
+        folded = torch.cat([folded, folded.new_zeros(pad_shape)], dim=2)
+        mask = torch.cat([mask, mask.new_zeros(pad_shape)], dim=2)
     return folded, mask
 
 
@@ -73,9 +75,9 @@ def test_periodicity_transform_period_length_consistency():
 
     assert folded.shape == mask.shape
     assert folded.shape[:2] == (B, N)
+    assert folded.shape[2] == k
     assert folded.shape[-1] == T
-    assert folded.shape[2] % k == 0
-    assert torch.all((mask > 0).any(dim=(2, 3)))
+    assert torch.all((mask > 0).any(dim=(2, 3, 4)))
 
 
 def test_periodicity_transform_matches_naive():
@@ -106,8 +108,8 @@ def test_periodicity_transform_min_period_threshold_expands_period():
     out_high, mask_high = high(x)
 
     # With the higher minimum period, more slots along P dimension remain populated.
-    low_active = (mask_low > 0).any(dim=2).squeeze(0).squeeze(0)
-    high_active = (mask_high > 0).any(dim=2).squeeze(0).squeeze(0)
+    low_active = (mask_low > 0).any(dim=(2, 3)).squeeze(0).squeeze(0)
+    high_active = (mask_high > 0).any(dim=(2, 3)).squeeze(0).squeeze(0)
     nz_low = torch.count_nonzero(low_active)
     nz_high = torch.count_nonzero(high_active)
 
@@ -153,8 +155,12 @@ def test_periodicity_transform_take_gt_T_with_compile():
             mask = (mask_c & mask_p).to(gathered.dtype)
             gathered = gathered * mask
 
-            gathered = gathered.reshape(B, N, K * gathered.size(2), Pmax)
-            flat_mask = mask.reshape(B, N, K * mask.size(2), Pmax)
+            gathered = gathered.view(B, N, K, gathered.size(2), Pmax)
+            flat_mask = mask.view(B, N, K, mask.size(2), Pmax)
+            if K < self.k:
+                pad_shape = (B, N, self.k - K, gathered.size(3), Pmax)
+                gathered = torch.cat([gathered, gathered.new_zeros(pad_shape)], dim=2)
+                flat_mask = torch.cat([flat_mask, flat_mask.new_zeros(pad_shape)], dim=2)
             return gathered, flat_mask
 
     transform = DegenerateTransform(k_periods=1, pmax=T + 2)
