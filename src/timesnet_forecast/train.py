@@ -167,7 +167,7 @@ def _compute_pmax_global(arrays: List[np.ndarray], k: int, cap: int) -> int:
         if arr.size == 0:
             continue
         x = torch.from_numpy(arr.T.astype(np.float32))  # [N, T]
-        kidx = PeriodicityTransform._topk_freq(x, k)
+        kidx, _ = PeriodicityTransform._topk_freq(x, k)
         if kidx.numel() == 0:
             continue
         periods = torch.clamp(x.shape[-1] // torch.clamp(kidx, min=1), min=1)

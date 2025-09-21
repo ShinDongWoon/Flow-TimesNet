@@ -21,7 +21,7 @@ def _periodicity_transform_naive(
         return empty, empty
 
     seqs = x.permute(0, 2, 1).reshape(B * N, T)
-    kidx = PeriodicityTransform._topk_freq(seqs, k)
+    kidx, _ = PeriodicityTransform._topk_freq(seqs, k)
     K = kidx.size(1)
     if K == 0 or kidx.numel() == 0:
         empty = x.new_zeros(B, N, max(k, 0), 1, pmax)
@@ -71,7 +71,7 @@ def test_periodicity_transform_period_length_consistency():
 
     k = 1
     transform = PeriodicityTransform(k, pmax=T)
-    folded, mask = transform(x)
+    folded, mask, _ = transform(x)
 
     assert folded.shape == mask.shape
     assert folded.shape[:2] == (B, N)
@@ -88,24 +88,28 @@ def test_periodicity_transform_matches_naive():
     pmax = T
     out_ref, mask_ref = _periodicity_transform_naive(x, k, pmax)
     transform = PeriodicityTransform(k, pmax=pmax)
-    out_vec, mask_vec = transform(x)
+    out_vec, mask_vec, _ = transform(x)
     assert torch.allclose(out_vec, out_ref, atol=1e-6)
     assert torch.allclose(mask_vec, mask_ref, atol=1e-6)
 
 
 def test_periodicity_transform_min_period_threshold_expands_period():
     class FixedFreqTransform(PeriodicityTransform):
-        def _topk_freq(self, x: torch.Tensor, k: int) -> torch.Tensor:  # type: ignore[override]
+        def _topk_freq(
+            self, x: torch.Tensor, k: int
+        ) -> Tuple[torch.Tensor, torch.Tensor]:  # type: ignore[override]
             BN = x.shape[0]
-            return torch.full((BN, k), 20, dtype=torch.long, device=x.device)
+            idx = torch.full((BN, k), 20, dtype=torch.long, device=x.device)
+            amp = torch.ones((BN, k), dtype=x.dtype, device=x.device)
+            return idx, amp
 
     x = torch.arange(1, 51, dtype=torch.float32).view(1, 50, 1)
 
     low = FixedFreqTransform(k_periods=1, pmax=10, min_period_threshold=1)
     high = FixedFreqTransform(k_periods=1, pmax=10, min_period_threshold=6)
 
-    out_low, mask_low = low(x)
-    out_high, mask_high = high(x)
+    out_low, mask_low, _ = low(x)
+    out_high, mask_high, _ = high(x)
 
     # With the higher minimum period, more slots along P dimension remain populated.
     low_active = (mask_low > 0).any(dim=(2, 3)).squeeze(0).squeeze(0)
@@ -124,7 +128,9 @@ def test_periodicity_transform_take_gt_T_with_compile():
     x = torch.randn(B, T, N)
 
     class DegenerateTransform(PeriodicityTransform):
-        def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:  # type: ignore[override]
+        def forward(
+            self, x: torch.Tensor
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:  # type: ignore[override]
             B, T, N = x.shape
             seqs = x.permute(0, 2, 1).reshape(B * N, T)
             kidx = torch.ones(B * N, self.k, dtype=torch.long, device=x.device)
@@ -161,11 +167,12 @@ def test_periodicity_transform_take_gt_T_with_compile():
                 pad_shape = (B, N, self.k - K, gathered.size(3), Pmax)
                 gathered = torch.cat([gathered, gathered.new_zeros(pad_shape)], dim=2)
                 flat_mask = torch.cat([flat_mask, flat_mask.new_zeros(pad_shape)], dim=2)
-            return gathered, flat_mask
+            amp = torch.ones(B, N, self.k, dtype=gathered.dtype, device=gathered.device)
+            return gathered, flat_mask, amp
 
     transform = DegenerateTransform(k_periods=1, pmax=T + 2)
     compiled = torch.compile(transform)
-    folded, mask = compiled(x)
+    folded, mask, _ = compiled(x)
     assert folded.shape == mask.shape
     assert folded.shape[-1] == T + 2
 

@@ -20,38 +20,47 @@ class PeriodicityTransform(nn.Module):
         self.min_period_threshold = int(min(self.pmax, min_thresh))
 
     @staticmethod
-    def _topk_freq(x: torch.Tensor, k: int) -> torch.Tensor:
-        """Return indices of top-k nonzero frequencies.
+    def _topk_freq(x: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return indices of top-k nonzero frequencies alongside amplitudes.
 
         Args:
             x: [..., T] 실수 시퀀스
             k: 선택할 빈도 수
 
         Returns:
-            torch.Tensor: [..., k] 형태의 주파수 인덱스
+            Tuple[torch.Tensor, torch.Tensor]:
+                - [..., k] 형태의 주파수 인덱스
+                - [..., k] 형태의 주파수 진폭
         """
         T = x.size(-1)
         spec = torch.fft.rfft(x, dim=-1)
-        mag2 = spec.real**2 + spec.imag**2
-        mag2[..., 0] = 0.0  # DC 성분 제외
-        k = min(k, mag2.size(-1) - 1) if mag2.size(-1) > 1 else 0
+        amp = torch.abs(spec)
+        if amp.size(-1) > 0:
+            amp[..., 0] = 0.0  # DC 성분 제외
+        avail = amp.size(-1) - 1 if amp.size(-1) > 1 else 0
+        k = min(k, avail) if avail > 0 else 0
         if k <= 0:
-            shape = list(x.shape[:-1]) + [1]
-            return torch.ones(shape, dtype=torch.long, device=x.device)
-        topk = torch.topk(mag2, k=k, dim=-1).indices
-        topk = torch.clamp(topk, min=1)
-        return topk
+            idx_shape = list(x.shape[:-1]) + [0]
+            empty_idx = torch.zeros(idx_shape, dtype=torch.long, device=x.device)
+            empty_amp = torch.zeros(idx_shape, dtype=amp.dtype, device=x.device)
+            return empty_idx, empty_amp
+        values, indices = torch.topk(amp, k=k, dim=-1)
+        indices = torch.clamp(indices, min=1)
+        return indices, values
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Vectorised period folding.
 
         Args:
             x: [B, T, N]
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
                 folded tensor [B, N, K, C_max, P_max]
                 mask tensor   [B, N, K, C_max, P_max]
+                amplitude      [B, N, K]
         """
         B, T, N = x.shape
         # Flatten batch & channel for joint processing
@@ -59,14 +68,16 @@ class PeriodicityTransform(nn.Module):
 
         if self.k <= 0:
             empty = x.new_zeros(B, N, 0, 1, self.pmax)
-            return empty, empty
+            empty_amp = x.new_zeros(B, N, 0)
+            return empty, empty, empty_amp
 
-        kidx = self._topk_freq(seqs, self.k)  # [BN, K]
+        kidx, kamp = self._topk_freq(seqs, self.k)  # [BN, K]
         K = kidx.size(1)
         if K == 0 or kidx.numel() == 0:
             Kpad = max(int(self.k), 0)
             empty = x.new_zeros(B, N, Kpad, 1, self.pmax)
-            return empty, empty
+            empty_amp = x.new_zeros(B, N, Kpad)
+            return empty, empty, empty_amp
 
         # Compute period lengths and cycles
         P = T // torch.clamp(kidx, min=1)
@@ -101,13 +112,16 @@ class PeriodicityTransform(nn.Module):
         Cmax = gathered.size(2)
         gathered = gathered.reshape(B, N, K, Cmax, Pmax)
         flat_mask = mask.reshape(B, N, K, Cmax, Pmax)
+        kamp = kamp.reshape(B, N, K)
         if K < self.k:
             pad_shape = (B, N, self.k - K, Cmax, Pmax)
             gathered_pad = gathered.new_zeros(pad_shape)
             mask_pad = flat_mask.new_zeros(pad_shape)
             gathered = torch.cat([gathered, gathered_pad], dim=2)
             flat_mask = torch.cat([flat_mask, mask_pad], dim=2)
-        return gathered, flat_mask
+            amp_pad = kamp.new_zeros(B, N, self.k - K)
+            kamp = torch.cat([kamp, amp_pad], dim=2)
+        return gathered, flat_mask, kamp
 
 
 class InceptionBlock(nn.Module):
@@ -200,6 +214,7 @@ class TimesBlock(nn.Module):
         folded: torch.Tensor,
         mask: torch.Tensor,
         step_mask: torch.Tensor | None = None,
+        freq_amp: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Project folded 2D inputs into a 1D residual update."""
 
@@ -223,7 +238,40 @@ class TimesBlock(nn.Module):
             torch.zeros_like(max_pool),
         )
         pooled = torch.cat([avg_pool, max_pool], dim=1)
-        combined = torch.cat([pooled, features], dim=1)
+
+        # Compute per-period 1D reconstructions and apply amplitude-based weights.
+        branch_sum = conv_in.sum(dim=2)
+        branch_weight = mask.sum(dim=2)
+        branch_recon = branch_sum / (branch_weight + eps)
+        branch_recon = branch_recon * (branch_weight > 0).to(dtype=branch_recon.dtype)
+
+        branch_valid = mask.amax(dim=(2, 3)) > 0
+        if freq_amp is not None and freq_amp.numel() > 0:
+            amp = freq_amp.to(dtype=branch_recon.dtype)
+            invalid_fill = torch.finfo(branch_recon.dtype).min
+            amp = torch.where(
+                branch_valid,
+                amp,
+                torch.full_like(amp, invalid_fill),
+            )
+            weight_logits = amp
+            branch_weights = F.softmax(weight_logits, dim=1)
+        else:
+            branch_weights = branch_valid.to(dtype=branch_recon.dtype)
+        branch_weights = branch_weights * branch_valid.to(dtype=branch_recon.dtype)
+        weight_denom = branch_weights.sum(dim=1, keepdim=True)
+        weight_safe = torch.where(
+            weight_denom > 0,
+            branch_weights / (weight_denom + eps),
+            torch.zeros_like(branch_weights),
+        )
+        weighted_recon = (branch_recon * weight_safe.unsqueeze(-1)).sum(dim=1, keepdim=True)
+        weighted_recon = weighted_recon.expand(-1, features.size(1), -1)
+        if step_mask is not None:
+            weighted_recon = weighted_recon * step_mask.to(dtype=weighted_recon.dtype)
+        features_mod = features + weighted_recon
+
+        combined = torch.cat([pooled, features_mod], dim=1)
         z = self.fuse(combined)
         z = self.act_layer(z)
         z = self.inner_dropout(z)
@@ -334,7 +382,7 @@ class TimesNet(nn.Module):
                     "min_sigma_vector length does not match number of series"
                 )
             sigma_floor = self.min_sigma_vector
-        z_all, mask_all = self.period(x)
+        z_all, mask_all, amp_all = self.period(x)
         BN = B * N
         K = z_all.size(2)
         if K == 0:
@@ -348,6 +396,7 @@ class TimesNet(nn.Module):
         folded = z_all.reshape(BN, K, z_all.size(3), z_all.size(4))
         mask = mask_all.reshape(BN, K, mask_all.size(3), mask_all.size(4))
         mask = mask.to(dtype=folded.dtype)
+        freq_amp = amp_all.reshape(BN, K)
         cycle_weight = mask.sum(dim=2)
         eps = torch.finfo(folded.dtype).eps
         aggregated = (folded * mask).sum(dim=2) / (cycle_weight + eps)
@@ -360,15 +409,16 @@ class TimesNet(nn.Module):
         for blk in self.blocks:
             if self.use_checkpoint:
                 delta = checkpoint(
-                    lambda inp, fold, m, s: blk(inp, fold, m, s),
+                    lambda inp, fold, m, s, a: blk(inp, fold, m, s, a),
                     features,
                     folded,
                     mask,
                     step_mask,
+                    freq_amp,
                     use_reentrant=False,
                 )
             else:
-                delta = blk(features, folded, mask, step_mask)
+                delta = blk(features, folded, mask, step_mask, freq_amp)
             delta = self.residual_dropout(delta)
             features = features + delta
         z = features * step_mask
