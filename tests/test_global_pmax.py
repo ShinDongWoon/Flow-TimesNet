@@ -72,7 +72,7 @@ def test_pmax_cap_applied(tmp_path):
         "model.n_layers=1",
         "model.dropout=0.0",
         "model.k_periods=1",
-        "model.kernel_set=[3]",
+        "model.kernel_set=[[3,3]]",
         "model.pmax_cap=5",
         "train.lr=1e-3",
         "train.weight_decay=0.0",
