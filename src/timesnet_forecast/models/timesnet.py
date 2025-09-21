@@ -189,13 +189,15 @@ class TimesBlock(nn.Module):
         kernel_set: Sequence[Sequence[int] | int | Tuple[int, int]],
         dropout: float,
         activation: str,
+        pmax: int,
+        min_period_threshold: int,
     ) -> None:
         super().__init__()
         self.period_channels = int(period_channels)
         self.d_model = int(d_model)
         self.inception = InceptionBlock(
             in_ch=self.period_channels,
-            out_ch=self.d_model,
+            out_ch=1,
             kernel_set=kernel_set,
             dropout=dropout,
             act=activation,
@@ -207,45 +209,70 @@ class TimesBlock(nn.Module):
         else:
             self.act_layer = nn.GELU()
         self.inner_dropout = nn.Dropout(dropout)
+        self.period_transform = PeriodicityTransform(
+            k_periods=self.period_channels,
+            pmax=int(pmax),
+            min_period_threshold=int(min_period_threshold),
+        )
 
     def forward(
         self,
         features: torch.Tensor,
-        folded: torch.Tensor,
-        mask: torch.Tensor,
         step_mask: torch.Tensor | None = None,
-        freq_amp: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Project folded 2D inputs into a 1D residual update."""
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fold the 1D feature map and compute a residual update."""
 
-        mask = mask.to(dtype=folded.dtype)
+        B_eff, channel_count, seq_len = features.shape
+        device = features.device
+        dtype = features.dtype
+        self.period_transform = self.period_transform.to(device=device, dtype=dtype)
+        if step_mask is not None:
+            features_in = features * step_mask.to(dtype=dtype)
+        else:
+            features_in = features
+
+        seq = features_in.reshape(B_eff * channel_count, seq_len)
+        seq = seq.unsqueeze(-1)
+        folded, mask, freq_amp = self.period_transform(seq)
+        if folded.numel() == 0:
+            zero_update = torch.zeros_like(features)
+            if step_mask is not None:
+                new_mask = step_mask.to(dtype=dtype)
+            else:
+                new_mask = torch.zeros(B_eff, 1, seq_len, device=device, dtype=dtype)
+            return zero_update, new_mask
+
+        K = folded.size(2)
+        cycles = folded.size(3)
+        periods = folded.size(4)
+        folded = folded.reshape(B_eff, channel_count, K, cycles, periods)
+        mask = mask.reshape(B_eff, channel_count, K, cycles, periods).to(dtype=folded.dtype)
+        freq_amp = freq_amp.reshape(B_eff, channel_count, K)
+
         conv_in = folded * mask
-        z2d = self.inception(conv_in)
-        cycle_mask = mask.amax(dim=1, keepdim=False)  # [B, C, P]
-        cycle_mask = cycle_mask.unsqueeze(1)  # [B, 1, C, P]
+        conv_in_flat = conv_in.reshape(B_eff * channel_count, K, cycles, periods)
+        z2d_flat = self.inception(conv_in_flat)
+        z2d = z2d_flat.reshape(B_eff, channel_count, -1, cycles, periods).squeeze(2)
+
+        cycle_mask = mask.amax(dim=2)
         weights = cycle_mask.to(dtype=z2d.dtype)
         eps = torch.finfo(z2d.dtype).eps
         weighted = z2d * weights
         avg_pool = weighted.sum(dim=2) / (weights.sum(dim=2) + eps)
         max_mask = cycle_mask > 0
         neg_fill = torch.finfo(z2d.dtype).min
-        masked = z2d.masked_fill(~max_mask.expand_as(z2d), neg_fill)
+        masked = z2d.masked_fill(~max_mask, neg_fill)
         max_pool = masked.max(dim=2).values
         valid_steps = max_mask.any(dim=2).to(dtype=max_pool.dtype)
-        max_pool = torch.where(
-            valid_steps.expand_as(max_pool) > 0,
-            max_pool,
-            torch.zeros_like(max_pool),
-        )
+        max_pool = torch.where(valid_steps > 0, max_pool, torch.zeros_like(max_pool))
         pooled = torch.cat([avg_pool, max_pool], dim=1)
 
-        # Compute per-period 1D reconstructions and apply amplitude-based weights.
-        branch_sum = conv_in.sum(dim=2)
-        branch_weight = mask.sum(dim=2)
+        branch_sum = conv_in.sum(dim=3)
+        branch_weight = mask.sum(dim=3)
         branch_recon = branch_sum / (branch_weight + eps)
         branch_recon = branch_recon * (branch_weight > 0).to(dtype=branch_recon.dtype)
 
-        branch_valid = mask.amax(dim=(2, 3)) > 0
+        branch_valid = mask.amax(dim=(3, 4)) > 0
         if freq_amp is not None and freq_amp.numel() > 0:
             amp = freq_amp.to(dtype=branch_recon.dtype)
             invalid_fill = torch.finfo(branch_recon.dtype).min
@@ -255,29 +282,35 @@ class TimesBlock(nn.Module):
                 torch.full_like(amp, invalid_fill),
             )
             weight_logits = amp
-            branch_weights = F.softmax(weight_logits, dim=1)
+            branch_weights = F.softmax(weight_logits, dim=2)
         else:
             branch_weights = branch_valid.to(dtype=branch_recon.dtype)
         branch_weights = branch_weights * branch_valid.to(dtype=branch_recon.dtype)
-        weight_denom = branch_weights.sum(dim=1, keepdim=True)
+        weight_denom = branch_weights.sum(dim=2, keepdim=True)
         weight_safe = torch.where(
             weight_denom > 0,
             branch_weights / (weight_denom + eps),
             torch.zeros_like(branch_weights),
         )
-        weighted_recon = (branch_recon * weight_safe.unsqueeze(-1)).sum(dim=1, keepdim=True)
-        weighted_recon = weighted_recon.expand(-1, features.size(1), -1)
-        if step_mask is not None:
-            weighted_recon = weighted_recon * step_mask.to(dtype=weighted_recon.dtype)
-        features_mod = features + weighted_recon
+        weighted_recon = (branch_recon * weight_safe.unsqueeze(-1)).sum(dim=2)
 
+        cycle_weight = mask.sum(dim=3)
+        step_valid = (cycle_weight > 0).any(dim=2)
+        new_step_mask = step_valid.any(dim=1, keepdim=True).to(dtype=dtype)
+        if step_mask is not None:
+            new_step_mask = new_step_mask * (step_mask > 0).to(dtype=dtype)
+
+        mask_to_apply = new_step_mask
+        weighted_recon = weighted_recon * mask_to_apply
+        features_mod = (features + weighted_recon) * mask_to_apply
+
+        pooled = pooled * mask_to_apply
         combined = torch.cat([pooled, features_mod], dim=1)
         z = self.fuse(combined)
         z = self.act_layer(z)
         z = self.inner_dropout(z)
-        if step_mask is not None:
-            z = z * step_mask.to(dtype=z.dtype)
-        return z
+        z = z * mask_to_apply
+        return z, new_step_mask
 
 
 class TimesNet(nn.Module):
@@ -354,6 +387,8 @@ class TimesNet(nn.Module):
                 kernel_set=self.kernel_set,
                 dropout=self.dropout,
                 activation=self.act,
+                pmax=self.period.pmax,
+                min_period_threshold=self.period.min_period_threshold,
             ).to(device=x.device, dtype=x.dtype)
             blocks.append(block)
         self.blocks = nn.ModuleList(blocks)
@@ -382,7 +417,7 @@ class TimesNet(nn.Module):
                     "min_sigma_vector length does not match number of series"
                 )
             sigma_floor = self.min_sigma_vector
-        z_all, mask_all, amp_all = self.period(x)
+        z_all, mask_all, _ = self.period(x)
         BN = B * N
         K = z_all.size(2)
         if K == 0:
@@ -396,7 +431,6 @@ class TimesNet(nn.Module):
         folded = z_all.reshape(BN, K, z_all.size(3), z_all.size(4))
         mask = mask_all.reshape(BN, K, mask_all.size(3), mask_all.size(4))
         mask = mask.to(dtype=folded.dtype)
-        freq_amp = amp_all.reshape(BN, K)
         cycle_weight = mask.sum(dim=2)
         eps = torch.finfo(folded.dtype).eps
         aggregated = (folded * mask).sum(dim=2) / (cycle_weight + eps)
@@ -408,19 +442,16 @@ class TimesNet(nn.Module):
         features = features * step_mask
         for blk in self.blocks:
             if self.use_checkpoint:
-                delta = checkpoint(
-                    lambda inp, fold, m, s, a: blk(inp, fold, m, s, a),
+                delta, step_mask = checkpoint(
+                    lambda inp, mask_in: blk(inp, mask_in),
                     features,
-                    folded,
-                    mask,
                     step_mask,
-                    freq_amp,
                     use_reentrant=False,
                 )
             else:
-                delta = blk(features, folded, mask, step_mask, freq_amp)
+                delta, step_mask = blk(features, step_mask)
             delta = self.residual_dropout(delta)
-            features = features + delta
+            features = (features + delta) * step_mask
         z = features * step_mask
         z = self.pool(z)
         y_all = self.head(z)
