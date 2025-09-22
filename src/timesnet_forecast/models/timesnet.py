@@ -241,12 +241,11 @@ class TimesBlock(nn.Module):
             cycles = total_len // period
             grid = x_pad.view(B, C, cycles, period)
             conv_out = self.inception(grid)
-            delta = conv_out - grid
-            delta = delta.view(B, C, total_len)
-            delta = delta.permute(0, 2, 1)
+            conv_out = conv_out.view(B, C, total_len)
+            conv_out = conv_out.permute(0, 2, 1)
             if pad_len > 0:
-                delta = delta[:, :-pad_len, :]
-            residuals.append(delta)
+                conv_out = conv_out[:, :-pad_len, :]
+            residuals.append(conv_out)
             valid_indices.append(idx)
 
         if not residuals:
