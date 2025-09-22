@@ -501,8 +501,7 @@ class TimesNet(nn.Module):
                 updated = block(features)
             delta = updated - features
             features = features + self.residual_dropout(delta)
-
-        features = self.layer_norm(features)
+            features = self.layer_norm(features)
         target_features = features[:, -target_steps:, :].contiguous()
         mu = self.output_proj(target_features)  # type: ignore[operator]
         assert self.sigma_proj is not None  # for type checkers
