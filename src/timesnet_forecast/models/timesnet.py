@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Tuple, Sequence
 import torch
 from torch import nn
@@ -220,12 +221,74 @@ class TimesBlock(nn.Module):
         return combined
 
 
+class PositionalEmbedding(nn.Module):
+    """Deterministic sinusoidal positional encoding."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.d_model = int(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError("PositionalEmbedding expects input shaped [B, L, C]")
+        B, L, _ = x.shape
+        device = x.device
+        dtype = x.dtype
+        position = torch.arange(L, device=device, dtype=dtype).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.d_model, 2, device=device, dtype=dtype)
+            * (-math.log(10000.0) / self.d_model)
+        )
+        pe = torch.zeros(L, self.d_model, device=device, dtype=dtype)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        cos_term = div_term
+        if pe[:, 1::2].shape[1] != cos_term.shape[0]:
+            cos_term = cos_term[: pe[:, 1::2].shape[1]]
+        pe[:, 1::2] = torch.cos(position * cos_term)
+        return pe.unsqueeze(0).expand(B, -1, -1)
+
+
+class DataEmbedding(nn.Module):
+    """Value + positional (+ optional temporal) embedding."""
+
+    def __init__(
+        self,
+        c_in: int,
+        d_model: int,
+        dropout: float,
+        time_features: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.value_embedding = nn.Linear(int(c_in), int(d_model))
+        self.position_embedding = PositionalEmbedding(d_model)
+        if time_features is not None and time_features > 0:
+            self.temporal_embedding: nn.Module | None = nn.Linear(
+                int(time_features), int(d_model)
+            )
+        else:
+            self.temporal_embedding = None
+        self.dropout = nn.Dropout(float(dropout))
+
+    def forward(
+        self, x: torch.Tensor, x_mark: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        value = self.value_embedding(x)
+        pos = self.position_embedding(x)
+        temporal = (
+            self.temporal_embedding(x_mark)
+            if self.temporal_embedding is not None and x_mark is not None
+            else None
+        )
+        if isinstance(temporal, torch.Tensor):
+            out = value + pos + temporal
+        else:
+            out = value + pos
+        return self.dropout(out)
+
+
 class TimesNet(nn.Module):
-    """
-    입력 [B, T, N]에서 FFT 기반으로 공유 주기를 선택하고,
-    2D InceptionBlock이 [채널(K), 주기(C), 길이(P)] 격자에서 패턴을 추출한 뒤
-    주기 축 풀링과 residual 스택을 통해 예측을 생성합니다.
-    """
+    """TimesNet with official embedding + linear forecasting head."""
+
     def __init__(
         self,
         input_len: int,
@@ -233,7 +296,6 @@ class TimesNet(nn.Module):
         d_model: int,
         n_layers: int,
         k_periods: int,
-        pmax: int,
         kernel_set: Sequence[Sequence[int] | int | Tuple[int, int]],
         dropout: float,
         activation: str,
@@ -245,91 +307,112 @@ class TimesNet(nn.Module):
         min_sigma_vector: torch.Tensor | Sequence[float] | None = None,
     ) -> None:
         super().__init__()
+        del channels_last  # retained for backward compatibility
         assert mode in ("direct", "recursive")
         self.mode = mode
-        self.pred_len = int(pred_len)
-        self._out_steps = self.pred_len if self.mode == "direct" else 1
-        self.period_selector = FFTPeriodSelector(
-            k_periods=k_periods,
-            pmax=pmax,
-            min_period_threshold=min_period_threshold,
-        )
-        self.k_periods = int(k_periods)
         self.input_len = int(input_len)
-        self.act = activation
-        # We don't know the period-length ``P`` at build time, so layers are built lazily
-        # during the first forward pass once the flattened length ``K*P`` is known.
-        self.blocks: nn.ModuleList = nn.ModuleList()
-        self.input_proj: nn.Module = nn.Identity()
-        self.residual_dropout: nn.Module = nn.Identity()
-        self.pool: nn.Module = nn.Identity()
-        self.head: nn.Module = nn.Identity()
-        self._lazy_built = False
-        self.kernel_set = list(kernel_set)
-        self.dropout = float(dropout)
+        self.pred_len = int(pred_len)
         self.d_model = int(d_model)
         self.n_layers = int(n_layers)
+        self.dropout = float(dropout)
         self.use_checkpoint = bool(use_checkpoint)
         self.min_sigma = float(min_sigma)
+        self.k_periods = int(k_periods)
+        self.kernel_set = list(kernel_set)
+        self.period_selector = FFTPeriodSelector(
+            k_periods=self.k_periods,
+            pmax=self.input_len,
+            min_period_threshold=min_period_threshold,
+        )
+        self.blocks = nn.ModuleList(
+            [
+                TimesBlock(
+                    d_model=self.d_model,
+                    kernel_set=self.kernel_set,
+                    dropout=self.dropout,
+                    activation=activation,
+                )
+                for _ in range(self.n_layers)
+            ]
+        )
+        for block in self.blocks:
+            object.__setattr__(block, "period_selector", self.period_selector)
+        self.residual_dropout = nn.Dropout(self.dropout)
+        self.layer_norm = nn.LayerNorm(self.d_model)
+        self.predict_linear = nn.Linear(self.input_len, self.input_len + self.pred_len)
+        self.embedding: DataEmbedding | None = None
+        self.embedding_time_features: int | None = None
+        self.output_proj: nn.Linear | None = None
+        self.output_dim: int | None = None
+        self._out_steps = self.pred_len if self.mode == "direct" else 1
         self.register_buffer("min_sigma_vector", None)
         if min_sigma_vector is not None:
             min_sigma_tensor = torch.as_tensor(min_sigma_vector, dtype=torch.float32)
             self.min_sigma_vector = min_sigma_tensor.reshape(1, 1, -1)
 
-    def _build_lazy(self, x: torch.Tensor) -> None:
-        """Instantiate convolutional blocks on first use.
+    def _ensure_embedding(
+        self, x: torch.Tensor, x_mark: torch.Tensor | None = None
+    ) -> None:
+        """Lazily instantiate embedding/output projection when dimensions are known."""
 
-        Args:
-            x: reference tensor for device/dtype placement
-        """
-        self.input_proj = nn.Linear(1, self.d_model).to(device=x.device, dtype=x.dtype)
-        with torch.no_grad():
-            self.input_proj.weight.zero_()
-            self.input_proj.bias.zero_()
-            if self.input_proj.weight.size(0) > 0:
-                self.input_proj.weight[0, 0] = 1.0
-        blocks: list[TimesBlock] = []
-        for _ in range(self.n_layers):
-            block = TimesBlock(
-                d_model=self.d_model,
-                kernel_set=self.kernel_set,
-                dropout=self.dropout,
-                activation=self.act,
-            ).to(device=x.device, dtype=x.dtype)
-            object.__setattr__(block, "period_selector", self.period_selector)
-            blocks.append(block)
-        self.blocks = nn.ModuleList(blocks)
-        self.residual_dropout = nn.Dropout(self.dropout)
-        # Pool only over the temporal dimension; series dimension is preserved.
-        self.pool = nn.AdaptiveAvgPool1d(self._out_steps)
-        # Lightweight 1x1 conv head emits (mu, log_sigma) per horizon step.
-        self.head = nn.Conv1d(self.d_model, 2, kernel_size=1).to(
-            device=x.device, dtype=x.dtype
-        )
-        self._lazy_built = True
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        x: [B, T, N]
-        returns:
-          Tuple(mu, sigma) where each tensor has shape:
-            direct:    [B, pred_len, N]
-            recursive: [B, 1, N]
-        """
-        B, T, N = x.shape
-        sigma_floor = None
-        if isinstance(self.min_sigma_vector, torch.Tensor) and self.min_sigma_vector.numel() > 0:
-            if self.min_sigma_vector.shape[-1] != N:
+        c_in = int(x.size(-1))
+        time_dim = int(x_mark.size(-1)) if x_mark is not None else 0
+        if self.embedding is None or self.output_proj is None:
+            if (
+                isinstance(self.min_sigma_vector, torch.Tensor)
+                and self.min_sigma_vector.numel() > 0
+                and self.min_sigma_vector.shape[-1] != c_in
+            ):
                 raise ValueError(
                     "min_sigma_vector length does not match number of series"
                 )
-            sigma_floor = self.min_sigma_vector
-        if not self._lazy_built:
-            self._build_lazy(x=x)
+            if time_dim == 0:
+                time_arg = None
+            else:
+                time_arg = time_dim
+            self.embedding = DataEmbedding(
+                c_in=c_in,
+                d_model=self.d_model,
+                dropout=self.dropout,
+                time_features=time_arg,
+            ).to(device=x.device, dtype=x.dtype)
+            self.embedding_time_features = time_dim
+            self.output_proj = nn.Linear(self.d_model, c_in).to(
+                device=x.device, dtype=x.dtype
+            )
+            self.output_dim = c_in
+        else:
+            if self.output_dim != c_in:
+                raise ValueError("Number of series changed between calls")
+            expected_time = self.embedding_time_features or 0
+            if time_dim != expected_time:
+                raise ValueError("Temporal feature dimension changed between calls")
 
-        BN = B * N
-        series = x.permute(0, 2, 1).reshape(BN, T, 1)
-        features = self.input_proj(series)
+    def _sigma_from_ref(self, ref: torch.Tensor) -> torch.Tensor:
+        if isinstance(self.min_sigma_vector, torch.Tensor) and self.min_sigma_vector.numel() > 0:
+            floor = self.min_sigma_vector.to(device=ref.device, dtype=ref.dtype)
+            return floor.expand_as(ref).clone()
+        return ref.new_full(ref.shape, self.min_sigma)
+
+    def forward(
+        self, x: torch.Tensor, x_mark: torch.Tensor | None = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if x.ndim != 3:
+            raise ValueError("TimesNet expects input shaped [B, T, N]")
+        B, T, N = x.shape
+        if T < self.input_len:
+            raise ValueError(
+                f"Input sequence length {T} is shorter than required input_len {self.input_len}"
+            )
+        if x_mark is not None:
+            if x_mark.shape[:2] != x.shape[:2]:
+                raise ValueError("x_mark must share batch/time dimensions with x")
+            mark_slice = x_mark[:, -self.input_len :, :]
+        else:
+            mark_slice = None
+        enc_x = x[:, -self.input_len :, :]
+        self._ensure_embedding(enc_x, mark_slice)
+        features = self.embedding(enc_x, mark_slice)  # type: ignore[arg-type]
 
         self.period_selector = self.period_selector.to(
             device=features.device, dtype=features.dtype
@@ -339,16 +422,8 @@ class TimesNet(nn.Module):
 
         preview_periods, _ = self.period_selector(features)
         if preview_periods.numel() == 0:
-            out_steps = self._out_steps
-            mu = x.new_zeros(B, out_steps, N)
-            if sigma_floor is not None:
-                sigma = (
-                    sigma_floor.to(dtype=x.dtype, device=x.device)
-                    .expand(B, out_steps, -1)
-                    .clone()
-                )
-            else:
-                sigma = x.new_full((B, out_steps, N), self.min_sigma)
+            mu = enc_x.new_zeros(B, self._out_steps, N)
+            sigma = self._sigma_from_ref(mu)
             return mu, sigma
 
         for block in self.blocks:
@@ -356,21 +431,16 @@ class TimesNet(nn.Module):
                 delta = checkpoint(block, features, use_reentrant=False)
             else:
                 delta = block(features)
-            delta = self.residual_dropout(delta)
-            features = features + delta
+            features = features + self.residual_dropout(delta)
 
-        z = features.permute(0, 2, 1)
-        z = self.pool(z)
-        y_all = self.head(z)
-        out_steps = self._out_steps
-        params = (
-            y_all.reshape(B, N, 2, out_steps).permute(0, 1, 3, 2).contiguous()
-        )
-        mu = params[..., 0].permute(0, 2, 1).contiguous()
-        log_sigma = params[..., 1]
-        sigma = F.softplus(log_sigma).permute(0, 2, 1).contiguous()
-        if sigma_floor is not None:
-            sigma = sigma + sigma_floor.to(dtype=sigma.dtype, device=sigma.device)
-        else:
-            sigma = sigma + self.min_sigma
+        features = self.layer_norm(features)
+        feat_t = features.permute(0, 2, 1).contiguous()  # [B, d_model, input_len]
+        proj_in = feat_t.reshape(B * self.d_model, self.input_len)
+        extended = self.predict_linear(proj_in)
+        extended = extended.view(B, self.d_model, self.input_len + self.pred_len)
+        target_steps = self.pred_len if self.mode == "direct" else self._out_steps
+        extended = extended[:, :, -target_steps:]
+        extended = extended.permute(0, 2, 1).contiguous()  # [B, target_steps, d_model]
+        mu = self.output_proj(extended)  # type: ignore[operator]
+        sigma = self._sigma_from_ref(mu)
         return mu, sigma

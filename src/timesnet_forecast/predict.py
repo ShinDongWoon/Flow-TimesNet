@@ -18,19 +18,6 @@ def _select_device(req: str) -> torch.device:
     if req == "cuda" and torch.cuda.is_available():
         return torch.device("cuda:0")
     return torch.device("cpu")
-
-
-def _pad_left_zeros(arr: np.ndarray, need_len: int) -> np.ndarray:
-    """
-    arr: [T, N], pad zeros at top to reach need_len
-    """
-    T, N = arr.shape
-    if T >= need_len:
-        return arr[-need_len:, :]
-    pad = np.zeros((need_len - T, N), dtype=arr.dtype)
-    return np.concatenate([pad, arr], axis=0)
-
-
 def forecast_direct_batch(
     model: TimesNet, last_seq: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -97,13 +84,14 @@ def predict_once(cfg: Dict) -> str:
         else:
             min_sigma_vector_tensor = min_sigma_vector_tensor.reshape(1, 1, -1)
 
+    input_len = int(cfg_used["model"]["input_len"])
+    pred_len = int(cfg_used["model"]["pred_len"])
     model = TimesNet(
-        input_len=int(cfg_used["model"]["input_len"]),
-        pred_len=int(cfg_used["model"]["pred_len"]),
+        input_len=input_len,
+        pred_len=pred_len,
         d_model=int(cfg_used["model"]["d_model"]),
         n_layers=int(cfg_used["model"]["n_layers"]),
         k_periods=int(cfg_used["model"]["k_periods"]),
-        pmax=int(cfg_used["model"]["pmax"]),
         min_period_threshold=min_period_threshold,
         kernel_set=list(cfg_used["model"]["kernel_set"]),
         dropout=float(cfg_used["model"]["dropout"]),
@@ -116,10 +104,9 @@ def predict_once(cfg: Dict) -> str:
     ).to(device)
     # Lazily construct layers by mirroring the training warm-up.
     with torch.no_grad():
-        warmup_len = int(cfg_used["model"]["pmax"])
         dummy = torch.zeros(
             1,
-            warmup_len,
+            input_len,
             len(ids),
             device=device,
         )
@@ -132,16 +119,6 @@ def predict_once(cfg: Dict) -> str:
         k.replace("_orig_mod.", "").replace("module.", ""): v
         for k, v in state.items()
     }
-    expected_frontend = clean_state.get("blocks.0.weight")
-    if expected_frontend is not None:
-        required_in_channels = int(expected_frontend.shape[1])
-        current_in_channels = int(model.blocks[0].weight.shape[1])
-        if current_in_channels != required_in_channels:
-            model._resize_frontend(
-                required_in_channels,
-                device=model.blocks[0].weight.device,
-                dtype=model.blocks[0].weight.dtype,
-            )
     min_sigma_buffer = getattr(model, "min_sigma_vector", None)
     if isinstance(min_sigma_buffer, torch.Tensor) and min_sigma_buffer.numel() > 0:
         checkpoint_value = clean_state.get("min_sigma_vector")
@@ -191,10 +168,11 @@ def predict_once(cfg: Dict) -> str:
                 else:
                     Xn[:, j] = X[:, j]
 
-        # take last pmax (model focuses internally on input_len) with left zero padding if needed
-        P = int(cfg_used["model"]["pmax"])
-        H = int(cfg_used["model"]["pred_len"])
-        last_seq = _pad_left_zeros(Xn, need_len=P)  # [P, N]
+        if Xn.shape[0] < input_len:
+            raise ValueError(
+                f"Test series '{fp}' shorter than required input_len={input_len}"
+            )
+        last_seq = Xn[-input_len:, :]
         xb = torch.from_numpy(last_seq).unsqueeze(0)
         if cfg_used["train"]["channels_last"]:
             xb = xb.unsqueeze(-1).to(
@@ -209,7 +187,7 @@ def predict_once(cfg: Dict) -> str:
             if cfg_used["model"]["mode"] == "direct":
                 mu_pred, _ = forecast_direct_batch(model, xb)
             else:
-                mu_pred, _ = forecast_recursive_batch(model, xb, H)
+                mu_pred, _ = forecast_recursive_batch(model, xb, pred_len)
 
         Pn = mu_pred.squeeze(0).float().cpu().numpy()  # [H, N]
         # inverse transform & clip

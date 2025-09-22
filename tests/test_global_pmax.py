@@ -4,31 +4,42 @@ import sys
 
 import numpy as np
 import pandas as pd
+import torch
 
 # Ensure the project src is on the path for imports
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
-from timesnet_forecast.train import _compute_pmax_global
 from timesnet_forecast.config import Config
 from timesnet_forecast import train
+from timesnet_forecast.models.timesnet import TimesNet
 from timesnet_forecast.utils import io as io_utils
 from timesnet_forecast.data.split import make_holdout_slices
 
 
-def test_compute_pmax_global():
-    T = 100
-    t = np.arange(T, dtype=np.float32)
-    s1 = np.sin(2 * math.pi * 5 * t / T)  # period 20
-    s2 = np.sin(2 * math.pi * 2 * t / T)  # period 50
-    arr = np.stack([s1, s2], axis=1)
-    pmax = _compute_pmax_global([arr], k=1, cap=100)
-    assert pmax == 50
-    assert _compute_pmax_global([arr], k=1, cap=30) == 30
+def test_timesnet_embedding_accepts_temporal_features():
+    torch.manual_seed(0)
+    B, L, H, N, mark_dim = 2, 12, 3, 4, 5
+    model = TimesNet(
+        input_len=L,
+        pred_len=H,
+        d_model=16,
+        n_layers=2,
+        k_periods=2,
+        kernel_set=[(3, 3)],
+        dropout=0.1,
+        activation="gelu",
+        mode="direct",
+    )
+    x = torch.randn(B, L + 2, N)
+    x_mark = torch.randn(B, L + 2, mark_dim)
+    mu, sigma = model(x, x_mark=x_mark)
+    assert mu.shape == (B, H, N)
+    assert sigma.shape == (B, H, N)
+    assert torch.all(sigma >= model.min_sigma)
 
 
-def test_pmax_cap_applied(tmp_path):
-    # Create a synthetic training CSV with strong periodic components
-    periods = 60
+def test_train_once_runs_without_pmax(tmp_path):
+    periods = 40
     dates = pd.date_range("2023-01-01", periods=periods, freq="D")
     t = np.arange(periods, dtype=np.float32)
     s1 = np.sin(2 * math.pi * 5 * t / periods) + 10.0
@@ -60,20 +71,19 @@ def test_pmax_cap_applied(tmp_path):
         "train.cuda_graphs=False",
         "train.channels_last=False",
         "train.val.strategy=holdout",
-        "train.val.holdout_days=3",
+        "train.val.holdout_days=10",
         "preprocess.normalize=none",
         "preprocess.normalize_per_series=True",
         "preprocess.clip_negative=False",
         "preprocess.eps=1e-8",
         "model.mode=direct",
-        "model.input_len=2",
-        "model.pred_len=1",
+        "model.input_len=6",
+        "model.pred_len=2",
         "model.d_model=8",
         "model.n_layers=1",
         "model.dropout=0.0",
         "model.k_periods=1",
         "model.kernel_set=[[3,3]]",
-        "model.pmax_cap=5",
         "train.lr=1e-3",
         "train.weight_decay=0.0",
         "train.grad_clip_norm=0.0",
@@ -102,14 +112,8 @@ def test_pmax_cap_applied(tmp_path):
         cfg["preprocess"]["normalize_per_series"],
         cfg["preprocess"]["eps"],
     )
-    train_arrays = [trn_norm.values.astype(np.float32)]
-    expected_pmax = _compute_pmax_global(
-        train_arrays,
-        int(cfg["model"]["k_periods"]),
-        int(cfg["model"]["pmax_cap"]),
-    )
-    assert expected_pmax == int(cfg["model"]["pmax_cap"])
+    assert trn_norm.shape[0] >= cfg["model"]["input_len"]
 
     train.train_once(cfg)
-    assert cfg["model"]["pmax"] == expected_pmax
+    assert "pmax" not in cfg.get("model", {})
 

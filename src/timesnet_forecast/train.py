@@ -104,7 +104,6 @@ def _build_dataloader(
     drop_last: bool,
     recursive_pred_len: int | None = None,
     augment: Dict | None = None,
-    pmax_global: int | None = None,
 ) -> DataLoader:
     if len(arrays) != len(masks):
         raise ValueError("arrays and masks must have the same length")
@@ -116,7 +115,6 @@ def _build_dataloader(
             mode,
             recursive_pred_len,
             augment,
-            pmax_global=pmax_global,
             valid_mask=m,
         )
         for a, m in zip(arrays, masks)
@@ -137,65 +135,20 @@ def _build_dataloader(
     )
 
 
-def _assert_min_len(x: torch.Tensor, pmax: int) -> None:
+def _assert_min_len(x: torch.Tensor, required_len: int) -> None:
     """Ensure the sequence length meets the model's minimum requirement."""
-    if x.size(1) < pmax:
+    if x.size(1) < required_len:
         raise ValueError(
-            f"Sequence length {x.size(1)} is shorter than required pmax {pmax}."
+            f"Sequence length {x.size(1)} is shorter than required input_len {required_len}."
         )
 
 
-def _model_pmax(model: nn.Module) -> int:
-    """Retrieve the ``pmax`` attribute from ``model`` for compatibility."""
+def _model_input_len(model: nn.Module) -> int:
+    """Retrieve the ``input_len`` attribute from ``model`` for compatibility."""
 
-    if hasattr(model, "period_selector"):
-        selector = getattr(model, "period_selector")
-        if hasattr(selector, "pmax"):
-            return int(selector.pmax)
-    if hasattr(model, "period"):
-        period = getattr(model, "period")
-        if hasattr(period, "pmax"):
-            return int(period.pmax)
-    raise AttributeError("model does not expose a pmax attribute")
-
-
-def _compute_pmax_global(arrays: List[np.ndarray], k: int, cap: int) -> int:
-    """Compute global maximum period length across training arrays.
-
-    Estimates dominant shared frequencies via FFT magnitude spectra averaged
-    across series, mirroring :class:`FFTPeriodSelector`.
-
-    Args:
-        arrays: List of training arrays shaped ``[T, N]``.
-        k: Number of top frequencies to consider.
-        cap: Maximum allowed value for the inferred period length.
-
-    Returns:
-        Maximum period length observed across all arrays clipped to ``cap``.
-    """
-
-    pmax = 1
-    if k <= 0:
-        return min(pmax, cap)
-    for arr in arrays:
-        if arr.size == 0:
-            continue
-        series = torch.from_numpy(arr.astype(np.float32)).transpose(0, 1)  # [N, T]
-        spec = torch.fft.rfft(series, dim=1)
-        amp = torch.abs(spec)
-        if amp.size(1) <= 1:
-            continue
-        amp[:, 0] = 0.0
-        available = amp.size(1) - 1
-        topk = min(k, available)
-        if topk <= 0:
-            continue
-        values, indices = torch.topk(amp, k=topk, dim=1)
-        indices = torch.clamp(indices, min=1)
-        periods = torch.div(series.size(1), indices, rounding_mode="floor")
-        periods = torch.clamp(periods, min=1, max=cap)
-        pmax = max(pmax, int(periods.max().item()))
-    return min(pmax, cap)
+    if hasattr(model, "input_len"):
+        return int(getattr(model, "input_len"))
+    raise AttributeError("model does not expose an input_len attribute")
 
 
 def _masked_mean(loss_tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -377,7 +330,7 @@ def _eval_wsmape(
                 loss_mask = loss_mask.to(yb.dtype)
             if channels_last and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
-            _assert_min_len(xb, _model_pmax(model))
+            _assert_min_len(xb, _model_input_len(model))
             if mode == "direct":
                 mu, _ = model(xb)
             else:
@@ -422,7 +375,7 @@ def _eval_metrics(
                 loss_mask = loss_mask.to(yb.dtype)
             if channels_last and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
-            _assert_min_len(xb, _model_pmax(model))
+            _assert_min_len(xb, _model_input_len(model))
             if mode == "direct":
                 mu, sigma = model(xb)
             else:
@@ -540,12 +493,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             train_mask_arrays.append(tr_mask_df.to_numpy(dtype=np.float32, copy=False))
             val_mask_arrays.append(va_mask_df.to_numpy(dtype=np.float32, copy=False))
 
-    # --- compute global period length
-    k_periods = int(cfg["model"].get("k_periods", 0))
-    pmax_cap = int(cfg["model"].get("pmax_cap", 730))
-    pmax_global = _compute_pmax_global(train_arrays, k_periods, pmax_cap)
+    # --- model hyper-parameters derived from config
     cfg.setdefault("model", {})
-    cfg["model"]["pmax"] = int(pmax_global)
     min_period_threshold = int(cfg["model"].get("min_period_threshold", 1))
     cfg["model"]["min_period_threshold"] = min_period_threshold
 
@@ -557,7 +506,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         train_arrays, train_mask_arrays, input_len, pred_len, mode, cfg["train"]["batch_size"],
         cfg["train"]["num_workers"], cfg["train"]["pin_memory"], cfg["train"]["persistent_workers"],
         cfg["train"]["prefetch_factor"], shuffle=True, drop_last=True,
-        augment=cfg["data"].get("augment"), pmax_global=pmax_global,
+        augment=cfg["data"].get("augment"),
     )
     dl_val = _build_dataloader(
         val_arrays, val_mask_arrays, input_len, pred_len, mode, batch_size=cfg["train"]["batch_size"],
@@ -565,7 +514,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         persistent_workers=cfg["train"]["persistent_workers"], prefetch_factor=cfg["train"]["prefetch_factor"],
         shuffle=False, drop_last=False,
         recursive_pred_len=(pred_len if mode == "recursive" else None),
-        augment=None, pmax_global=pmax_global,
+        augment=None,
     )
     if len(dl_val.dataset) == 0:
         raise ValueError("Validation split has no windows; increase train.val.holdout_days or adjust model.input_len/pred_len.")
@@ -614,7 +563,6 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         d_model=int(cfg["model"]["d_model"]),
         n_layers=int(cfg["model"]["n_layers"]),
         k_periods=int(cfg["model"]["k_periods"]),
-        pmax=int(cfg["model"]["pmax"]),
         min_period_threshold=min_period_threshold,
         kernel_set=list(cfg["model"]["kernel_set"]),
         dropout=float(cfg["model"]["dropout"]),
@@ -716,7 +664,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 mb_w = torch.ones_like(yb_w)
             if cfg["train"]["channels_last"] and xb_w.dim() == 4:
                 xb_w = xb_w.to(memory_format=torch.channels_last)
-            _assert_min_len(xb_w, _model_pmax(model))
+            _assert_min_len(xb_w, _model_input_len(model))
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                 mu_w, sigma_w = model(xb_w)
                 loss_tensor = gaussian_nll_loss(mu_w, sigma_w, yb_w, min_sigma=min_sigma)
@@ -752,7 +700,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         with torch.cuda.stream(capture_stream):
             graph.capture_begin()
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
-                _assert_min_len(static_x, _model_pmax(model))
+                _assert_min_len(static_x, _model_input_len(model))
                 static_mu, static_sigma = model(static_x)
                 static_loss_tensor = gaussian_nll_loss(
                     static_mu, static_sigma, static_y, min_sigma=min_sigma
@@ -787,7 +735,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 mb = torch.ones_like(yb)
             if cfg["train"]["channels_last"] and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
-            _assert_min_len(xb, _model_pmax(model))
+            _assert_min_len(xb, _model_input_len(model))
             if use_graphs:
                 loss_val = graph_step(xb, yb, mb)
             else:
