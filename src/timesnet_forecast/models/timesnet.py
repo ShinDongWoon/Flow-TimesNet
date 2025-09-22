@@ -200,6 +200,7 @@ class TimesBlock(nn.Module):
         dropout: float,
         activation: str,
         d_ff: int | None = None,
+        bottleneck_ratio: float = 1.0,
     ) -> None:
         super().__init__()
         self.d_model = int(d_model)
@@ -208,6 +209,9 @@ class TimesBlock(nn.Module):
         self.d_ff = int(d_ff)
         if self.d_ff <= 0:
             raise ValueError("d_ff must be a positive integer")
+        self.bottleneck_ratio = float(bottleneck_ratio)
+        if self.bottleneck_ratio <= 0:
+            raise ValueError("bottleneck_ratio must be a positive value")
 
         act_name = activation.lower()
         if act_name == "relu":
@@ -223,6 +227,7 @@ class TimesBlock(nn.Module):
                 kernel_set=kernel_spec,
                 dropout=dropout,
                 act=activation,
+                bottleneck_ratio=self.bottleneck_ratio,
             ),
             mid_activation,
             InceptionBlock(
@@ -231,6 +236,7 @@ class TimesBlock(nn.Module):
                 kernel_set=kernel_spec,
                 dropout=dropout,
                 act=activation,
+                bottleneck_ratio=self.bottleneck_ratio,
             ),
         )
         # ``period_selector`` is injected from ``TimesNet`` after instantiation to
@@ -380,6 +386,7 @@ class TimesNet(nn.Module):
         activation: str,
         mode: str,
         d_ff: int | None = None,
+        bottleneck_ratio: float = 1.0,
         min_period_threshold: int = 1,
         channels_last: bool = False,
         use_checkpoint: bool = True,
@@ -399,6 +406,9 @@ class TimesNet(nn.Module):
         self.d_ff = int(d_ff)
         if self.d_ff <= 0:
             raise ValueError("d_ff must be a positive integer")
+        self.bottleneck_ratio = float(bottleneck_ratio)
+        if self.bottleneck_ratio <= 0:
+            raise ValueError("bottleneck_ratio must be a positive value")
         self.n_layers = int(n_layers)
         self.dropout = float(dropout)
         self.use_checkpoint = bool(use_checkpoint)
@@ -419,6 +429,7 @@ class TimesNet(nn.Module):
                     kernel_set=self.kernel_set,
                     dropout=self.dropout,
                     activation=activation,
+                    bottleneck_ratio=self.bottleneck_ratio,
                 )
                 for _ in range(self.n_layers)
             ]

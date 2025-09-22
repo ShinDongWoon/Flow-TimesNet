@@ -561,6 +561,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     d_model = int(model_cfg["d_model"])
     d_ff = int(model_cfg.get("d_ff", 4 * d_model))
     model_cfg["d_ff"] = d_ff
+    bottleneck_ratio = float(model_cfg.get("bottleneck_ratio", 1.0))
+    model_cfg["bottleneck_ratio"] = bottleneck_ratio
 
     model = TimesNet(
         input_len=input_len,
@@ -574,6 +576,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         dropout=float(model_cfg["dropout"]),
         activation=str(model_cfg["activation"]),
         mode=mode,
+        bottleneck_ratio=bottleneck_ratio,
         channels_last=cfg["train"]["channels_last"],
         use_checkpoint=use_checkpoint,
         use_embedding_norm=bool(model_cfg.get("use_embedding_norm", True)),
