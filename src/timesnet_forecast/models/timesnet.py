@@ -328,7 +328,7 @@ class TimesNet(nn.Module):
         self.kernel_set = list(kernel_set)
         self.period_selector = FFTPeriodSelector(
             k_periods=self.k_periods,
-            pmax=self.input_len,
+            pmax=self.input_len + self.pred_len,
             min_period_threshold=min_period_threshold,
         )
         self.blocks = nn.ModuleList(
@@ -424,7 +424,14 @@ class TimesNet(nn.Module):
             mark_slice = None
         enc_x = x[:, -self.input_len :, :]
         self._ensure_embedding(enc_x, mark_slice)
+        target_steps = self.pred_len if self.mode == "direct" else self._out_steps
         features = self.embedding(enc_x, mark_slice)  # type: ignore[arg-type]
+        d_model = features.size(-1)
+        feat_t = features.permute(0, 2, 1).contiguous()
+        feat_flat = feat_t.reshape(B * d_model, self.input_len)
+        extended = self.predict_linear(feat_flat)
+        extended = extended.view(B, d_model, self.input_len + self.pred_len)
+        features = extended.permute(0, 2, 1).contiguous()
 
         self.period_selector = self.period_selector.to(
             device=features.device, dtype=features.dtype
@@ -447,16 +454,10 @@ class TimesNet(nn.Module):
             features = features + self.residual_dropout(delta)
 
         features = self.layer_norm(features)
-        feat_t = features.permute(0, 2, 1).contiguous()  # [B, d_model, input_len]
-        proj_in = feat_t.reshape(B * self.d_model, self.input_len)
-        extended = self.predict_linear(proj_in)
-        extended = extended.view(B, self.d_model, self.input_len + self.pred_len)
-        target_steps = self.pred_len if self.mode == "direct" else self._out_steps
-        extended = extended[:, :, -target_steps:]
-        extended = extended.permute(0, 2, 1).contiguous()  # [B, target_steps, d_model]
-        mu = self.output_proj(extended)  # type: ignore[operator]
+        target_features = features[:, -target_steps:, :].contiguous()
+        mu = self.output_proj(target_features)  # type: ignore[operator]
         assert self.sigma_proj is not None  # for type checkers
         floor = self._sigma_from_ref(mu)
-        sigma_head = self.sigma_proj(extended)
+        sigma_head = self.sigma_proj(target_features)
         sigma = F.softplus(sigma_head) + floor
         return mu, sigma
