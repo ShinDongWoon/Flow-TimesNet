@@ -257,6 +257,7 @@ class DataEmbedding(nn.Module):
         d_model: int,
         dropout: float,
         time_features: int | None = None,
+        use_norm: bool = True,
     ) -> None:
         super().__init__()
         self.value_embedding = nn.Linear(int(c_in), int(d_model))
@@ -267,6 +268,8 @@ class DataEmbedding(nn.Module):
             )
         else:
             self.temporal_embedding = None
+        self.use_norm = bool(use_norm)
+        self.norm = nn.LayerNorm(int(d_model))
         self.dropout = nn.Dropout(float(dropout))
 
     def forward(
@@ -283,6 +286,8 @@ class DataEmbedding(nn.Module):
             out = value + pos + temporal
         else:
             out = value + pos
+        if self.use_norm:
+            out = self.norm(out)
         return self.dropout(out)
 
 
@@ -303,6 +308,7 @@ class TimesNet(nn.Module):
         min_period_threshold: int = 1,
         channels_last: bool = False,
         use_checkpoint: bool = True,
+        use_embedding_norm: bool = True,
         min_sigma: float = 1e-3,
         min_sigma_vector: torch.Tensor | Sequence[float] | None = None,
     ) -> None:
@@ -316,6 +322,7 @@ class TimesNet(nn.Module):
         self.n_layers = int(n_layers)
         self.dropout = float(dropout)
         self.use_checkpoint = bool(use_checkpoint)
+        self.use_embedding_norm = bool(use_embedding_norm)
         self.min_sigma = float(min_sigma)
         self.k_periods = int(k_periods)
         self.kernel_set = list(kernel_set)
@@ -376,6 +383,7 @@ class TimesNet(nn.Module):
                 d_model=self.d_model,
                 dropout=self.dropout,
                 time_features=time_arg,
+                use_norm=self.use_embedding_norm,
             ).to(device=x.device, dtype=x.dtype)
             self.embedding_time_features = time_dim
             self.output_proj = nn.Linear(self.d_model, c_in).to(
