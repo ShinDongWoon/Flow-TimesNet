@@ -99,6 +99,7 @@ def predict_once(cfg: Dict) -> str:
         mode=str(cfg_used["model"]["mode"]),
         channels_last=cfg_used["train"]["channels_last"],
         use_checkpoint=use_checkpoint,
+        use_embedding_norm=bool(cfg_used["model"].get("use_embedding_norm", True)),
         min_sigma=min_sigma_scalar,
         min_sigma_vector=min_sigma_vector_tensor,
     ).to(device)

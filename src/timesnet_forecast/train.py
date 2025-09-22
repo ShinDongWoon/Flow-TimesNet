@@ -570,6 +570,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         mode=mode,
         channels_last=cfg["train"]["channels_last"],
         use_checkpoint=use_checkpoint,
+        use_embedding_norm=bool(cfg["model"].get("use_embedding_norm", True)),
         min_sigma=min_sigma_scalar,
         min_sigma_vector=min_sigma_vector_tensor,
     ).to(device)

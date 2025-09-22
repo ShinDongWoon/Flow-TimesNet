@@ -67,6 +67,7 @@ model:
     - [5, 5]
     - [7, 7]
   activation: "gelu"
+  use_embedding_norm: true
 
 tuning:
   enabled: true
