@@ -103,6 +103,32 @@ class FFTPeriodSelector(nn.Module):
         return periods, sample_values.to(dtype)
 
 
+class InceptionBranch(nn.Module):
+    """Single inception branch with bottlenecked convolutions."""
+
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        kernel_size: tuple[int, int],
+        bottleneck_ratio: float,
+    ) -> None:
+        super().__init__()
+        if bottleneck_ratio <= 0:
+            raise ValueError("bottleneck_ratio must be a positive value")
+        kh, kw = kernel_size
+        pad = (max(kh // 2, 0), max(kw // 2, 0))
+        mid_ch = max(1, int(out_ch // float(bottleneck_ratio)))
+        self.branch = nn.Sequential(
+            nn.Conv2d(in_ch, mid_ch, kernel_size=1),
+            nn.Conv2d(mid_ch, mid_ch, kernel_size=(kh, kw), padding=pad),
+            nn.Conv2d(mid_ch, out_ch, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.branch(x)
+
+
 class InceptionBlock(nn.Module):
     """2D inception block that preserves the cycle/period grid."""
 
@@ -113,6 +139,7 @@ class InceptionBlock(nn.Module):
         kernel_set: Sequence[Sequence[int] | int | Tuple[int, int]],
         dropout: float,
         act: str,
+        bottleneck_ratio: float = 1.0,
     ) -> None:
         super().__init__()
         parsed_kernels: list[tuple[int, int]] = []
@@ -128,12 +155,17 @@ class InceptionBlock(nn.Module):
             parsed_kernels.append((int(kh), int(kw)))
         if not parsed_kernels:
             raise ValueError("kernel_set must contain at least one kernel size")
-        self.paths = nn.ModuleList()
-        for kh, kw in parsed_kernels:
-            pad = (max(kh // 2, 0), max(kw // 2, 0))
-            self.paths.append(
-                nn.Conv2d(in_ch, out_ch, kernel_size=(kh, kw), padding=pad)
-            )
+        self.paths = nn.ModuleList(
+            [
+                InceptionBranch(
+                    in_ch=in_ch,
+                    out_ch=out_ch,
+                    kernel_size=(kh, kw),
+                    bottleneck_ratio=bottleneck_ratio,
+                )
+                for kh, kw in parsed_kernels
+            ]
+        )
         self.proj = nn.Conv2d(out_ch * len(parsed_kernels), out_ch, kernel_size=1)
         if in_ch != out_ch:
             self.res_proj = nn.Conv2d(in_ch, out_ch, kernel_size=1)
