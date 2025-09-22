@@ -118,12 +118,19 @@ class InceptionBranch(nn.Module):
             raise ValueError("bottleneck_ratio must be a positive value")
         kh, kw = kernel_size
         pad = (max(kh // 2, 0), max(kw // 2, 0))
-        mid_ch = max(1, int(out_ch // float(bottleneck_ratio)))
-        self.branch = nn.Sequential(
-            nn.Conv2d(in_ch, mid_ch, kernel_size=1),
-            nn.Conv2d(mid_ch, mid_ch, kernel_size=(kh, kw), padding=pad),
-            nn.Conv2d(mid_ch, out_ch, kernel_size=1),
-        )
+        if math.isclose(bottleneck_ratio, 1.0, rel_tol=1e-9, abs_tol=1e-9):
+            # Preserve the legacy single convolution behaviour when no
+            # bottlenecking is requested.
+            self.branch = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=(kh, kw), padding=pad)
+            )
+        else:
+            mid_ch = max(1, int(out_ch // float(bottleneck_ratio)))
+            self.branch = nn.Sequential(
+                nn.Conv2d(in_ch, mid_ch, kernel_size=1),
+                nn.Conv2d(mid_ch, mid_ch, kernel_size=(kh, kw), padding=pad),
+                nn.Conv2d(mid_ch, out_ch, kernel_size=1),
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.branch(x)

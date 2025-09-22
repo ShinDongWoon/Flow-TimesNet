@@ -3,11 +3,12 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch import nn
 
 # Ensure the project src is on the path for imports
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
-from timesnet_forecast.models.timesnet import InceptionBlock
+from timesnet_forecast.models.timesnet import InceptionBlock, InceptionBranch
 
 
 @pytest.mark.parametrize(
@@ -42,3 +43,31 @@ def test_inception_block_bottleneck_residual(in_ch, out_ch, bottleneck_ratio):
         dropped = block.dropout(activated)
 
     assert torch.allclose(out, dropped + residual)
+
+
+def test_inception_branch_ratio_one_single_conv():
+    in_ch, out_ch = 4, 6
+    kernel_size = (3, 5)
+    branch = InceptionBranch(
+        in_ch=in_ch,
+        out_ch=out_ch,
+        kernel_size=kernel_size,
+        bottleneck_ratio=1.0,
+    )
+
+    modules = list(branch.branch.children())
+    assert len(modules) == 1
+    conv = modules[0]
+    assert isinstance(conv, nn.Conv2d)
+    assert conv.in_channels == in_ch
+    assert conv.out_channels == out_ch
+    assert conv.kernel_size == kernel_size
+    expected_pad = (kernel_size[0] // 2, kernel_size[1] // 2)
+    assert conv.padding == expected_pad
+
+    x = torch.randn(2, in_ch, 7, 9)
+    with torch.no_grad():
+        out_branch = branch(x)
+        out_direct = conv(x)
+
+    assert torch.allclose(out_branch, out_direct)
