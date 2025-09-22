@@ -43,7 +43,7 @@ def _reference_times_block(
     amplitudes: torch.Tensor,
 ) -> torch.Tensor:
     if periods.numel() == 0:
-        return torch.zeros_like(x)
+        return x
 
     B, L, C = x.shape
     x_perm = x.permute(0, 2, 1).contiguous()
@@ -71,13 +71,14 @@ def _reference_times_block(
         valid_indices.append(idx)
 
     if not residuals:
-        return torch.zeros_like(x)
+        return x
 
     stacked = torch.stack(residuals, dim=-1)
     amps = amplitudes[:, valid_indices]
     weights = F.softmax(amps, dim=1)
     weights = weights.view(B, 1, 1, -1)
-    return (stacked * weights).sum(dim=-1)
+    combined = (stacked * weights).sum(dim=-1)
+    return x + combined
 
 
 def test_times_block_preserves_shape():
@@ -94,6 +95,7 @@ def test_times_block_preserves_shape():
     x = torch.randn(3, 10, 4)
     out = block(x)
     assert out.shape == x.shape
+    assert (out - x).shape == x.shape
 
 
 def test_times_block_softmax_weighting():
@@ -114,7 +116,24 @@ def test_times_block_softmax_weighting():
     weights = torch.softmax(logits, dim=1)
     expected_value = (weights * torch.tensor([[2.0, 4.0]])).sum(dim=1)
     expected = expected_value.view(1, 1, 1).expand_as(out)
-    assert torch.allclose(out, expected)
+    residual = out - x
+    assert torch.allclose(residual, expected)
+
+
+def test_times_block_returns_input_when_no_valid_periods():
+    block = TimesBlock(
+        d_model=2,
+        kernel_set=[(3, 3)],
+        dropout=0.0,
+        activation="gelu",
+    )
+    selector = StaticSelector(periods=[0, -1], amplitudes=[1.0, 1.0])
+    object.__setattr__(block, "period_selector", selector)
+
+    x = torch.randn(2, 5, 2)
+    out = block(x)
+    assert torch.allclose(out, x)
+    assert torch.allclose(out - x, torch.zeros_like(x))
 
 
 def test_times_block_matches_reference_impl():

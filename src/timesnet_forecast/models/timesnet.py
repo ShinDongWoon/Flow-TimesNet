@@ -164,7 +164,7 @@ class TimesBlock(nn.Module):
         self.period_selector: FFTPeriodSelector | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute residual updates for ``x`` using dominant periods."""
+        """Apply weighted period residuals to ``x``."""
 
         if x.ndim != 3:
             raise ValueError("TimesBlock expects input shaped [B, L, d_model]")
@@ -173,7 +173,7 @@ class TimesBlock(nn.Module):
 
         periods, amplitudes = self.period_selector(x)
         if periods.numel() == 0:
-            return torch.zeros_like(x)
+            return x
 
         B, L, C = x.shape
         device = x.device
@@ -208,7 +208,7 @@ class TimesBlock(nn.Module):
             valid_indices.append(idx)
 
         if not residuals:
-            return torch.zeros_like(x)
+            return x
 
         stacked = torch.stack(residuals, dim=-1)  # [B, L, C, K_valid]
 
@@ -218,7 +218,7 @@ class TimesBlock(nn.Module):
         weights = F.softmax(amp, dim=1) if amp.numel() > 0 else amp
         weights = weights.view(B, 1, 1, -1)
         combined = (stacked * weights).sum(dim=-1)
-        return combined
+        return x + combined
 
 
 class PositionalEmbedding(nn.Module):
@@ -428,9 +428,10 @@ class TimesNet(nn.Module):
 
         for block in self.blocks:
             if self.use_checkpoint:
-                delta = checkpoint(block, features, use_reentrant=False)
+                updated = checkpoint(block, features, use_reentrant=False)
             else:
-                delta = block(features)
+                updated = block(features)
+            delta = updated - features
             features = features + self.residual_dropout(delta)
 
         features = self.layer_norm(features)
