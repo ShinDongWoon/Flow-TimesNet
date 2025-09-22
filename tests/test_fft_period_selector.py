@@ -35,8 +35,8 @@ def test_fft_period_selector_shared_periods_and_ordering():
 
     expected_periods = [L // dominant_freqs[0], L // dominant_freqs[1]]
     assert periods.tolist() == expected_periods
-    assert amplitudes.shape == (2,)
-    assert amplitudes[0] >= amplitudes[1]
+    assert amplitudes.shape == (B, 2)
+    assert torch.all(amplitudes[:, 0] >= amplitudes[:, 1])
 
 
 def test_fft_period_selector_respects_bounds():
@@ -52,6 +52,7 @@ def test_fft_period_selector_respects_bounds():
     periods, amplitudes = selector(x)
 
     assert periods.tolist() == [16, 5]
+    assert amplitudes.shape == (1, 2)
     assert torch.all(amplitudes > 0)
 
 
