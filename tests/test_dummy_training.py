@@ -1,6 +1,5 @@
 import math
 from pathlib import Path
-from types import SimpleNamespace
 import sys
 
 import numpy as np
@@ -38,7 +37,6 @@ def test_dummy_training_smape_wsmape():
         d_model=16,
         n_layers=2,
         k_periods=2,
-        pmax=input_len,
         kernel_set=[(3, 3)],
         dropout=0.0,
         activation="gelu",
@@ -89,7 +87,7 @@ def test_eval_metrics_returns_masked_nll():
             super().__init__()
             self.register_buffer("mu_buf", mu)
             self.register_buffer("sigma_buf", sigma)
-            self.period = SimpleNamespace(pmax=1)
+            self.input_len = 1
 
         def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             batch = x.shape[0]

@@ -61,7 +61,6 @@ model:
   n_layers: 3
   dropout: 0.1
   k_periods: 4
-  pmax_cap: 365            # 2-year cap
   min_period_threshold: 7  # 최소 주기 하한선
   kernel_set:
     - [3, 3]

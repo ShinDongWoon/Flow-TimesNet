@@ -20,7 +20,6 @@ class SlidingWindowDataset(Dataset):
         mode: str,  # "direct"|"recursive"
         recursive_pred_len: int | None = None,
         augment: Dict | None = None,
-        pmax_global: int | None = None,
         valid_mask: np.ndarray | None = None,  # [T, N]
     ) -> None:
         super().__init__()
@@ -36,11 +35,6 @@ class SlidingWindowDataset(Dataset):
             self.M = valid_mask.astype(np.float32)
         self.T, self.N = self.X.shape
         self.L = int(input_len)
-        if pmax_global is None:
-            raise ValueError("pmax_global must be provided")
-        self.P = int(pmax_global)
-        if self.P <= 0:
-            raise ValueError("pmax_global must be positive")
         if mode == "direct":
             self.H = int(pred_len)
         else:
@@ -66,16 +60,11 @@ class SlidingWindowDataset(Dataset):
             delta = np.random.randint(-self.time_shift, self.time_shift + 1)
             s = int(np.clip(s + delta, 0, self.T - self.L - self.H))
         e = s + self.L
-        start = int(max(0, e - self.P))
-        x = self.X[start:e, :]  # [<=P, N]
+        x = self.X[s:e, :]
         y = self.X[e : e + self.H, :]  # [H, N] or [1, N]
         mask = self.M[e : e + self.H, :]
         if self.add_noise_std > 0:
             x = x + np.random.normal(scale=self.add_noise_std, size=x.shape)
-        if x.shape[0] < self.P:
-            pad_len = self.P - x.shape[0]
-            pad = np.zeros((pad_len, self.N), dtype=np.float32)
-            x = np.concatenate([pad, x.astype(np.float32, copy=False)], axis=0)
         x = x.astype(np.float32, copy=False)
         y = y.astype(np.float32, copy=False)
         mask = mask.astype(np.float32, copy=False)
