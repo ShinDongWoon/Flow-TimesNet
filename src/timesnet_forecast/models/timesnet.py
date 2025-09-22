@@ -149,15 +149,39 @@ class TimesBlock(nn.Module):
         kernel_set: Sequence[Sequence[int] | int | Tuple[int, int]],
         dropout: float,
         activation: str,
+        d_ff: int | None = None,
     ) -> None:
         super().__init__()
         self.d_model = int(d_model)
-        self.inception = InceptionBlock(
-            in_ch=self.d_model,
-            out_ch=self.d_model,
-            kernel_set=kernel_set,
-            dropout=dropout,
-            act=activation,
+        if d_ff is None:
+            d_ff = self.d_model
+        self.d_ff = int(d_ff)
+        if self.d_ff <= 0:
+            raise ValueError("d_ff must be a positive integer")
+
+        act_name = activation.lower()
+        if act_name == "relu":
+            mid_activation: nn.Module = nn.ReLU()
+        else:
+            mid_activation = nn.GELU()
+
+        kernel_spec = list(kernel_set)
+        self.inception = nn.Sequential(
+            InceptionBlock(
+                in_ch=self.d_model,
+                out_ch=self.d_ff,
+                kernel_set=kernel_spec,
+                dropout=dropout,
+                act=activation,
+            ),
+            mid_activation,
+            InceptionBlock(
+                in_ch=self.d_ff,
+                out_ch=self.d_model,
+                kernel_set=kernel_spec,
+                dropout=dropout,
+                act=activation,
+            ),
         )
         # ``period_selector`` is injected from ``TimesNet`` after instantiation to
         # avoid registering the shared selector multiple times.
@@ -305,6 +329,7 @@ class TimesNet(nn.Module):
         dropout: float,
         activation: str,
         mode: str,
+        d_ff: int | None = None,
         min_period_threshold: int = 1,
         channels_last: bool = False,
         use_checkpoint: bool = True,
@@ -319,6 +344,11 @@ class TimesNet(nn.Module):
         self.input_len = int(input_len)
         self.pred_len = int(pred_len)
         self.d_model = int(d_model)
+        if d_ff is None:
+            d_ff = 4 * self.d_model
+        self.d_ff = int(d_ff)
+        if self.d_ff <= 0:
+            raise ValueError("d_ff must be a positive integer")
         self.n_layers = int(n_layers)
         self.dropout = float(dropout)
         self.use_checkpoint = bool(use_checkpoint)
@@ -335,6 +365,7 @@ class TimesNet(nn.Module):
             [
                 TimesBlock(
                     d_model=self.d_model,
+                    d_ff=self.d_ff,
                     kernel_set=self.kernel_set,
                     dropout=self.dropout,
                     activation=activation,
