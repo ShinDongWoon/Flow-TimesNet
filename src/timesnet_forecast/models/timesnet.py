@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from typing import Tuple, Sequence
 import torch
 from torch import nn
@@ -45,8 +46,25 @@ class FFTPeriodSelector(nn.Module):
             empty_amp = torch.zeros(B, 0, dtype=dtype, device=device)
             return empty_idx, empty_amp
 
-        spec = torch.fft.rfft(x, dim=1)
-        amp = torch.abs(spec)
+        fft_dtype = x.dtype
+        if fft_dtype in (torch.float16, torch.bfloat16):
+            fft_dtype = torch.float32
+
+        autocast_enabled = (
+            x.is_cuda
+            and torch.cuda.is_available()
+            and torch.is_autocast_enabled()
+        )
+        autocast_context = (
+            torch.cuda.amp.autocast(enabled=False)
+            if autocast_enabled
+            else nullcontext()
+        )
+
+        with autocast_context:
+            fft_input = x.to(fft_dtype) if x.dtype != fft_dtype else x
+            spec = torch.fft.rfft(fft_input, dim=1)
+            amp = torch.abs(spec)
         amp_mean = amp.mean(dim=(0, 2))
         amp_samples = amp.mean(dim=2)
 
