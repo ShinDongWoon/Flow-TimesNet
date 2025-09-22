@@ -343,6 +343,7 @@ class TimesNet(nn.Module):
         self.embedding: DataEmbedding | None = None
         self.embedding_time_features: int | None = None
         self.output_proj: nn.Linear | None = None
+        self.sigma_proj: nn.Linear | None = None
         self.output_dim: int | None = None
         self._out_steps = self.pred_len if self.mode == "direct" else 1
         self.register_buffer("min_sigma_vector", None)
@@ -357,7 +358,7 @@ class TimesNet(nn.Module):
 
         c_in = int(x.size(-1))
         time_dim = int(x_mark.size(-1)) if x_mark is not None else 0
-        if self.embedding is None or self.output_proj is None:
+        if self.embedding is None or self.output_proj is None or self.sigma_proj is None:
             if (
                 isinstance(self.min_sigma_vector, torch.Tensor)
                 and self.min_sigma_vector.numel() > 0
@@ -378,6 +379,9 @@ class TimesNet(nn.Module):
             ).to(device=x.device, dtype=x.dtype)
             self.embedding_time_features = time_dim
             self.output_proj = nn.Linear(self.d_model, c_in).to(
+                device=x.device, dtype=x.dtype
+            )
+            self.sigma_proj = nn.Linear(self.d_model, c_in).to(
                 device=x.device, dtype=x.dtype
             )
             self.output_dim = c_in
@@ -443,5 +447,8 @@ class TimesNet(nn.Module):
         extended = extended[:, :, -target_steps:]
         extended = extended.permute(0, 2, 1).contiguous()  # [B, target_steps, d_model]
         mu = self.output_proj(extended)  # type: ignore[operator]
-        sigma = self._sigma_from_ref(mu)
+        assert self.sigma_proj is not None  # for type checkers
+        floor = self._sigma_from_ref(mu)
+        sigma_head = self.sigma_proj(extended)
+        sigma = F.softplus(sigma_head) + floor
         return mu, sigma
