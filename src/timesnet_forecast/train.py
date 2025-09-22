@@ -597,6 +597,37 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     )
 
     epochs = int(cfg["train"]["epochs"])
+    accum_steps = max(int(cfg["train"].get("accumulation_steps", 1)), 1)
+
+    batches_per_epoch = len(dl_train)
+    updates_per_epoch = max(1, math.ceil(batches_per_epoch / accum_steps)) if batches_per_epoch > 0 else 1
+
+    warmup_steps_cfg = cfg["train"].get("lr_warmup_steps")
+    warmup_epochs_cfg = cfg["train"].get("lr_warmup_epochs")
+    if warmup_steps_cfg is not None and warmup_epochs_cfg is not None:
+        raise ValueError("Specify only one of train.lr_warmup_steps or train.lr_warmup_epochs")
+
+    warmup_steps = 0
+    warmup_epochs = 0
+    if warmup_steps_cfg is not None:
+        warmup_steps = max(int(warmup_steps_cfg), 0)
+        if warmup_steps > 0:
+            warmup_epochs = max(1, math.ceil(warmup_steps / updates_per_epoch)) if updates_per_epoch > 0 else warmup_steps
+    elif warmup_epochs_cfg is not None:
+        warmup_epochs = max(int(warmup_epochs_cfg), 0)
+        warmup_steps = warmup_epochs * updates_per_epoch
+
+    warmup_start_factor = 1.0
+    warmup_length = warmup_steps if warmup_steps > 0 else warmup_epochs
+    if warmup_length > 0:
+        if warmup_length <= 1:
+            warmup_start_factor = 0.5
+        else:
+            warmup_start_factor = max(1e-4, min(1.0, 1.0 / warmup_length))
+
+    cfg["train"]["lr_warmup_steps_effective"] = warmup_steps
+    cfg["train"]["lr_warmup_epochs_effective"] = warmup_epochs
+    cfg["train"]["lr_warmup_start_factor_effective"] = warmup_start_factor
 
     sched_cfg = cfg["train"].get("lr_scheduler", {})
     scheduler: torch.optim.lr_scheduler._LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None
@@ -622,11 +653,41 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             t_max = int(t_max_val)
         except (TypeError, ValueError):
             t_max = epochs
-        scheduler = CosineAnnealingLR(
+        cosine_t_max = max(1, t_max - warmup_epochs) if warmup_epochs > 0 else t_max
+        cosine_sched = CosineAnnealingLR(
             optim,
-            T_max=t_max,
+            T_max=cosine_t_max,
             eta_min=float(sched_cfg.get("eta_min", 1e-5)),
         )
+        scheduler = cosine_sched
+        if warmup_epochs > 0:
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optim,
+                start_factor=warmup_start_factor,
+                end_factor=1.0,
+                total_iters=warmup_epochs,
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optim,
+                schedulers=[warmup_scheduler, cosine_sched],
+                milestones=[warmup_epochs],
+            )
+    elif warmup_epochs > 0:
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optim,
+            start_factor=warmup_start_factor,
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        scheduler = warmup_scheduler
+
+    if warmup_epochs > 0 and sched_type == "ReduceLROnPlateau":
+        console().print(
+            "[yellow]Warmup requested but not supported with ReduceLROnPlateau scheduler; skipping warmup.[/yellow]"
+        )
+        cfg["train"]["lr_warmup_steps_effective"] = 0
+        cfg["train"]["lr_warmup_epochs_effective"] = 0
+        cfg["train"]["lr_warmup_start_factor_effective"] = 1.0
 
     try:
         grad_scaler = torch.amp.GradScaler(
@@ -647,8 +708,6 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     patience_limit = cfg["train"].get("early_stopping_patience")
     patience = 0
     best_epoch = 0
-    accum_steps = int(cfg["train"].get("accumulation_steps", 1))
-
     if use_graphs:
         warmup_iters = 3
         train_iter = iter(dl_train)
@@ -721,7 +780,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             graph.replay()
             return float(static_loss.item())
 
-    print_config(cfg)
+    print_config(cfg, current_lr=optim.param_groups[0]["lr"])
     for ep in range(1, epochs + 1):
         model.train()
         losses: List[float] = []
