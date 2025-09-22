@@ -2,6 +2,7 @@ import math
 from pathlib import Path
 import sys
 
+import pytest
 import torch
 
 # Ensure the project src is on the path for imports
@@ -67,3 +68,35 @@ def test_fft_period_selector_handles_zero_k():
 
     assert periods.numel() == 0
     assert amplitudes.numel() == 0
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is required for AMP coverage"
+)
+def test_fft_period_selector_amp_non_power_of_two_sequence():
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    B, L, C = 2, 150, 4  # L is intentionally non-power-of-two
+
+    selector = FFTPeriodSelector(k_periods=3, pmax=L).to(device)
+
+    x_ref = torch.randn(B, L, C, device=device, dtype=torch.float32, requires_grad=True)
+    periods_ref, amplitudes_ref = selector(x_ref)
+    loss_ref = amplitudes_ref.sum()
+    loss_ref.backward()
+    grad_ref = x_ref.grad.detach().clone()
+
+    x_amp = x_ref.detach().clone().requires_grad_(True)
+    with torch.cuda.amp.autocast():
+        periods_amp, amplitudes_amp = selector(x_amp)
+        loss_amp = amplitudes_amp.sum()
+
+    assert periods_amp.dtype == torch.long
+    assert amplitudes_amp.dtype == x_amp.dtype
+
+    loss_amp.backward()
+
+    assert torch.equal(periods_amp, periods_ref)
+    assert torch.allclose(amplitudes_amp, amplitudes_ref, atol=1e-3, rtol=1e-3)
+    assert x_amp.grad is not None
+    assert torch.allclose(x_amp.grad, grad_ref, atol=1e-3, rtol=1e-3)
