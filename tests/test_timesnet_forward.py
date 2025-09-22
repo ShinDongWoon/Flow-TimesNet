@@ -7,6 +7,7 @@ import torch
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 from timesnet_forecast.models.timesnet import TimesNet
+from timesnet_forecast.train import gaussian_nll_loss
 
 
 def test_forward_shape_and_head_processing():
@@ -66,3 +67,40 @@ def test_timesnet_applies_per_series_floor():
     _, sigma = model(x)
     expected_floor = floor.view(1, 1, N)
     assert torch.all(sigma >= expected_floor)
+
+
+def test_timesnet_sigma_head_produces_finite_loss():
+    torch.manual_seed(0)
+    B, L, H, N = 4, 24, 6, 2
+
+    model = TimesNet(
+        input_len=L,
+        pred_len=H,
+        d_model=16,
+        n_layers=2,
+        k_periods=2,
+        kernel_set=[(3, 3)],
+        dropout=0.1,
+        activation="gelu",
+        mode="direct",
+    )
+    model.train()
+    with torch.no_grad():
+        _ = model(torch.zeros(1, L, N))
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    x = torch.randn(B, L, N)
+    y = torch.randn(B, H, N)
+
+    optimizer.zero_grad()
+    mu, sigma = model(x)
+    loss = gaussian_nll_loss(mu, sigma, y).mean()
+    assert torch.isfinite(loss)
+    loss.backward()
+    optimizer.step()
+
+    with torch.no_grad():
+        mu_eval, sigma_eval = model(x)
+        post_update_loss = gaussian_nll_loss(mu_eval, sigma_eval, y).mean()
+        assert torch.isfinite(post_update_loss)
+        assert torch.all(sigma_eval > 0)
