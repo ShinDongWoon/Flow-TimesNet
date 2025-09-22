@@ -15,6 +15,9 @@
   stability. Validation uses the mean Gaussian NLL for model selection while still reporting
   SMAPE as a secondary diagnostic metric.
 - Configuration option `model.inception_kernel_set` has been renamed to `model.kernel_set`. The previous name is still accepted for backward compatibility.
+- `model.bottleneck_ratio` toggles ``1×1 → k×k → 1×1`` bottlenecks inside every inception branch.
+  Ratios greater than ``1`` shrink the hidden width while ratios below ``1`` expand it; set the
+  value to ``1.0`` to recover the previous single ``k×k`` convolution without bottlenecks.
 - Using CUDA Graphs (`train.cuda_graphs: true`) disables dropout because the model is placed in evaluation mode during graph capture. This trades regularization for faster execution.
 - Activation checkpointing can be toggled via `train.use_checkpoint`. Enabling it reduces memory usage at the cost of slower training throughput and is automatically turned off when CUDA graphs are active.
 - Manual CUDA graph capture (`train.cuda_graphs`) and `torch.compile` (`train.compile`) are mutually exclusive. TorchDynamo already performs graph capture and its compiled modules cannot be re-captured safely.
