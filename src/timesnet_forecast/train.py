@@ -766,18 +766,19 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
 
         def graph_step(
             xb: torch.Tensor, yb: torch.Tensor, mb: torch.Tensor, hb: torch.Tensor
-        ) -> float:
+        ) -> torch.Tensor:
             static_x.copy_(xb)
             static_y.copy_(yb)
             static_m.copy_(mb)
             static_hist.copy_(hb)
             graph.replay()
-            return float(static_loss.item())
+            return static_loss.detach()
 
     print_config(cfg)
     for ep in range(1, epochs + 1):
         model.train()
-        losses: List[float] = []
+        losses: List[torch.Tensor] = []
+        loss_total = torch.zeros((), device=device, dtype=torch.float32)
         optim.zero_grad(set_to_none=True)
         num_batches = len(dl_train)
         for i, (xb, yb, mb, hb) in enumerate(
@@ -794,7 +795,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 xb = xb.to(memory_format=torch.channels_last)
             _assert_min_len(xb, model.period.pmax)
             if use_graphs:
-                loss_val = graph_step(xb, yb, mb, hb)
+                loss_tensor = graph_step(xb, yb, mb, hb)
             else:
                 with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                     mu, sigma = model(xb, mask=hb)
@@ -802,7 +803,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                     masked_loss = _masked_mean(loss_tensor, mb)
                     loss = masked_loss / accum_steps
                 grad_scaler.scale(loss).backward()
-                loss_val = float(masked_loss.item())
+                loss_tensor = masked_loss.detach()
             if (i + 1) % accum_steps == 0 or (i + 1) == num_batches:
                 if grad_clip and grad_clip > 0:
                     grad_scaler.unscale_(optim)
@@ -810,7 +811,11 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 grad_scaler.step(optim)
                 grad_scaler.update()
                 optim.zero_grad(set_to_none=True)
-            losses.append(float(loss_val))
+            loss_scalar = loss_tensor.detach()
+            if use_graphs:
+                loss_scalar = loss_scalar.clone()
+            losses.append(loss_scalar)
+            loss_total = loss_total + loss_scalar
 
         eval_metrics = _eval_metrics(
             model,
@@ -825,8 +830,9 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         )
         val_nll = eval_metrics["nll"]
         val_smape = eval_metrics["smape"]
+        epoch_loss = (loss_total / len(losses)).item() if losses else float("nan")
         console().print(
-            f"[bold]Epoch {ep}[/bold] loss={np.mean(losses):.6f}  val_nll={val_nll:.6f}  val_smape={val_smape:.6f}"
+            f"[bold]Epoch {ep}[/bold] loss={epoch_loss:.6f}  val_nll={val_nll:.6f}  val_smape={val_smape:.6f}"
         )
         if scheduler is not None:
             if sched_type == "ReduceLROnPlateau":
