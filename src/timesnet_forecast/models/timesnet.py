@@ -125,7 +125,10 @@ class InceptionBranch(nn.Module):
                 nn.Conv2d(in_ch, out_ch, kernel_size=(kh, kw), padding=pad)
             )
         else:
-            mid_ch = max(1, int(out_ch // float(bottleneck_ratio)))
+            base = min(in_ch, out_ch)
+            mid_ch = max(
+                1, int(math.ceil(base / float(bottleneck_ratio)))
+            )
             self.branch = nn.Sequential(
                 nn.Conv2d(in_ch, mid_ch, kernel_size=1),
                 nn.Conv2d(mid_ch, mid_ch, kernel_size=(kh, kw), padding=pad),

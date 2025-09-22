@@ -71,3 +71,31 @@ def test_inception_branch_ratio_one_single_conv():
         out_direct = conv(x)
 
     assert torch.allclose(out_branch, out_direct)
+
+
+def test_inception_branch_contracts_when_ratio_gt_one_and_expands_output():
+    in_ch, out_ch = 3, 7
+    ratio = 2.5
+    branch = InceptionBranch(
+        in_ch=in_ch,
+        out_ch=out_ch,
+        kernel_size=(3, 3),
+        bottleneck_ratio=ratio,
+    )
+
+    modules = list(branch.branch.children())
+    assert len(modules) == 3
+
+    first_conv, _mid_conv, final_conv = modules
+    assert isinstance(first_conv, nn.Conv2d)
+    assert first_conv.in_channels == in_ch
+    assert first_conv.out_channels < in_ch
+
+    assert isinstance(final_conv, nn.Conv2d)
+    assert final_conv.out_channels == out_ch
+
+    x = torch.randn(2, in_ch, 5, 5)
+    with torch.no_grad():
+        out = branch(x)
+
+    assert out.shape == (2, out_ch, 5, 5)
