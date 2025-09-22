@@ -689,6 +689,24 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         cfg["train"]["lr_warmup_epochs_effective"] = 0
         cfg["train"]["lr_warmup_start_factor_effective"] = 1.0
 
+    warmup_active = (
+        cfg["train"].get("lr_warmup_epochs_effective", 0) > 0
+        and scheduler is not None
+        and hasattr(scheduler, "base_lrs")
+    )
+    if warmup_active:
+        initial_lrs: List[float] = []
+        for base_lr, param_group in zip(scheduler.base_lrs, optim.param_groups):
+            warmup_lr = base_lr * warmup_start_factor
+            param_group["lr"] = warmup_lr
+            initial_lrs.append(warmup_lr)
+        if hasattr(scheduler, "_last_lr"):
+            scheduler._last_lr = initial_lrs
+        if isinstance(scheduler, torch.optim.lr_scheduler.SequentialLR):
+            for sub_scheduler in scheduler._schedulers:
+                if hasattr(sub_scheduler, "_last_lr"):
+                    sub_scheduler._last_lr = initial_lrs
+
     try:
         grad_scaler = torch.amp.GradScaler(
             device_type=device.type,
