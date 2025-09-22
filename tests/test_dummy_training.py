@@ -35,6 +35,7 @@ def test_dummy_training_smape_wsmape():
         input_len=input_len,
         pred_len=pred_len,
         d_model=16,
+        d_ff=32,
         n_layers=2,
         k_periods=2,
         kernel_set=[(3, 3)],

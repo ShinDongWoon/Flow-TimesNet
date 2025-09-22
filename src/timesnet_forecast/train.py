@@ -557,20 +557,26 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         min_sigma_vector_tensor = None
 
     # --- model
+    model_cfg = cfg["model"]
+    d_model = int(model_cfg["d_model"])
+    d_ff = int(model_cfg.get("d_ff", 4 * d_model))
+    model_cfg["d_ff"] = d_ff
+
     model = TimesNet(
         input_len=input_len,
         pred_len=pred_len,
-        d_model=int(cfg["model"]["d_model"]),
-        n_layers=int(cfg["model"]["n_layers"]),
-        k_periods=int(cfg["model"]["k_periods"]),
+        d_model=d_model,
+        d_ff=d_ff,
+        n_layers=int(model_cfg["n_layers"]),
+        k_periods=int(model_cfg["k_periods"]),
         min_period_threshold=min_period_threshold,
-        kernel_set=list(cfg["model"]["kernel_set"]),
-        dropout=float(cfg["model"]["dropout"]),
-        activation=str(cfg["model"]["activation"]),
+        kernel_set=list(model_cfg["kernel_set"]),
+        dropout=float(model_cfg["dropout"]),
+        activation=str(model_cfg["activation"]),
         mode=mode,
         channels_last=cfg["train"]["channels_last"],
         use_checkpoint=use_checkpoint,
-        use_embedding_norm=bool(cfg["model"].get("use_embedding_norm", True)),
+        use_embedding_norm=bool(model_cfg.get("use_embedding_norm", True)),
         min_sigma=min_sigma_scalar,
         min_sigma_vector=min_sigma_vector_tensor,
     ).to(device)

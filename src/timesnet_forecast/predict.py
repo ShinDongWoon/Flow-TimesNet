@@ -86,20 +86,26 @@ def predict_once(cfg: Dict) -> str:
 
     input_len = int(cfg_used["model"]["input_len"])
     pred_len = int(cfg_used["model"]["pred_len"])
+    model_cfg = cfg_used["model"]
+    d_model = int(model_cfg["d_model"])
+    d_ff = int(model_cfg.get("d_ff", 4 * d_model))
+    model_cfg["d_ff"] = d_ff
+
     model = TimesNet(
         input_len=input_len,
         pred_len=pred_len,
-        d_model=int(cfg_used["model"]["d_model"]),
-        n_layers=int(cfg_used["model"]["n_layers"]),
-        k_periods=int(cfg_used["model"]["k_periods"]),
+        d_model=d_model,
+        d_ff=d_ff,
+        n_layers=int(model_cfg["n_layers"]),
+        k_periods=int(model_cfg["k_periods"]),
         min_period_threshold=min_period_threshold,
-        kernel_set=list(cfg_used["model"]["kernel_set"]),
-        dropout=float(cfg_used["model"]["dropout"]),
-        activation=str(cfg_used["model"]["activation"]),
-        mode=str(cfg_used["model"]["mode"]),
+        kernel_set=list(model_cfg["kernel_set"]),
+        dropout=float(model_cfg["dropout"]),
+        activation=str(model_cfg["activation"]),
+        mode=str(model_cfg["mode"]),
         channels_last=cfg_used["train"]["channels_last"],
         use_checkpoint=use_checkpoint,
-        use_embedding_norm=bool(cfg_used["model"].get("use_embedding_norm", True)),
+        use_embedding_norm=bool(model_cfg.get("use_embedding_norm", True)),
         min_sigma=min_sigma_scalar,
         min_sigma_vector=min_sigma_vector_tensor,
     ).to(device)
