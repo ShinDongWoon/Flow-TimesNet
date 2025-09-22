@@ -25,7 +25,7 @@ from .utils.metrics import wsmape_grouped, smape_mean
 from .utils import io as io_utils
 from .data.split import make_holdout_slices, make_rolling_slices
 from .data.dataset import SlidingWindowDataset
-from .models.timesnet import TimesNet, PeriodicityTransform
+from .models.timesnet import TimesNet
 from .predict import forecast_recursive_batch
 
 
@@ -145,11 +145,25 @@ def _assert_min_len(x: torch.Tensor, pmax: int) -> None:
         )
 
 
+def _model_pmax(model: nn.Module) -> int:
+    """Retrieve the ``pmax`` attribute from ``model`` for compatibility."""
+
+    if hasattr(model, "period_selector"):
+        selector = getattr(model, "period_selector")
+        if hasattr(selector, "pmax"):
+            return int(selector.pmax)
+    if hasattr(model, "period"):
+        period = getattr(model, "period")
+        if hasattr(period, "pmax"):
+            return int(period.pmax)
+    raise AttributeError("model does not expose a pmax attribute")
+
+
 def _compute_pmax_global(arrays: List[np.ndarray], k: int, cap: int) -> int:
     """Compute global maximum period length across training arrays.
 
-    Uses :meth:`PeriodicityTransform._topk_freq` to determine dominant
-    frequencies for each series and derives the corresponding period lengths.
+    Estimates dominant shared frequencies via FFT magnitude spectra averaged
+    across series, mirroring :class:`FFTPeriodSelector`.
 
     Args:
         arrays: List of training arrays shaped ``[T, N]``.
@@ -166,11 +180,20 @@ def _compute_pmax_global(arrays: List[np.ndarray], k: int, cap: int) -> int:
     for arr in arrays:
         if arr.size == 0:
             continue
-        x = torch.from_numpy(arr.T.astype(np.float32))  # [N, T]
-        kidx, _ = PeriodicityTransform._topk_freq(x, k)
-        if kidx.numel() == 0:
+        series = torch.from_numpy(arr.astype(np.float32)).transpose(0, 1)  # [N, T]
+        spec = torch.fft.rfft(series, dim=1)
+        amp = torch.abs(spec)
+        if amp.size(1) <= 1:
             continue
-        periods = torch.clamp(x.shape[-1] // torch.clamp(kidx, min=1), min=1)
+        amp[:, 0] = 0.0
+        available = amp.size(1) - 1
+        topk = min(k, available)
+        if topk <= 0:
+            continue
+        values, indices = torch.topk(amp, k=topk, dim=1)
+        indices = torch.clamp(indices, min=1)
+        periods = torch.div(series.size(1), indices, rounding_mode="floor")
+        periods = torch.clamp(periods, min=1, max=cap)
         pmax = max(pmax, int(periods.max().item()))
     return min(pmax, cap)
 
@@ -354,7 +377,7 @@ def _eval_wsmape(
                 loss_mask = loss_mask.to(yb.dtype)
             if channels_last and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
-            _assert_min_len(xb, model.period.pmax)
+            _assert_min_len(xb, _model_pmax(model))
             if mode == "direct":
                 mu, _ = model(xb)
             else:
@@ -399,7 +422,7 @@ def _eval_metrics(
                 loss_mask = loss_mask.to(yb.dtype)
             if channels_last and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
-            _assert_min_len(xb, model.period.pmax)
+            _assert_min_len(xb, _model_pmax(model))
             if mode == "direct":
                 mu, sigma = model(xb)
             else:
@@ -693,7 +716,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 mb_w = torch.ones_like(yb_w)
             if cfg["train"]["channels_last"] and xb_w.dim() == 4:
                 xb_w = xb_w.to(memory_format=torch.channels_last)
-            _assert_min_len(xb_w, model.period.pmax)
+            _assert_min_len(xb_w, _model_pmax(model))
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                 mu_w, sigma_w = model(xb_w)
                 loss_tensor = gaussian_nll_loss(mu_w, sigma_w, yb_w, min_sigma=min_sigma)
@@ -729,7 +752,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         with torch.cuda.stream(capture_stream):
             graph.capture_begin()
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
-                _assert_min_len(static_x, model.period.pmax)
+                _assert_min_len(static_x, _model_pmax(model))
                 static_mu, static_sigma = model(static_x)
                 static_loss_tensor = gaussian_nll_loss(
                     static_mu, static_sigma, static_y, min_sigma=min_sigma
@@ -764,7 +787,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 mb = torch.ones_like(yb)
             if cfg["train"]["channels_last"] and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
-            _assert_min_len(xb, model.period.pmax)
+            _assert_min_len(xb, _model_pmax(model))
             if use_graphs:
                 loss_val = graph_step(xb, yb, mb)
             else:

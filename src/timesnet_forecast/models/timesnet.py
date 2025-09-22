@@ -7,121 +7,131 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 
-class PeriodicityTransform(nn.Module):
-    """Approximate period folding via FFT."""
+class FFTPeriodSelector(nn.Module):
+    """Shared dominant period selector based on FFT magnitude spectra."""
 
     def __init__(
         self, k_periods: int, pmax: int, min_period_threshold: int = 1
     ) -> None:
         super().__init__()
-        self.k = int(k_periods)
+        self.k = int(max(0, k_periods))
         self.pmax = int(max(1, pmax))
         min_thresh = int(max(1, min_period_threshold))
         self.min_period_threshold = int(min(self.pmax, min_thresh))
 
-    @staticmethod
-    def _topk_freq(x: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return indices of top-k nonzero frequencies alongside amplitudes.
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Select shared dominant periods for ``x``.
 
         Args:
-            x: [..., T] 실수 시퀀스
-            k: 선택할 빈도 수
+            x: Input tensor shaped ``[B, L, C]`` where ``L`` is the temporal
+                dimension and ``C`` enumerates feature channels.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
-                - [..., k] 형태의 주파수 인덱스
-                - [..., k] 형태의 주파수 진폭
+                - Selected period lengths ``[K]`` as ``torch.long`` values.
+                - Corresponding averaged amplitudes ``[K]`` for weighting.
         """
-        T = x.size(-1)
-        spec = torch.fft.rfft(x, dim=-1)
-        amp = torch.abs(spec)
-        if amp.size(-1) > 0:
-            amp[..., 0] = 0.0  # DC 성분 제외
-        avail = amp.size(-1) - 1 if amp.size(-1) > 1 else 0
-        k = min(k, avail) if avail > 0 else 0
-        if k <= 0:
-            idx_shape = list(x.shape[:-1]) + [0]
-            empty_idx = torch.zeros(idx_shape, dtype=torch.long, device=x.device)
-            empty_amp = torch.zeros(idx_shape, dtype=amp.dtype, device=x.device)
+
+        if x.ndim != 3:
+            raise ValueError("FFTPeriodSelector expects input shaped [B, L, C]")
+
+        B, L, C = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        if self.k <= 0 or L <= 1 or C <= 0 or B <= 0:
+            empty_idx = torch.zeros(0, dtype=torch.long, device=device)
+            empty_amp = torch.zeros(0, dtype=dtype, device=device)
             return empty_idx, empty_amp
-        values, indices = torch.topk(amp, k=k, dim=-1)
+
+        spec = torch.fft.rfft(x, dim=1)
+        amp = torch.abs(spec)
+        amp_mean = amp.mean(dim=(0, 2))
+
+        if amp_mean.numel() <= 1:
+            empty_idx = torch.zeros(0, dtype=torch.long, device=device)
+            empty_amp = torch.zeros(0, dtype=amp_mean.dtype, device=device)
+            return empty_idx, empty_amp.to(dtype)
+
+        amp_mean = amp_mean.to(dtype)
+        amp_mean[0] = 0.0  # Remove DC component
+
+        available = amp_mean.numel() - 1
+        k = min(self.k, available)
+        if k <= 0:
+            empty_idx = torch.zeros(0, dtype=torch.long, device=device)
+            empty_amp = torch.zeros(0, dtype=dtype, device=device)
+            return empty_idx, empty_amp
+
+        freq_indices = torch.arange(amp_mean.numel(), device=device, dtype=dtype)
+        tie_break = freq_indices * torch.finfo(dtype).eps
+        scores = amp_mean - tie_break
+        _, indices = torch.topk(scores, k=k, largest=True)
+        values = amp_mean.gather(0, indices)
         indices = torch.clamp(indices, min=1)
-        return indices, values
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Vectorised period folding.
-
-        Args:
-            x: [B, T, N]
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                folded tensor [B, N, K, C_max, P_max]
-                mask tensor   [B, N, K, C_max, P_max]
-                amplitude      [B, N, K]
-        """
-        B, T, N = x.shape
-        # Flatten batch & channel for joint processing
-        seqs = x.permute(0, 2, 1).reshape(B * N, T)  # [BN, T]
-
-        if self.k <= 0:
-            empty = x.new_zeros(B, N, 0, 1, self.pmax)
-            empty_amp = x.new_zeros(B, N, 0)
-            return empty, empty, empty_amp
-
-        kidx, kamp = self._topk_freq(seqs, self.k)  # [BN, K]
-        K = kidx.size(1)
-        if K == 0 or kidx.numel() == 0:
-            Kpad = max(int(self.k), 0)
-            empty = x.new_zeros(B, N, Kpad, 1, self.pmax)
-            empty_amp = x.new_zeros(B, N, Kpad)
-            return empty, empty, empty_amp
-
-        # Compute period lengths and cycles
-        P = T // torch.clamp(kidx, min=1)
-        P = torch.clamp(
-            P, min=self.min_period_threshold, max=self.pmax
-        )  # [BN, K]
-        cycles = torch.clamp(T // P, min=1)  # [BN, K]
-        take = cycles * P
-
-        Pmax = self.pmax
-        # Keep ``Cmax`` as a tensor to avoid ``.item()`` which breaks GPU capture
-        Cmax_t = torch.clamp(cycles.max(), min=1)
-        idx_c = torch.arange(Cmax_t, device=x.device)
-        idx_p = torch.arange(Pmax, device=x.device)
-
-        BN = B * N
-        base = torch.clamp(T - take, min=0)[..., None, None]
-        P_exp = P[..., None, None]
-        indices = base + idx_c.view(1, 1, -1, 1) * P_exp + idx_p.view(1, 1, 1, -1)
-        indices = indices.clamp(min=0, max=T - 1)
-
-        seqs_exp = (
-            seqs.unsqueeze(1).unsqueeze(2).expand(BN, K, idx_c.size(0), -1)
+        periods = torch.div(L, indices, rounding_mode="floor")
+        periods = periods.to(torch.long)
+        periods = torch.clamp(
+            periods,
+            min=self.min_period_threshold,
+            max=self.pmax,
         )
-        gathered = torch.gather(seqs_exp, dim=-1, index=indices)
 
-        mask_c = idx_c.view(1, 1, -1, 1) < cycles[..., None, None]
-        mask_p = idx_p.view(1, 1, 1, -1) < P[..., None, None]
-        mask = (mask_c & mask_p).to(gathered.dtype)
-        gathered = gathered * mask
+        return periods, values
 
-        Cmax = gathered.size(2)
-        gathered = gathered.reshape(B, N, K, Cmax, Pmax)
-        flat_mask = mask.reshape(B, N, K, Cmax, Pmax)
-        kamp = kamp.reshape(B, N, K)
-        if K < self.k:
-            pad_shape = (B, N, self.k - K, Cmax, Pmax)
-            gathered_pad = gathered.new_zeros(pad_shape)
-            mask_pad = flat_mask.new_zeros(pad_shape)
-            gathered = torch.cat([gathered, gathered_pad], dim=2)
-            flat_mask = torch.cat([flat_mask, mask_pad], dim=2)
-            amp_pad = kamp.new_zeros(B, N, self.k - K)
-            kamp = torch.cat([kamp, amp_pad], dim=2)
-        return gathered, flat_mask, kamp
+
+def fold_by_periods(
+    seqs: torch.Tensor, periods: torch.Tensor, pmax: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fold 1D sequences according to ``periods`` producing a period grid.
+
+    Args:
+        seqs: Tensor shaped ``[B, L]`` containing the sequences to fold.
+        periods: Integer tensor ``[K]`` with period lengths to extract.
+        pmax: Maximum length of the period axis in the folded representation.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - Folded tensor ``[B, K, C_max, pmax]``.
+            - Mask tensor with the same shape marking valid elements.
+    """
+
+    if periods.numel() == 0:
+        empty = seqs.new_zeros(seqs.size(0), 0, 1, pmax)
+        return empty, empty
+
+    device = seqs.device
+    L = seqs.size(1)
+    periods = periods.to(device=device, dtype=torch.long)
+    periods = torch.clamp(periods, min=1, max=int(pmax))
+
+    cycles = torch.div(L, torch.clamp(periods, min=1), rounding_mode="floor")
+    cycles = torch.clamp(cycles, min=1)
+    take = cycles * periods
+
+    Cmax_t = torch.clamp(cycles.max(), min=1)
+    idx_c = torch.arange(Cmax_t, device=device)
+    idx_p = torch.arange(int(pmax), device=device)
+
+    base = torch.clamp(L - take, min=0)
+    base = base.view(1, -1, 1, 1)
+    periods_exp = periods.view(1, -1, 1, 1)
+
+    indices = base + idx_c.view(1, 1, -1, 1) * periods_exp + idx_p.view(1, 1, 1, -1)
+    indices = indices.clamp(min=0, max=max(L - 1, 0))
+    indices = indices.expand(seqs.size(0), -1, -1, -1)
+
+    seqs_exp = seqs.unsqueeze(1).unsqueeze(2).expand(-1, periods.size(0), idx_c.numel(), -1)
+    gathered = torch.gather(seqs_exp, dim=-1, index=indices)
+
+    mask_c = idx_c.view(1, 1, -1, 1) < cycles.view(1, -1, 1, 1)
+    mask_p = idx_p.view(1, 1, 1, -1) < periods.view(1, -1, 1, 1)
+    mask = (mask_c & mask_p).to(gathered.dtype)
+    mask = mask.expand(seqs.size(0), -1, -1, -1).contiguous()
+
+    gathered = gathered * mask
+    return gathered, mask
 
 
 class InceptionBlock(nn.Module):
@@ -209,50 +219,75 @@ class TimesBlock(nn.Module):
         else:
             self.act_layer = nn.GELU()
         self.inner_dropout = nn.Dropout(dropout)
-        self.period_transform = PeriodicityTransform(
-            k_periods=self.period_channels,
-            pmax=int(pmax),
-            min_period_threshold=int(min_period_threshold),
-        )
+        self.pmax = int(pmax)
+        self.min_period_threshold = int(max(1, min_period_threshold))
 
     def forward(
         self,
         features: torch.Tensor,
-        step_mask: torch.Tensor | None = None,
+        step_mask: torch.Tensor | None,
+        periods: torch.Tensor,
+        amplitudes: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Fold the 1D feature map and compute a residual update."""
+        """Fold the 1D feature map using shared periods and compute an update."""
 
         B_eff, channel_count, seq_len = features.shape
         device = features.device
         dtype = features.dtype
-        self.period_transform = self.period_transform.to(device=device, dtype=dtype)
+
+        periods = periods.to(device=device, dtype=torch.long)
+        periods = periods[periods > 0]
+        periods = torch.clamp(
+            periods,
+            min=self.min_period_threshold,
+            max=self.pmax,
+        )
+
+        if periods.numel() == 0:
+            zero_update = torch.zeros_like(features)
+            if step_mask is not None:
+                new_mask = step_mask.to(dtype=dtype)
+            else:
+                new_mask = torch.ones(B_eff, 1, seq_len, device=device, dtype=dtype)
+            return zero_update, new_mask
+
         if step_mask is not None:
             features_in = features * step_mask.to(dtype=dtype)
         else:
             features_in = features
 
         seq = features_in.reshape(B_eff * channel_count, seq_len)
-        seq = seq.unsqueeze(-1)
-        folded, mask, freq_amp = self.period_transform(seq)
+        folded, mask = fold_by_periods(seq, periods, self.pmax)
         if folded.numel() == 0:
             zero_update = torch.zeros_like(features)
             if step_mask is not None:
                 new_mask = step_mask.to(dtype=dtype)
             else:
-                new_mask = torch.zeros(B_eff, 1, seq_len, device=device, dtype=dtype)
+                new_mask = torch.ones(B_eff, 1, seq_len, device=device, dtype=dtype)
             return zero_update, new_mask
 
-        K = folded.size(2)
-        cycles = folded.size(3)
-        periods = folded.size(4)
-        folded = folded.reshape(B_eff, channel_count, K, cycles, periods)
-        mask = mask.reshape(B_eff, channel_count, K, cycles, periods).to(dtype=folded.dtype)
-        freq_amp = freq_amp.reshape(B_eff, channel_count, K)
+        Cmax = folded.size(2)
+        K = folded.size(1)
+        if K > self.period_channels:
+            folded = folded[:, : self.period_channels]
+            mask = mask[:, : self.period_channels]
+            K = self.period_channels
+        if K < self.period_channels:
+            pad_shape = (folded.size(0), self.period_channels - K, Cmax, self.pmax)
+            folded = torch.cat([folded, folded.new_zeros(pad_shape)], dim=1)
+            mask = torch.cat([mask, mask.new_zeros(pad_shape)], dim=1)
+        folded = folded.reshape(B_eff, channel_count, self.period_channels, Cmax, self.pmax)
+        mask = mask.reshape(B_eff, channel_count, self.period_channels, Cmax, self.pmax)
+        mask = mask.to(dtype=folded.dtype)
 
         conv_in = folded * mask
-        conv_in_flat = conv_in.reshape(B_eff * channel_count, K, cycles, periods)
+        conv_in_flat = conv_in.reshape(
+            B_eff * channel_count, self.period_channels, Cmax, self.pmax
+        )
         z2d_flat = self.inception(conv_in_flat)
-        z2d = z2d_flat.reshape(B_eff, channel_count, -1, cycles, periods).squeeze(2)
+        z2d = z2d_flat.reshape(
+            B_eff, channel_count, -1, Cmax, self.pmax
+        ).squeeze(2)
 
         cycle_mask = mask.amax(dim=2)
         weights = cycle_mask.to(dtype=z2d.dtype)
@@ -273,18 +308,33 @@ class TimesBlock(nn.Module):
         branch_recon = branch_recon * (branch_weight > 0).to(dtype=branch_recon.dtype)
 
         branch_valid = mask.amax(dim=(3, 4)) > 0
+        freq_amp: torch.Tensor | None
+        if amplitudes is not None and amplitudes.numel() > 0:
+            amp = amplitudes.to(device=device, dtype=branch_recon.dtype)
+            amp = amp[: self.period_channels]
+            if amp.size(0) < self.period_channels:
+                pad = torch.zeros(
+                    self.period_channels - amp.size(0),
+                    device=device,
+                    dtype=branch_recon.dtype,
+                )
+                amp = torch.cat([amp, pad], dim=0)
+            freq_amp = amp.view(1, 1, -1).expand(B_eff, channel_count, -1)
+        else:
+            freq_amp = None
+
         if freq_amp is not None and freq_amp.numel() > 0:
-            amp = freq_amp.to(dtype=branch_recon.dtype)
             invalid_fill = torch.finfo(branch_recon.dtype).min
             amp = torch.where(
                 branch_valid,
-                amp,
-                torch.full_like(amp, invalid_fill),
+                freq_amp,
+                torch.full_like(freq_amp, invalid_fill),
             )
             weight_logits = amp
             branch_weights = F.softmax(weight_logits, dim=2)
         else:
             branch_weights = branch_valid.to(dtype=branch_recon.dtype)
+
         branch_weights = branch_weights * branch_valid.to(dtype=branch_recon.dtype)
         weight_denom = branch_weights.sum(dim=2, keepdim=True)
         weight_safe = torch.where(
@@ -315,10 +365,9 @@ class TimesBlock(nn.Module):
 
 class TimesNet(nn.Module):
     """
-    입력 [B, T, N] -> PeriodicityTransform -> [B, N, K, C, P]
-    2D InceptionBlock이 [채널(K), 주기(C), 길이(P)] 격자에서 패턴을 추출하고
-    주기 축 풀링을 통해 1D 시퀀스로 환원한 뒤 residual 스택을 구성합니다.
-    전역 풀링 후 선형 헤드가 pred_len 생성 (direct) 또는 1스텝 (recursive).
+    입력 [B, T, N]에서 FFT 기반으로 공유 주기를 선택하고,
+    2D InceptionBlock이 [채널(K), 주기(C), 길이(P)] 격자에서 패턴을 추출한 뒤
+    주기 축 풀링과 residual 스택을 통해 예측을 생성합니다.
     """
     def __init__(
         self,
@@ -343,7 +392,7 @@ class TimesNet(nn.Module):
         self.mode = mode
         self.pred_len = int(pred_len)
         self._out_steps = self.pred_len if self.mode == "direct" else 1
-        self.period = PeriodicityTransform(
+        self.period_selector = FFTPeriodSelector(
             k_periods=k_periods,
             pmax=pmax,
             min_period_threshold=min_period_threshold,
@@ -354,6 +403,7 @@ class TimesNet(nn.Module):
         # We don't know the period-length ``P`` at build time, so layers are built lazily
         # during the first forward pass once the flattened length ``K*P`` is known.
         self.blocks: nn.ModuleList = nn.ModuleList()
+        self.selector_embedding: nn.Module = nn.Identity()
         self.input_proj: nn.Module = nn.Identity()
         self.residual_dropout: nn.Module = nn.Identity()
         self.pool: nn.Module = nn.Identity()
@@ -376,6 +426,9 @@ class TimesNet(nn.Module):
         Args:
             x: reference tensor for device/dtype placement
         """
+        self.selector_embedding = nn.Conv1d(1, self.d_model, kernel_size=1).to(
+            device=x.device, dtype=x.dtype
+        )
         self.input_proj = nn.Conv1d(self.k_periods, self.d_model, kernel_size=1).to(
             device=x.device, dtype=x.dtype
         )
@@ -387,8 +440,8 @@ class TimesNet(nn.Module):
                 kernel_set=self.kernel_set,
                 dropout=self.dropout,
                 activation=self.act,
-                pmax=self.period.pmax,
-                min_period_threshold=self.period.min_period_threshold,
+                pmax=self.period_selector.pmax,
+                min_period_threshold=self.period_selector.min_period_threshold,
             ).to(device=x.device, dtype=x.dtype)
             blocks.append(block)
         self.blocks = nn.ModuleList(blocks)
@@ -417,39 +470,78 @@ class TimesNet(nn.Module):
                     "min_sigma_vector length does not match number of series"
                 )
             sigma_floor = self.min_sigma_vector
-        z_all, mask_all, _ = self.period(x)
+        if not self._lazy_built:
+            self._build_lazy(x=x)
+
         BN = B * N
-        K = z_all.size(2)
-        if K == 0:
+        seqs = x.permute(0, 2, 1).reshape(BN, T)
+        selector_in = seqs.unsqueeze(1)
+        selector_embed = self.selector_embedding(selector_in)
+        selector_embed = selector_embed.permute(0, 2, 1)
+        self.period_selector = self.period_selector.to(
+            device=selector_embed.device, dtype=selector_embed.dtype
+        )
+        periods, amplitudes = self.period_selector(selector_embed)
+
+        if periods.numel() == 0:
             out_steps = self._out_steps
             mu = x.new_zeros(B, out_steps, N)
             if sigma_floor is not None:
-                sigma = sigma_floor.to(dtype=x.dtype, device=x.device).expand(B, out_steps, -1).clone()
+                sigma = (
+                    sigma_floor.to(dtype=x.dtype, device=x.device)
+                    .expand(B, out_steps, -1)
+                    .clone()
+                )
             else:
                 sigma = x.new_full((B, out_steps, N), self.min_sigma)
             return mu, sigma
-        folded = z_all.reshape(BN, K, z_all.size(3), z_all.size(4))
-        mask = mask_all.reshape(BN, K, mask_all.size(3), mask_all.size(4))
+
+        folded, mask = fold_by_periods(seqs, periods, self.period_selector.pmax)
+        if folded.numel() == 0:
+            out_steps = self._out_steps
+            mu = x.new_zeros(B, out_steps, N)
+            if sigma_floor is not None:
+                sigma = (
+                    sigma_floor.to(dtype=x.dtype, device=x.device)
+                    .expand(B, out_steps, -1)
+                    .clone()
+                )
+            else:
+                sigma = x.new_full((B, out_steps, N), self.min_sigma)
+            return mu, sigma
+
         mask = mask.to(dtype=folded.dtype)
         cycle_weight = mask.sum(dim=2)
         eps = torch.finfo(folded.dtype).eps
         aggregated = (folded * mask).sum(dim=2) / (cycle_weight + eps)
         aggregated = aggregated * (cycle_weight > 0).to(dtype=aggregated.dtype)
+
+        K = aggregated.size(1)
+        if K > self.k_periods:
+            aggregated = aggregated[:, : self.k_periods]
+            cycle_weight = cycle_weight[:, : self.k_periods]
+        elif K < self.k_periods:
+            pad_k = self.k_periods - K
+            pad_agg = aggregated.new_zeros(aggregated.size(0), pad_k, aggregated.size(2))
+            aggregated = torch.cat([aggregated, pad_agg], dim=1)
+            pad_cycle = cycle_weight.new_zeros(cycle_weight.size(0), pad_k, cycle_weight.size(2))
+            cycle_weight = torch.cat([cycle_weight, pad_cycle], dim=1)
+
         step_mask = (cycle_weight > 0).any(dim=1, keepdim=True).to(dtype=aggregated.dtype)
-        if not self._lazy_built:
-            self._build_lazy(x=aggregated)
         features = self.input_proj(aggregated)
         features = features * step_mask
         for blk in self.blocks:
             if self.use_checkpoint:
                 delta, step_mask = checkpoint(
-                    lambda inp, mask_in: blk(inp, mask_in),
+                    blk,
                     features,
                     step_mask,
+                    periods,
+                    amplitudes,
                     use_reentrant=False,
                 )
             else:
-                delta, step_mask = blk(features, step_mask)
+                delta, step_mask = blk(features, step_mask, periods, amplitudes)
             delta = self.residual_dropout(delta)
             features = (features + delta) * step_mask
         z = features * step_mask
