@@ -24,7 +24,7 @@ train:
   device: "cuda"              # "cuda"|"cpu" 자동 선택 코드에서 처리
   epochs: 70
   early_stopping_patience: 10
-  batch_size: 64
+  batch_size: 128
   accumulation_steps: 1
   lr_warmup_steps: 400       # conservative warmup for unnormalized SMAPE training
   lr: 1.0e-3
