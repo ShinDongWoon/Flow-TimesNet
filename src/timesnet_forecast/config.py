@@ -68,10 +68,15 @@ class Config:
         if overrides:
             base = apply_overrides(base, overrides)
         # Backward compatibility: rename inception_kernel_set -> kernel_set
-        model_cfg = base.get("model", {})
+        model_cfg = base.setdefault("model", {})
         if "inception_kernel_set" in model_cfg and "kernel_set" not in model_cfg:
             model_cfg["kernel_set"] = model_cfg.pop("inception_kernel_set")
-            base["model"] = model_cfg
+        # Inject defaults for newly introduced static/id embedding knobs to
+        # maintain backwards compatibility with older config files that do not
+        # specify them explicitly.
+        model_cfg.setdefault("id_embed_dim", 32)
+        model_cfg.setdefault("static_proj_dim", 32)
+        model_cfg.setdefault("static_layernorm", True)
         return Config(raw=base)
 
     def get(self, path: str, default: Any = None) -> Any:

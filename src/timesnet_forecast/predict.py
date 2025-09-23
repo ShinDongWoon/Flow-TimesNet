@@ -208,6 +208,14 @@ def predict_once(cfg: Dict) -> str:
     bottleneck_ratio = float(model_cfg.get("bottleneck_ratio", 1.0))
     model_cfg["bottleneck_ratio"] = bottleneck_ratio
 
+    id_embed_dim = int(model_cfg.get("id_embed_dim", 32))
+    static_proj_cfg = model_cfg.get("static_proj_dim", 32)
+    static_proj_dim = None if static_proj_cfg is None else int(static_proj_cfg)
+    static_layernorm = bool(model_cfg.get("static_layernorm", True))
+    model_cfg["id_embed_dim"] = id_embed_dim
+    model_cfg["static_proj_dim"] = static_proj_dim
+    model_cfg["static_layernorm"] = static_layernorm
+
     model = TimesNet(
         input_len=input_len,
         pred_len=pred_len,
@@ -226,6 +234,9 @@ def predict_once(cfg: Dict) -> str:
         use_embedding_norm=bool(model_cfg.get("use_embedding_norm", True)),
         min_sigma=min_sigma_scalar,
         min_sigma_vector=min_sigma_vector_tensor,
+        id_embed_dim=id_embed_dim,
+        static_proj_dim=static_proj_dim,
+        static_layernorm=static_layernorm,
     ).to(device)
     # Lazily construct layers by mirroring the training warm-up.
     with torch.no_grad():

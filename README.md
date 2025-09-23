@@ -25,3 +25,13 @@
 - Enable fully deterministic execution by setting `train.deterministic: true`. This seeds every RNG, disables cuDNN benchmarking, and enforces deterministic algorithms via `torch.use_deterministic_algorithms`, yielding reproducible metrics and weights for integration tests.
 - Sliding windows are fixed to `model.input_len` without zero padding. Ensure both training and inference provide at least that much history; optional temporal covariates can be passed alongside the values tensor when using the built-in embedding.
 - The model "telescopes" input sequences: `TimesNet.forward` always crops to the first `input_len` steps of the periodic canvas, so passing extra history at inference produces the same `[B, pred_len, N]` shaped output as training.
+
+## Static features and series ID embeddings
+
+- During training the pipeline computes simple static covariates for every series via `compute_series_features` and stores them in the scaler artifact. These features are aligned with the `ids` array so inference can re-use them without recomputation. Custom static features can be supplied by precomputing a `[num_series, feature_dim]` tensor and passing it through the dataloader hooks in `train_once` (see the `series_static` arguments to `_build_dataloader`).
+- `TimesNet` now accepts per-series identifiers via `series_ids` and optional static covariates via `series_static`. The configuration exposes the relevant hyper-parameters:
+  - `model.id_embed_dim` (default `32`) controls the width of the learned ID embedding. Set it to `0` to disable the embedding entirely when identifiers are not informative.
+  - `model.static_proj_dim` (default `32`) specifies the projection width applied to static covariates before they are concatenated with temporal features. Use `null` to keep the raw feature dimensionality or reduce the value to shrink the projection.
+  - `model.static_layernorm` toggles a `LayerNorm` after the static projection. Leaving it enabled stabilises training when mixing features with very different scales.
+- Larger embedding dimensions increase both parameter count and activation memory. The ID embedding contributes approximately `num_series × id_embed_dim` parameters (for example, 1 000 series with a width of 64 adds 64 000 weights), while the static projection introduces roughly `static_input_dim × static_proj_dim + static_proj_dim` parameters. Plan GPU memory accordingly when increasing these knobs or when enabling Optuna sweeps over them.
+- Override the new hyper-parameters via the CLI, e.g. `timesnet-forecast train --override model.id_embed_dim=16 model.static_proj_dim=null`, or include them in Optuna search spaces (`model.id_embed_dim: {choices: [0, 16, 32], type: "categorical"}`) to tune their impact automatically.
