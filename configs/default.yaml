@@ -62,7 +62,7 @@ model:
   d_ff: 1024
   n_layers: 3
   dropout: 0.1
-  k_periods: 4
+  k_periods: 3
   min_period_threshold: 7  # 최소 주기 하한선
   kernel_set:
     - [3, 3]
