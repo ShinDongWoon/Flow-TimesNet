@@ -161,6 +161,21 @@ def _unpack_batch(batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torc
     return xb, yb, mask, static, series_ids
 
 
+def _call_model_optional(
+    model: nn.Module,
+    xb: torch.Tensor,
+    series_static: torch.Tensor | None,
+    series_ids: torch.Tensor | None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    try:
+        return model(xb, series_static=series_static, series_ids=series_ids)
+    except TypeError as err:
+        err_str = str(err)
+        if "series_static" in err_str or "series_ids" in err_str:
+            return model(xb)
+        raise
+
+
 def _assert_min_len(x: torch.Tensor, required_len: int) -> None:
     """Ensure the sequence length meets the model's minimum requirement."""
     if x.size(1) < required_len:
@@ -347,22 +362,36 @@ def _eval_wsmape(
     model.eval()
     ys: List[np.ndarray] = []
     ps: List[np.ndarray] = []
+    default_series_ids = torch.arange(len(ids), dtype=torch.long, device=device)
     with torch.inference_mode(), amp_autocast(True if device.type == "cuda" else False):
         for batch in loader:
-            xb, yb, mask, _, _ = _unpack_batch(batch)
+            xb, yb, mask, static, series_idx = _unpack_batch(batch)
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
-            loss_mask = move_to_device(mask, device) if use_loss_mask else None
-            if loss_mask is not None:
-                loss_mask = loss_mask.to(yb.dtype)
+            mask_dev = move_to_device(mask, device)
+            loss_mask = mask_dev.to(yb.dtype) if use_loss_mask else None
+            if static is not None:
+                static = move_to_device(static, device)
+            if series_idx is not None:
+                series_idx = series_idx.to(device=device, dtype=torch.long, non_blocking=True)
+            else:
+                series_idx = default_series_ids
             if channels_last and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
             _assert_min_len(xb, _model_input_len(model))
             if mode == "direct":
-                mu, _ = model(xb)
+                mu, _ = _call_model_optional(
+                    model, xb, static, series_idx
+                )
             else:
                 # recursive multi-step forecast during validation
-                mu, _ = forecast_recursive_batch(model, xb, pred_len)
+                mu, _ = forecast_recursive_batch(
+                    model,
+                    xb,
+                    pred_len,
+                    series_static=static,
+                    series_ids=series_idx,
+                )
                 mu = mu[:, : yb.shape[1], :]
             if loss_mask is not None:
                 yb_eval = yb * loss_mask
@@ -393,21 +422,38 @@ def _eval_metrics(
     ps: List[np.ndarray] = []
     nll_num = 0.0
     nll_den = 0.0
+    default_series_ids = torch.arange(len(ids), dtype=torch.long, device=device)
     with torch.inference_mode(), amp_autocast(True if device.type == "cuda" else False):
         for batch in loader:
-            xb, yb, mask, _, _ = _unpack_batch(batch)
+            xb, yb, mask, static, series_idx = _unpack_batch(batch)
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
-            loss_mask = move_to_device(mask, device) if use_loss_mask else None
-            if loss_mask is not None:
-                loss_mask = loss_mask.to(yb.dtype)
+            mask_dev = move_to_device(mask, device)
+            loss_mask = mask_dev.to(yb.dtype) if use_loss_mask else None
+            if static is not None:
+                static = move_to_device(static, device)
+            if series_idx is not None:
+                series_idx = series_idx.to(device=device, dtype=torch.long, non_blocking=True)
+            else:
+                series_idx = default_series_ids
             if channels_last and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
             _assert_min_len(xb, _model_input_len(model))
             if mode == "direct":
-                mu, sigma = model(xb)
+                mu, sigma = _call_model_optional(
+                    model,
+                    xb,
+                    static,
+                    series_idx,
+                )
             else:
-                mu, sigma = forecast_recursive_batch(model, xb, pred_len)
+                mu, sigma = forecast_recursive_batch(
+                    model,
+                    xb,
+                    pred_len,
+                    series_static=static,
+                    series_ids=series_idx,
+                )
                 mu = mu[:, : yb.shape[1], :]
                 sigma = sigma[:, : yb.shape[1], :]
             if loss_mask is not None:
@@ -556,6 +602,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     )
     if len(dl_val.dataset) == 0:
         raise ValueError("Validation split has no windows; increase train.val.holdout_days or adjust model.input_len/pred_len.")
+
+    series_ids_default = torch.arange(len(ids), dtype=torch.long, device=device)
 
     use_loss_masking = bool(cfg["train"].get("use_loss_masking", False))
 
@@ -776,24 +824,42 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     if use_graphs:
         warmup_iters = 3
         train_iter = iter(dl_train)
+        graph_captured = False
+        static_series_buf: torch.Tensor | None = None
+        static_ids_buf: torch.Tensor | None = None
         for w in range(warmup_iters):
             try:
                 batch_w = next(train_iter)
             except StopIteration:
                 break
-            xb_w, yb_w, mb_w, _, _ = _unpack_batch(batch_w)
+            xb_w, yb_w, mask_w, static_w, series_ids_w = _unpack_batch(batch_w)
             xb_w = xb_w.to(device, non_blocking=True)
             yb_w = yb_w.to(device, non_blocking=True)
             if use_loss_masking:
-                mb_w = mb_w.to(device, non_blocking=True).to(yb_w.dtype)
+                mask_w = mask_w.to(device, non_blocking=True)
+                mb_w = mask_w.to(yb_w.dtype)
             else:
-                mb_w = torch.ones_like(yb_w)
+                mb_w = torch.ones_like(yb_w, dtype=yb_w.dtype, device=device)
+            if static_w is not None:
+                static_w = static_w.to(device=device, non_blocking=True)
+            if series_ids_w is not None:
+                series_ids_w = series_ids_w.to(
+                    device=device, dtype=torch.long, non_blocking=True
+                )
+            else:
+                series_ids_w = series_ids_default
             if cfg["train"]["channels_last"] and xb_w.dim() == 4:
                 xb_w = xb_w.to(memory_format=torch.channels_last)
             _assert_min_len(xb_w, _model_input_len(model))
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
-                mu_w, sigma_w = model(xb_w)
-                loss_tensor = gaussian_nll_loss(mu_w, sigma_w, yb_w, min_sigma=min_sigma)
+                mu_w, sigma_w = model(
+                    xb_w,
+                    series_static=static_w,
+                    series_ids=series_ids_w,
+                )
+                loss_tensor = gaussian_nll_loss(
+                    mu_w, sigma_w, yb_w, min_sigma=min_sigma
+                )
                 loss_w = _masked_mean(loss_tensor, mb_w) / accum_steps
             grad_scaler.scale(loss_w).backward()
             if (w + 1) % accum_steps == 0:
@@ -804,14 +870,27 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 grad_scaler.update()
                 optim.zero_grad(set_to_none=True)
 
-        batch0 = next(train_iter)
-        xb0, yb0, mb0, _, _ = _unpack_batch(batch0)
+        try:
+            batch0 = next(train_iter)
+        except StopIteration:
+            train_iter = iter(dl_train)
+            batch0 = next(train_iter)
+        xb0, yb0, mask0, static0, series_ids0 = _unpack_batch(batch0)
         xb0 = xb0.to(device, non_blocking=True)
         yb0 = yb0.to(device, non_blocking=True)
         if use_loss_masking:
-            mb0 = mb0.to(device, non_blocking=True).to(yb0.dtype)
+            mask0 = mask0.to(device, non_blocking=True)
+            mb0 = mask0.to(yb0.dtype)
         else:
-            mb0 = torch.ones_like(yb0)
+            mb0 = torch.ones_like(yb0, dtype=yb0.dtype, device=device)
+        if static0 is not None:
+            static0 = static0.to(device=device, non_blocking=True)
+        if series_ids0 is not None:
+            series_ids0 = series_ids0.to(
+                device=device, dtype=torch.long, non_blocking=True
+            )
+        else:
+            series_ids0 = series_ids_default
         if cfg["train"]["channels_last"] and xb0.dim() == 4:
             xb0 = xb0.to(memory_format=torch.channels_last)
         static_x = torch.empty_like(xb0)
@@ -820,6 +899,12 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         static_x.copy_(xb0)
         static_y.copy_(yb0)
         static_m.copy_(mb0)
+        if static0 is not None:
+            static_series_buf = torch.empty_like(static0)
+            static_series_buf.copy_(static0)
+        if series_ids0 is not None:
+            static_ids_buf = torch.empty_like(series_ids0)
+            static_ids_buf.copy_(series_ids0)
         capture_stream = torch.cuda.Stream()
         graph = torch.cuda.CUDAGraph()
         optim.zero_grad(set_to_none=True)
@@ -828,7 +913,11 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             graph.capture_begin()
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                 _assert_min_len(static_x, _model_input_len(model))
-                static_mu, static_sigma = model(static_x)
+                static_mu, static_sigma = model(
+                    static_x,
+                    series_static=static_series_buf,
+                    series_ids=static_ids_buf,
+                )
                 static_loss_tensor = gaussian_nll_loss(
                     static_mu, static_sigma, static_y, min_sigma=min_sigma
                 )
@@ -836,14 +925,35 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 static_scaled = static_loss / accum_steps
             grad_scaler.scale(static_scaled).backward()
             graph.capture_end()
+            graph_captured = True
         torch.cuda.current_stream().wait_stream(capture_stream)
         model.train()
         optim.zero_grad(set_to_none=True)
+        assert graph_captured, "CUDA graph capture did not complete successfully"
+        console().print("[green]CUDA graph captured successfully.[/green]")
 
-        def graph_step(xb: torch.Tensor, yb: torch.Tensor, mb: torch.Tensor) -> float:
+        def graph_step(
+            xb: torch.Tensor,
+            yb: torch.Tensor,
+            mb: torch.Tensor,
+            static_feat: torch.Tensor | None,
+            series_idx: torch.Tensor,
+        ) -> float:
             static_x.copy_(xb)
             static_y.copy_(yb)
             static_m.copy_(mb)
+            if static_series_buf is not None:
+                if static_feat is None:
+                    raise RuntimeError(
+                        "series_static buffer captured but no features provided"
+                    )
+                static_series_buf.copy_(static_feat)
+            elif static_feat is not None:
+                raise RuntimeError(
+                    "series_static provided but CUDA graph captured without buffer"
+                )
+            if static_ids_buf is not None:
+                static_ids_buf.copy_(series_idx)
             graph.replay()
             return float(static_loss.item())
 
@@ -853,27 +963,49 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         losses: List[float] = []
         optim.zero_grad(set_to_none=True)
         num_batches = len(dl_train)
+        copy_time_total = 0.0
+        iter_time_total = 0.0
         for i, batch in enumerate(tqdm(dl_train, desc=f"Epoch {ep}/{epochs}", leave=False)):
-            xb, yb, mb, _, _ = _unpack_batch(batch)
+            iter_start = time.perf_counter()
+            xb, yb, mask, static_feat, series_idx = _unpack_batch(batch)
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
             if use_loss_masking:
-                mb = mb.to(device, non_blocking=True).to(yb.dtype)
+                mask = mask.to(device, non_blocking=True)
+                mb = mask.to(yb.dtype)
             else:
-                mb = torch.ones_like(yb)
+                mb = torch.ones_like(yb, dtype=yb.dtype, device=device)
+            if static_feat is not None:
+                static_feat = static_feat.to(device=device, non_blocking=True)
+            if series_idx is not None:
+                series_idx = series_idx.to(
+                    device=device, dtype=torch.long, non_blocking=True
+                )
+            else:
+                series_idx = series_ids_default
             if cfg["train"]["channels_last"] and xb.dim() == 4:
                 xb = xb.to(memory_format=torch.channels_last)
             _assert_min_len(xb, _model_input_len(model))
+            after_copy = time.perf_counter()
             if use_graphs:
-                loss_val = graph_step(xb, yb, mb)
+                loss_val = graph_step(xb, yb, mb, static_feat, series_idx)
             else:
                 with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
-                    mu, sigma = model(xb)
-                    loss_tensor = gaussian_nll_loss(mu, sigma, yb, min_sigma=min_sigma)
+                    mu, sigma = model(
+                        xb,
+                        series_static=static_feat,
+                        series_ids=series_idx,
+                    )
+                    loss_tensor = gaussian_nll_loss(
+                        mu, sigma, yb, min_sigma=min_sigma
+                    )
                     masked_loss = _masked_mean(loss_tensor, mb)
                     loss = masked_loss / accum_steps
                 grad_scaler.scale(loss).backward()
                 loss_val = float(masked_loss.item())
+            iter_end = time.perf_counter()
+            copy_time_total += after_copy - iter_start
+            iter_time_total += max(iter_end - iter_start, 1e-12)
             if (i + 1) % accum_steps == 0 or (i + 1) == num_batches:
                 if grad_clip and grad_clip > 0:
                     grad_scaler.unscale_(optim)
@@ -882,6 +1014,15 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 grad_scaler.update()
                 optim.zero_grad(set_to_none=True)
             losses.append(float(loss_val))
+
+        if num_batches > 0 and iter_time_total > 0.0:
+            overhead_pct = (copy_time_total / iter_time_total) * 100.0
+            console().print(
+                (
+                    f"[cyan]Epoch {ep} data prep overhead: {overhead_pct:.2f}% "
+                    f"(prep {copy_time_total:.4f}s / iter {iter_time_total:.4f}s)[/cyan]"
+                )
+            )
 
         eval_metrics = _eval_metrics(
             model,

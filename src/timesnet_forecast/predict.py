@@ -25,13 +25,28 @@ def forecast_direct_batch(
 
 
 def forecast_recursive_batch(
-    model: TimesNet, last_seq: torch.Tensor, H: int
+    model: TimesNet,
+    last_seq: torch.Tensor,
+    H: int,
+    series_static: torch.Tensor | None = None,
+    series_ids: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     mus: List[torch.Tensor] = []
     sigmas: List[torch.Tensor] = []
     seq = last_seq
     for _ in range(H):
-        mu_step, sigma_step = model(seq)
+        try:
+            mu_step, sigma_step = model(
+                seq,
+                series_static=series_static,
+                series_ids=series_ids,
+            )
+        except TypeError as err:
+            err_str = str(err)
+            if "series_static" in err_str or "series_ids" in err_str:
+                mu_step, sigma_step = model(seq)
+            else:
+                raise
         mus.append(mu_step)
         sigmas.append(sigma_step)
         seq = torch.cat([seq[:, 1:, :], mu_step], dim=1)
