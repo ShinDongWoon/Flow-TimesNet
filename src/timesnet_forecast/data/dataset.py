@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Tuple, Dict
+from typing import Dict, Sequence
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -21,6 +21,8 @@ class SlidingWindowDataset(Dataset):
         recursive_pred_len: int | None = None,
         augment: Dict | None = None,
         valid_mask: np.ndarray | None = None,  # [T, N]
+        series_static: np.ndarray | None = None,
+        series_ids: Sequence[int] | np.ndarray | None = None,
     ) -> None:
         super().__init__()
         assert mode in ("direct", "recursive")
@@ -50,22 +52,49 @@ class SlidingWindowDataset(Dataset):
         # output length, so the last valid start index is ``T - L - H``.
         self.idxs = np.arange(self.T - self.L - self.H + 1)
         # In recursive mode ``self.H`` may be 1 (training) or >1 (validation).
+        self._X_tensor = torch.from_numpy(self.X)
+        self._M_tensor = torch.from_numpy(self.M)
+
+        if series_static is not None:
+            static_arr = np.asarray(series_static, dtype=np.float32)
+            if static_arr.ndim == 1:
+                static_arr = static_arr.reshape(-1, 1)
+            if static_arr.shape[0] != self.N:
+                raise ValueError(
+                    "series_static must have shape [num_series, num_features]"
+                )
+            self.series_static = torch.from_numpy(static_arr)
+        else:
+            self.series_static = None
+
+        if series_ids is not None:
+            ids_arr = np.asarray(series_ids)
+            if ids_arr.ndim != 1:
+                raise ValueError("series_ids must be a 1D sequence")
+            if ids_arr.shape[0] != self.N:
+                raise ValueError("series_ids length must match number of series")
+            self.series_ids = torch.from_numpy(ids_arr.astype(np.int64, copy=False))
+        else:
+            self.series_ids = None
 
     def __len__(self) -> int:
         return int(len(self.idxs))
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, ...]:
         s = int(self.idxs[idx])
         if self.time_shift > 0:
             delta = np.random.randint(-self.time_shift, self.time_shift + 1)
             s = int(np.clip(s + delta, 0, self.T - self.L - self.H))
         e = s + self.L
-        x = self.X[s:e, :]
-        y = self.X[e : e + self.H, :]  # [H, N] or [1, N]
-        mask = self.M[e : e + self.H, :]
+        x_tensor = self._X_tensor[s:e, :].clone()
         if self.add_noise_std > 0:
-            x = x + np.random.normal(scale=self.add_noise_std, size=x.shape)
-        x = x.astype(np.float32, copy=False)
-        y = y.astype(np.float32, copy=False)
-        mask = mask.astype(np.float32, copy=False)
-        return torch.from_numpy(x), torch.from_numpy(y), torch.from_numpy(mask)
+            noise = torch.randn_like(x_tensor) * self.add_noise_std
+            x_tensor = x_tensor + noise
+        y_tensor = self._X_tensor[e : e + self.H, :].clone()
+        mask_tensor = self._M_tensor[e : e + self.H, :].clone()
+        items: list[torch.Tensor] = [x_tensor, y_tensor, mask_tensor]
+        if self.series_static is not None:
+            items.append(self.series_static)
+        if self.series_ids is not None:
+            items.append(self.series_ids)
+        return tuple(items)

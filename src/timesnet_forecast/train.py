@@ -92,7 +92,7 @@ def _should_use_cuda_graphs(train_cfg: Dict, device: torch.device) -> bool:
 
 def _build_dataloader(
     arrays: List[np.ndarray],
-    masks: List[np.ndarray],
+    masks: List[np.ndarray | None],
     input_len: int,
     pred_len: int,
     mode: str,
@@ -105,9 +105,15 @@ def _build_dataloader(
     drop_last: bool,
     recursive_pred_len: int | None = None,
     augment: Dict | None = None,
+    series_static: List[np.ndarray | None] | None = None,
+    series_ids: List[np.ndarray | None] | None = None,
 ) -> DataLoader:
     if len(arrays) != len(masks):
         raise ValueError("arrays and masks must have the same length")
+    if series_static is not None and len(series_static) != len(arrays):
+        raise ValueError("series_static must match arrays length when provided")
+    if series_ids is not None and len(series_ids) != len(arrays):
+        raise ValueError("series_ids must match arrays length when provided")
     datasets = [
         SlidingWindowDataset(
             a,
@@ -117,8 +123,10 @@ def _build_dataloader(
             recursive_pred_len,
             augment,
             valid_mask=m,
+            series_static=series_static[i] if series_static is not None else None,
+            series_ids=series_ids[i] if series_ids is not None else None,
         )
-        for a, m in zip(arrays, masks)
+        for i, (a, m) in enumerate(zip(arrays, masks))
     ]
     if len(datasets) == 1:
         ds = datasets[0]
@@ -134,6 +142,23 @@ def _build_dataloader(
         prefetch_factor=prefetch_factor if num_workers > 0 else 2,
         drop_last=drop_last,
     )
+
+
+def _unpack_batch(batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    if not isinstance(batch, (list, tuple)):
+        raise TypeError("batch must be a tuple or list of tensors")
+    if len(batch) == 3:
+        xb, yb, mask = batch
+        static = None
+        series_ids = None
+    elif len(batch) == 4:
+        xb, yb, mask, static = batch
+        series_ids = None
+    elif len(batch) == 5:
+        xb, yb, mask, static, series_ids = batch
+    else:
+        raise ValueError(f"Unexpected batch size: {len(batch)}")
+    return xb, yb, mask, static, series_ids
 
 
 def _assert_min_len(x: torch.Tensor, required_len: int) -> None:
@@ -323,7 +348,8 @@ def _eval_wsmape(
     ys: List[np.ndarray] = []
     ps: List[np.ndarray] = []
     with torch.inference_mode(), amp_autocast(True if device.type == "cuda" else False):
-        for xb, yb, mask in loader:
+        for batch in loader:
+            xb, yb, mask, _, _ = _unpack_batch(batch)
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
             loss_mask = move_to_device(mask, device) if use_loss_mask else None
@@ -368,7 +394,8 @@ def _eval_metrics(
     nll_num = 0.0
     nll_den = 0.0
     with torch.inference_mode(), amp_autocast(True if device.type == "cuda" else False):
-        for xb, yb, mask in loader:
+        for batch in loader:
+            xb, yb, mask, _, _ = _unpack_batch(batch)
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
             loss_mask = move_to_device(mask, device) if use_loss_mask else None
@@ -433,7 +460,6 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     mask_wide = (~wide_raw.isna()).astype(np.float32)
     wide = wide_raw.fillna(0.0)
     series_static_np, static_feature_names = compute_series_features(wide, mask_wide)
-    series_static_torch = torch.from_numpy(series_static_np)
     if cfg.get("preprocess", {}).get("clip_negative", False):
         wide = wide.clip(lower=0.0)
     ids = list(wide.columns)
@@ -505,11 +531,18 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     input_len = int(cfg["model"]["input_len"])
     pred_len = int(cfg["model"]["pred_len"])
     mode = cfg["model"]["mode"]
+    series_id_array = np.arange(len(ids), dtype=np.int64)
+    train_static_list = [series_static_np] * len(train_arrays)
+    val_static_list = [series_static_np] * len(val_arrays)
+    train_id_list = [series_id_array] * len(train_arrays)
+    val_id_list = [series_id_array] * len(val_arrays)
     dl_train = _build_dataloader(
         train_arrays, train_mask_arrays, input_len, pred_len, mode, cfg["train"]["batch_size"],
         cfg["train"]["num_workers"], cfg["train"]["pin_memory"], cfg["train"]["persistent_workers"],
         cfg["train"]["prefetch_factor"], shuffle=True, drop_last=True,
         augment=cfg["data"].get("augment"),
+        series_static=train_static_list,
+        series_ids=train_id_list,
     )
     dl_val = _build_dataloader(
         val_arrays, val_mask_arrays, input_len, pred_len, mode, batch_size=cfg["train"]["batch_size"],
@@ -518,6 +551,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         shuffle=False, drop_last=False,
         recursive_pred_len=(pred_len if mode == "recursive" else None),
         augment=None,
+        series_static=val_static_list,
+        series_ids=val_id_list,
     )
     if len(dl_val.dataset) == 0:
         raise ValueError("Validation split has no windows; increase train.val.holdout_days or adjust model.input_len/pred_len.")
@@ -743,9 +778,10 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         train_iter = iter(dl_train)
         for w in range(warmup_iters):
             try:
-                xb_w, yb_w, mb_w = next(train_iter)
+                batch_w = next(train_iter)
             except StopIteration:
                 break
+            xb_w, yb_w, mb_w, _, _ = _unpack_batch(batch_w)
             xb_w = xb_w.to(device, non_blocking=True)
             yb_w = yb_w.to(device, non_blocking=True)
             if use_loss_masking:
@@ -768,7 +804,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 grad_scaler.update()
                 optim.zero_grad(set_to_none=True)
 
-        xb0, yb0, mb0 = next(train_iter)
+        batch0 = next(train_iter)
+        xb0, yb0, mb0, _, _ = _unpack_batch(batch0)
         xb0 = xb0.to(device, non_blocking=True)
         yb0 = yb0.to(device, non_blocking=True)
         if use_loss_masking:
@@ -816,7 +853,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         losses: List[float] = []
         optim.zero_grad(set_to_none=True)
         num_batches = len(dl_train)
-        for i, (xb, yb, mb) in enumerate(tqdm(dl_train, desc=f"Epoch {ep}/{epochs}", leave=False)):
+        for i, batch in enumerate(tqdm(dl_train, desc=f"Epoch {ep}/{epochs}", leave=False)):
+            xb, yb, mb, _, _ = _unpack_batch(batch)
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
             if use_loss_masking:
