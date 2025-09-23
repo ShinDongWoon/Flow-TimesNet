@@ -87,13 +87,13 @@ class FFTPeriodSelector(nn.Module):
         tie_break = freq_indices * torch.finfo(dtype).eps
         scores = amp_mean - tie_break
         _, indices = torch.topk(scores, k=k, largest=True)
+        safe_indices = indices.to(device=device, dtype=torch.long).clamp_min(1)
         sample_values = amp_samples.gather(
-            1, indices.view(1, -1).expand(B, -1)
+            1, safe_indices.view(1, -1).expand(B, -1)
         )
-        indices = torch.clamp(indices, min=1)
 
-        periods = torch.div(L, indices, rounding_mode="floor")
-        periods = periods.to(torch.long)
+        L_t = torch.tensor(L, dtype=torch.long, device=device)
+        periods = (L_t + safe_indices - 1) // safe_indices
         periods = torch.clamp(
             periods,
             min=self.min_period_threshold,
