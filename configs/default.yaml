@@ -32,6 +32,7 @@ train:
   grad_clip_norm: 1.0
   amp: true
   compile: false
+  deterministic: false
   cuda_graphs: false         # Mutually exclusive with compile
   use_checkpoint: false      # Enable activation checkpointing to save memory at the cost of speed
   min_sigma: 1.0e-3
