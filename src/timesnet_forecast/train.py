@@ -405,9 +405,9 @@ def _eval_metrics(
 def train_once(cfg: Dict) -> Tuple[float, Dict]:
     # --- bootstrap
     device = _select_device(cfg["train"]["device"])
-    torch.backends.cudnn.benchmark = True
+    deterministic = bool(cfg["train"].get("deterministic", False))
     torch.set_float32_matmul_precision(cfg["train"]["matmul_precision"])
-    seed_everything(int(cfg.get("tuning", {}).get("seed", 2025)))
+    seed_everything(int(cfg.get("tuning", {}).get("seed", 2025)), deterministic=deterministic)
     console().print(f"[bold green]Device:[/bold green] {device}")
 
     use_graphs = _should_use_cuda_graphs(cfg["train"], device)
