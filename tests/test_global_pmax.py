@@ -117,5 +117,20 @@ def test_train_once_runs_without_pmax(tmp_path):
     assert trn_norm.shape[0] >= cfg["model"]["input_len"]
 
     train.train_once(cfg)
+    scaler_meta = io_utils.load_pickle(
+        tmp_path / "artifacts" / cfg["artifacts"]["scaler_file"]
+    )
+    static_features = scaler_meta.get("static_features")
+    feature_names = scaler_meta.get("feature_names")
+    assert isinstance(static_features, np.ndarray)
+    assert static_features.dtype == np.float32
+    assert static_features.shape[0] == len(scaler_meta["ids"])
+    assert feature_names == [
+        "mean",
+        "std",
+        "diff_std",
+        "seasonal_strength",
+        "dominant_period",
+    ]
     assert "pmax" not in cfg.get("model", {})
 

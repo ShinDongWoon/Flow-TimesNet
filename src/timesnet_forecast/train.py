@@ -23,6 +23,7 @@ from .utils.torch_opt import (
 )
 from .utils.metrics import wsmape_grouped, smape_mean
 from .utils import io as io_utils
+from .utils.static_features import compute_series_features
 from .data.split import make_holdout_slices, make_rolling_slices
 from .data.dataset import SlidingWindowDataset
 from .models.timesnet import TimesNet
@@ -431,6 +432,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     )
     mask_wide = (~wide_raw.isna()).astype(np.float32)
     wide = wide_raw.fillna(0.0)
+    series_static_np, static_feature_names = compute_series_features(wide, mask_wide)
+    series_static_torch = torch.from_numpy(series_static_np)
     if cfg.get("preprocess", {}).get("clip_negative", False):
         wide = wide.clip(lower=0.0)
     ids = list(wide.columns)
@@ -897,7 +900,13 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     schema_path = os.path.join(art_dir, cfg["artifacts"]["schema_file"])
     cfg_path = os.path.join(art_dir, cfg["artifacts"]["config_file"])
     io_utils.save_pickle(
-        {"scaler": scaler, "method": cfg["preprocess"]["normalize"], "ids": ids},
+        {
+            "scaler": scaler,
+            "method": cfg["preprocess"]["normalize"],
+            "ids": ids,
+            "static_features": series_static_np,
+            "feature_names": static_feature_names,
+        },
         scaler_path,
     )
     io_utils.save_json({"date": schema["date"], "target": schema["target"], "id": schema["id"]}, schema_path)
