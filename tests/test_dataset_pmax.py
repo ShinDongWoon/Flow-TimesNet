@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import torch
 
 # Ensure the project src is on the path for imports
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
@@ -46,3 +47,35 @@ def test_sliding_window_last_chunk_matches_source():
     np.testing.assert_allclose(x_last.squeeze(-1).numpy(), np.array([3.0, 4.0, 5.0, 6.0], dtype=np.float32))
     np.testing.assert_allclose(y_last.squeeze(-1).numpy(), np.array([7.0, 8.0, 9.0], dtype=np.float32))
     np.testing.assert_allclose(m_last.squeeze(-1).numpy(), np.array([1.0, 1.0, 1.0], dtype=np.float32))
+
+
+def test_sliding_window_static_features_collate_shape():
+    values = np.arange(20, dtype=np.float32).reshape(-1, 2)
+    mask = np.ones_like(values, dtype=np.float32)
+    static = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    series_ids = np.array([0, 1], dtype=np.int64)
+    ds = SlidingWindowDataset(
+        values,
+        input_len=3,
+        pred_len=2,
+        mode="direct",
+        recursive_pred_len=None,
+        augment=None,
+        valid_mask=mask,
+        series_static=static,
+        series_ids=series_ids,
+    )
+
+    x0, y0, m0, s0, ids0 = ds[0]
+    assert x0.dtype == torch.float32
+    assert y0.dtype == torch.float32
+    assert m0.dtype == torch.float32
+    assert s0.dtype == torch.float32
+    assert ids0.dtype == torch.long
+    assert s0.shape == static.shape
+    assert ids0.shape == series_ids.shape
+
+    loader = torch.utils.data.DataLoader(ds, batch_size=2, shuffle=False)
+    xb, yb, mb, sb, idb = next(iter(loader))
+    assert sb.shape == (2, static.shape[0], static.shape[1])
+    assert idb.shape == (2, series_ids.shape[0])
