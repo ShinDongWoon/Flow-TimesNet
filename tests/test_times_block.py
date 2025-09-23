@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,6 +35,11 @@ class AddPeriodScale(nn.Module):
     def forward(self, grid: torch.Tensor) -> torch.Tensor:
         period = grid.size(-1)
         return grid + period * torch.ones_like(grid)
+
+
+class Identity2D(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x
 
 
 def _reference_times_block(
@@ -152,3 +158,22 @@ def test_times_block_matches_reference_impl():
     expected = _reference_times_block(x, block, periods, amplitudes)
     out = block(x)
     assert torch.allclose(out, expected, atol=1e-6)
+
+
+@pytest.mark.parametrize("length,periods", [(25, [7]), (24, [5, 9])])
+def test_times_block_identity_reconstruction(length: int, periods: list[int]) -> None:
+    torch.manual_seed(0)
+    block = TimesBlock(
+        d_model=3,
+        kernel_set=[(3, 3)],
+        dropout=0.0,
+        activation="gelu",
+    )
+    block.inception = Identity2D()
+    selector = StaticSelector(periods=periods, amplitudes=[1.0] * len(periods))
+    object.__setattr__(block, "period_selector", selector)
+
+    x = torch.randn(2, length, 3)
+    out = block(x)
+
+    assert torch.allclose(out, x)

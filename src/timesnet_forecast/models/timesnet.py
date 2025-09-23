@@ -92,7 +92,12 @@ class FFTPeriodSelector(nn.Module):
         )
         indices = torch.clamp(indices, min=1)
 
-        periods = torch.div(L, indices, rounding_mode="floor")
+        try:
+            periods = torch.div(L, indices, rounding_mode="ceil")
+        except RuntimeError as exc:  # pragma: no cover - fallback for older PyTorch
+            if "rounding_mode" not in str(exc):
+                raise
+            periods = torch.div(-L, indices, rounding_mode="floor").neg()
         periods = periods.to(torch.long)
         periods = torch.clamp(
             periods,

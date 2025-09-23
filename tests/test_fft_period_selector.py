@@ -34,7 +34,10 @@ def test_fft_period_selector_shared_periods_and_ordering():
     selector = FFTPeriodSelector(k_periods=2, pmax=L)
     periods, amplitudes = selector(x)
 
-    expected_periods = [L // dominant_freqs[0], L // dominant_freqs[1]]
+    expected_periods = [
+        math.ceil(L / dominant_freqs[0]),
+        math.ceil(L / dominant_freqs[1]),
+    ]
     assert periods.tolist() == expected_periods
     assert amplitudes.shape == (B, 2)
     assert torch.all(amplitudes[:, 0] >= amplitudes[:, 1])
@@ -55,6 +58,22 @@ def test_fft_period_selector_respects_bounds():
     assert periods.tolist() == [16, 5]
     assert amplitudes.shape == (1, 2)
     assert torch.all(amplitudes > 0)
+
+
+@pytest.mark.parametrize("seq_len,freq", [(100, 7), (99, 7)])
+def test_fft_period_selector_uses_ceiling_period(seq_len: int, freq: int) -> None:
+    torch.manual_seed(0)
+    t = torch.arange(seq_len, dtype=torch.float32)
+    signal = torch.sin(2 * math.pi * freq * t / seq_len)
+    x = signal.view(1, seq_len, 1)
+
+    selector = FFTPeriodSelector(k_periods=1, pmax=seq_len)
+    periods, amplitudes = selector(x)
+
+    assert periods.numel() == 1
+    assert amplitudes.shape == (1, 1)
+    expected_period = math.ceil(seq_len / freq)
+    assert periods.item() == expected_period
 
 
 def test_fft_period_selector_handles_zero_k():
