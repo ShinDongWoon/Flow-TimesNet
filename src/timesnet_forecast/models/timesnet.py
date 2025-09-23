@@ -403,6 +403,9 @@ class TimesNet(nn.Module):
         use_embedding_norm: bool = True,
         min_sigma: float = 1e-3,
         min_sigma_vector: torch.Tensor | Sequence[float] | None = None,
+        id_embed_dim: int = 32,
+        static_proj_dim: int | None = None,
+        static_layernorm: bool = True,
     ) -> None:
         super().__init__()
         del channels_last  # retained for backward compatibility
@@ -459,29 +462,158 @@ class TimesNet(nn.Module):
         if min_sigma_vector is not None:
             min_sigma_tensor = torch.as_tensor(min_sigma_vector, dtype=torch.float32)
             self.min_sigma_vector = min_sigma_tensor.reshape(1, 1, -1)
+        self.id_embed_dim = int(id_embed_dim)
+        if self.id_embed_dim < 0:
+            raise ValueError("id_embed_dim must be non-negative")
+        if static_proj_dim is None:
+            self.static_proj_dim: int | None = None
+        else:
+            proj_val = int(static_proj_dim)
+            if proj_val <= 0:
+                raise ValueError("static_proj_dim must be a positive integer when provided")
+            self.static_proj_dim = proj_val
+        self.static_layernorm = bool(static_layernorm)
+        self.series_embedding: nn.Embedding | None = None
+        self.static_proj: nn.Linear | None = None
+        self.static_norm: nn.Module | None = None
+        self.pre_embedding_norm: nn.LayerNorm | None = None
+        self.pre_embedding_dropout = nn.Dropout(self.dropout)
+        self._augmented_in_features: int | None = None
+        self._per_series_feature_dim: int | None = None
+        self._static_in_features: int | None = None
+        self._static_out_dim: int = 0
+        self._series_id_vocab: int | None = None
+        self._series_id_reference: torch.Tensor | None = None
+        self.debug_memory: bool = False
 
     def _ensure_embedding(
-        self, x: torch.Tensor, x_mark: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        x_mark: torch.Tensor | None = None,
+        series_static: torch.Tensor | None = None,
+        series_ids: torch.Tensor | None = None,
     ) -> None:
         """Lazily instantiate embedding/output projection when dimensions are known."""
 
         c_in = int(x.size(-1))
         time_dim = int(x_mark.size(-1)) if x_mark is not None else 0
-        if self.embedding is None or self.output_proj is None or self.sigma_proj is None:
-            if (
-                isinstance(self.min_sigma_vector, torch.Tensor)
-                and self.min_sigma_vector.numel() > 0
-                and self.min_sigma_vector.shape[-1] != c_in
-            ):
-                raise ValueError(
-                    "min_sigma_vector length does not match number of series"
-                )
-            if time_dim == 0:
-                time_arg = None
+        static_out_dim = 0
+        if series_static is not None:
+            if series_static.ndim == 2:
+                static_ref = series_static
+            elif series_static.ndim == 3:
+                static_ref = series_static[0]
             else:
-                time_arg = time_dim
+                raise ValueError("series_static must have shape [N, F] or [B, N, F]")
+            if static_ref.size(0) != c_in:
+                raise ValueError(
+                    "series_static must align with the number of input series"
+                )
+            static_in = int(static_ref.size(-1))
+            if static_in <= 0:
+                raise ValueError("series_static must have at least one feature")
+            if self.static_proj is None:
+                proj_dim = (
+                    self.static_proj_dim if self.static_proj_dim is not None else static_in
+                )
+                self.static_proj = nn.Linear(static_in, proj_dim).to(
+                    device=x.device, dtype=x.dtype
+                )
+                if self.static_layernorm:
+                    self.static_norm = nn.LayerNorm(proj_dim).to(
+                        device=x.device, dtype=x.dtype
+                    )
+                else:
+                    self.static_norm = nn.Identity()
+                self._static_in_features = static_in
+                self._static_out_dim = proj_dim
+            else:
+                if self.static_proj.in_features != static_in:
+                    raise ValueError(
+                        "series_static feature dimension changed between calls"
+                    )
+                self.static_proj = self.static_proj.to(device=x.device, dtype=x.dtype)
+                if self.static_norm is not None:
+                    self.static_norm = self.static_norm.to(
+                        device=x.device, dtype=x.dtype
+                    )
+                self._static_out_dim = int(self.static_proj.out_features)
+            static_out_dim = self._static_out_dim
+        elif self.static_proj is not None:
+            self.static_proj = self.static_proj.to(device=x.device, dtype=x.dtype)
+            if self.static_norm is not None:
+                self.static_norm = self.static_norm.to(device=x.device, dtype=x.dtype)
+            static_out_dim = int(self.static_proj.out_features)
+
+        id_feature_dim = 0
+        ids_reference: torch.Tensor | None = None
+        if self.id_embed_dim > 0:
+            if series_ids is not None:
+                if series_ids.ndim == 1:
+                    ids_reference = series_ids.to(torch.long)
+                elif series_ids.ndim == 2:
+                    ids_reference = series_ids[0].to(torch.long)
+                else:
+                    raise ValueError(
+                        "series_ids must have shape [N] or [B, N]"
+                    )
+                if ids_reference.numel() != c_in:
+                    raise ValueError(
+                        "series_ids length must match number of series"
+                    )
+            if self.series_embedding is None:
+                if ids_reference is None:
+                    ids_reference = torch.arange(
+                        c_in, device=x.device, dtype=torch.long
+                    )
+                vocab = int(ids_reference.max().item()) + 1 if ids_reference.numel() > 0 else c_in
+                self.series_embedding = nn.Embedding(vocab, self.id_embed_dim).to(
+                    device=x.device, dtype=x.dtype
+                )
+                self._series_id_vocab = vocab
+                self._series_id_reference = ids_reference.to(device=x.device)
+            else:
+                self.series_embedding = self.series_embedding.to(
+                    device=x.device, dtype=x.dtype
+                )
+                if ids_reference is not None:
+                    vocab = int(ids_reference.max().item()) + 1 if ids_reference.numel() > 0 else c_in
+                    if vocab > int(self.series_embedding.num_embeddings):
+                        raise ValueError(
+                            "series_ids vocabulary expanded between calls"
+                        )
+                    self._series_id_reference = ids_reference.to(device=x.device)
+                elif self._series_id_reference is None:
+                    self._series_id_reference = torch.arange(
+                        c_in, device=x.device, dtype=torch.long
+                    )
+                self._series_id_vocab = int(self.series_embedding.num_embeddings)
+            if self._series_id_reference is not None and self._series_id_reference.numel() != c_in:
+                raise ValueError("series identifier count changed between calls")
+            id_feature_dim = self.id_embed_dim
+
+        total_per_series = 1 + static_out_dim + id_feature_dim
+        total_in = c_in * total_per_series
+
+        if (
+            isinstance(self.min_sigma_vector, torch.Tensor)
+            and self.min_sigma_vector.numel() > 0
+            and self.min_sigma_vector.shape[-1] != c_in
+        ):
+            raise ValueError(
+                "min_sigma_vector length does not match number of series"
+            )
+
+        rebuild_embedding = (
+            self.embedding is None
+            or self.output_proj is None
+            or self.sigma_proj is None
+            or self._augmented_in_features != total_in
+        )
+        if rebuild_embedding:
+            time_arg = None if time_dim == 0 else time_dim
             self.embedding = DataEmbedding(
-                c_in=c_in,
+                c_in=total_in,
                 d_model=self.d_model,
                 dropout=self.dropout,
                 time_features=time_arg,
@@ -495,12 +627,33 @@ class TimesNet(nn.Module):
                 device=x.device, dtype=x.dtype
             )
             self.output_dim = c_in
+            self._augmented_in_features = total_in
+            self._per_series_feature_dim = total_per_series
         else:
             if self.output_dim != c_in:
                 raise ValueError("Number of series changed between calls")
             expected_time = self.embedding_time_features or 0
             if time_dim != expected_time:
                 raise ValueError("Temporal feature dimension changed between calls")
+            assert self.embedding is not None and self.output_proj is not None
+            assert self.sigma_proj is not None
+            self.embedding = self.embedding.to(device=x.device, dtype=x.dtype)
+            self.output_proj = self.output_proj.to(device=x.device, dtype=x.dtype)
+            self.sigma_proj = self.sigma_proj.to(device=x.device, dtype=x.dtype)
+            self._per_series_feature_dim = total_per_series
+
+        if (
+            self.pre_embedding_norm is None
+            or tuple(self.pre_embedding_norm.normalized_shape) != (total_in,)
+        ):
+            self.pre_embedding_norm = nn.LayerNorm(total_in).to(
+                device=x.device, dtype=x.dtype
+            )
+        else:
+            self.pre_embedding_norm = self.pre_embedding_norm.to(
+                device=x.device, dtype=x.dtype
+            )
+        self.pre_embedding_dropout = self.pre_embedding_dropout.to(device=x.device)
 
     def _sigma_from_ref(self, ref: torch.Tensor) -> torch.Tensor:
         if isinstance(self.min_sigma_vector, torch.Tensor) and self.min_sigma_vector.numel() > 0:
@@ -509,7 +662,11 @@ class TimesNet(nn.Module):
         return ref.new_full(ref.shape, self.min_sigma)
 
     def forward(
-        self, x: torch.Tensor, x_mark: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        x_mark: torch.Tensor | None = None,
+        series_static: torch.Tensor | None = None,
+        series_ids: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if x.ndim != 3:
             raise ValueError("TimesNet expects input shaped [B, T, N]")
@@ -525,15 +682,108 @@ class TimesNet(nn.Module):
         else:
             mark_slice = None
         enc_x = x[:, -self.input_len :, :]
-        self._ensure_embedding(enc_x, mark_slice)
+        self._ensure_embedding(enc_x, mark_slice, series_static, series_ids)
         target_steps = self.pred_len if self.mode == "direct" else self._out_steps
-        features = self.embedding(enc_x, mark_slice)  # type: ignore[arg-type]
+        time_len = enc_x.size(1)
+        per_series_features: list[torch.Tensor] = [enc_x.unsqueeze(-1)]
+
+        if self.static_proj is not None:
+            assert self.static_proj.in_features is not None
+            static_in = int(self.static_proj.in_features)
+            if series_static is None:
+                static_tensor = enc_x.new_zeros(B, N, static_in)
+            else:
+                static_tensor = series_static
+                if static_tensor.ndim == 2:
+                    static_tensor = static_tensor.unsqueeze(0)
+                if static_tensor.ndim != 3:
+                    raise ValueError(
+                        "series_static must have shape [N, F] or [B, N, F]"
+                    )
+                if static_tensor.size(0) == 1 and B > 1:
+                    static_tensor = static_tensor.expand(B, -1, -1)
+                if static_tensor.size(0) != B:
+                    raise ValueError(
+                        "series_static batch dimension does not match input"
+                    )
+                if static_tensor.size(1) != N:
+                    raise ValueError(
+                        "series_static series dimension does not match input"
+                    )
+                if static_tensor.size(2) != static_in:
+                    raise ValueError(
+                        "series_static feature dimension changed between calls"
+                    )
+                static_tensor = static_tensor.to(device=enc_x.device, dtype=enc_x.dtype)
+            static_proj = self.static_proj(static_tensor)
+            if self.static_norm is not None:
+                static_proj = self.static_norm(static_proj)
+            static_rep = static_proj.unsqueeze(1).expand(-1, time_len, -1, -1)
+            per_series_features.append(static_rep)
+
+        if self.series_embedding is not None and self.id_embed_dim > 0:
+            if series_ids is None:
+                if self._series_id_reference is None:
+                    ids_tensor = torch.arange(
+                        N, device=enc_x.device, dtype=torch.long
+                    ).unsqueeze(0)
+                else:
+                    ids_tensor = self._series_id_reference.view(1, -1).to(enc_x.device)
+                    if ids_tensor.size(1) != N:
+                        raise ValueError(
+                            "Stored series identifiers do not match input dimension"
+                        )
+                if ids_tensor.size(0) == 1 and B > 1:
+                    ids_tensor = ids_tensor.expand(B, -1)
+            else:
+                ids_tensor = series_ids
+                if ids_tensor.ndim == 1:
+                    ids_tensor = ids_tensor.unsqueeze(0)
+                if ids_tensor.ndim != 2:
+                    raise ValueError(
+                        "series_ids must have shape [N] or [B, N]"
+                    )
+                if ids_tensor.size(0) == 1 and B > 1:
+                    ids_tensor = ids_tensor.expand(B, -1)
+                if ids_tensor.size(0) != B:
+                    raise ValueError(
+                        "series_ids batch dimension does not match input"
+                    )
+                if ids_tensor.size(1) != N:
+                    raise ValueError(
+                        "series_ids length must match number of series"
+                    )
+                ids_tensor = ids_tensor.to(device=enc_x.device, dtype=torch.long)
+                self._series_id_reference = ids_tensor[0].detach().clone()
+            ids_tensor = ids_tensor.to(device=enc_x.device, dtype=torch.long)
+            id_embed = self.series_embedding(ids_tensor)
+            id_rep = id_embed.unsqueeze(1).expand(-1, time_len, -1, -1)
+            per_series_features.append(id_rep)
+
+        combined = torch.cat(per_series_features, dim=-1)
+        combined = combined.reshape(B, time_len, -1)
+        assert (
+            self.pre_embedding_norm is not None
+        ), "pre_embedding_norm should have been initialised by _ensure_embedding"
+        combined = self.pre_embedding_norm(combined)
+        combined = self.pre_embedding_dropout(combined)
+        features = self.embedding(combined, mark_slice)  # type: ignore[arg-type]
+        if features.shape[-1] != self.d_model:
+            raise RuntimeError(
+                "Embedding output dimension mismatch with configured d_model"
+            )
         d_model = features.size(-1)
         feat_t = features.permute(0, 2, 1).contiguous()
         feat_flat = feat_t.reshape(B * d_model, self.input_len)
         extended = self.predict_linear(feat_flat)
         extended = extended.view(B, d_model, self.input_len + self.pred_len)
         features = extended.permute(0, 2, 1).contiguous()
+
+        if self.debug_memory and features.is_cuda and torch.cuda.is_available():
+            mem_bytes = torch.cuda.memory_allocated(features.device)
+            print(
+                f"[TimesNet] CUDA memory allocated after predict_linear: {mem_bytes / (1024 ** 2):.2f} MiB"
+            )
 
         self.period_selector = self.period_selector.to(
             device=features.device, dtype=features.dtype
@@ -548,6 +798,10 @@ class TimesNet(nn.Module):
             return mu, sigma
 
         for block in self.blocks:
+            if features.shape[-1] != self.d_model:
+                raise RuntimeError(
+                    "Residual input to TimesBlock must maintain d_model channels"
+                )
             if self.use_checkpoint:
                 updated = checkpoint(block, features, use_reentrant=False)
             else:
