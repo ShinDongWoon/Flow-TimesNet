@@ -19,9 +19,22 @@ def _select_device(req: str) -> torch.device:
         return torch.device("cuda:0")
     return torch.device("cpu")
 def forecast_direct_batch(
-    model: TimesNet, last_seq: torch.Tensor
+    model: TimesNet,
+    last_seq: torch.Tensor,
+    series_static: torch.Tensor | None = None,
+    series_ids: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    return model(last_seq)
+    try:
+        return model(
+            last_seq,
+            series_static=series_static,
+            series_ids=series_ids,
+        )
+    except TypeError as err:
+        err_str = str(err)
+        if "series_static" in err_str or "series_ids" in err_str:
+            return model(last_seq)
+        raise
 
 
 def forecast_recursive_batch(
@@ -78,6 +91,93 @@ def predict_once(cfg: Dict) -> str:
     ids: List[str] = list(scaler_meta["ids"])
     method = scaler_meta["method"]
     scaler = scaler_meta["scaler"]
+
+    static_features_np = None
+    static_feature_ids: List[str] | None = None
+    static_file = cfg_used["artifacts"].get("static_file")
+    if static_file:
+        static_path = static_file
+        if not os.path.isabs(static_path):
+            static_path = os.path.join(art_dir, static_path)
+        try:
+            static_payload = io_utils.load_pickle(static_path)
+        except FileNotFoundError:
+            console().print(
+                f"[yellow]Static feature artifact not found at {static_path}; falling back to scaler metadata.[/yellow]"
+            )
+        except OSError as err:
+            console().print(
+                f"[yellow]Failed to load static feature artifact {static_path}: {err}; falling back to scaler metadata.[/yellow]"
+            )
+        except Exception as err:  # noqa: BLE001
+            console().print(
+                f"[yellow]Error loading static feature artifact {static_path}: {err}; falling back to scaler metadata.[/yellow]"
+            )
+        else:
+            if isinstance(static_payload, dict):
+                static_features_np = static_payload.get("static_features")
+                payload_ids = static_payload.get("ids") or static_payload.get("series_ids")
+                if payload_ids is not None:
+                    static_feature_ids = list(payload_ids)
+            elif isinstance(static_payload, np.ndarray):
+                static_features_np = static_payload
+            else:
+                console().print(
+                    f"[yellow]Unsupported static feature artifact type {type(static_payload)!r}; falling back to scaler metadata.[/yellow]"
+                )
+                static_features_np = None
+            if static_features_np is None:
+                console().print(
+                    f"[yellow]Static feature artifact {static_path} did not contain features; falling back to scaler metadata.[/yellow]"
+                )
+
+    if static_features_np is None:
+        static_features_np = scaler_meta.get("static_features")
+        static_feature_ids = static_feature_ids or ids
+
+    static_tensor_full: torch.Tensor | None = None
+    if static_features_np is not None:
+        static_arr = np.asarray(static_features_np, dtype=np.float32)
+        if static_arr.ndim == 1:
+            static_arr = static_arr.reshape(-1, 1)
+        if static_arr.ndim != 2:
+            console().print(
+                f"[yellow]Expected 2D static features but received shape {static_arr.shape}; ignoring static features.[/yellow]"
+            )
+        else:
+            base_ids = list(static_feature_ids or ids)
+            if len(base_ids) == 0 and static_arr.shape[0] > 0:
+                base_ids = ids[: static_arr.shape[0]]
+            if static_arr.shape[0] != len(base_ids):
+                console().print(
+                    f"[yellow]Static feature count ({static_arr.shape[0]}) does not match provided id list length ({len(base_ids)}); aligning with overlap and zero-filling missing ids.[/yellow]"
+                )
+            limit = min(static_arr.shape[0], len(base_ids))
+            id_to_row = {base_ids[i]: i for i in range(limit)}
+            static_tensor_full = torch.from_numpy(static_arr).to(
+                device=device, dtype=torch.float32
+            )
+            feat_dim = int(static_tensor_full.size(1)) if static_tensor_full.ndim == 2 else 0
+            aligned = torch.zeros(
+                (len(ids), feat_dim),
+                dtype=static_tensor_full.dtype,
+                device=device,
+            )
+            missing_static_ids: List[str] = []
+            for pos, series_id in enumerate(ids):
+                row_idx = id_to_row.get(series_id)
+                if row_idx is None:
+                    missing_static_ids.append(series_id)
+                    continue
+                aligned[pos] = static_tensor_full[row_idx]
+            if missing_static_ids:
+                console().print(
+                    f"[yellow]Static features missing for {len(missing_static_ids)} series; zero-filled values will be used.[/yellow]"
+                )
+            static_tensor_full = aligned
+
+    id_position_map = {series_id: idx for idx, series_id in enumerate(ids)}
+    full_series_ids_tensor = torch.arange(len(ids), dtype=torch.long, device=device)
 
     # Build model
     min_period_threshold = int(cfg_used["model"].get("min_period_threshold", 1))
@@ -176,6 +276,41 @@ def predict_once(cfg: Dict) -> str:
             wide = wide.clip(lower=0.0)
         # align columns to training ids
         wide = wide.reindex(columns=ids).fillna(0.0)
+        columns = list(wide.columns)
+        if columns == ids:
+            series_ids_tensor = full_series_ids_tensor
+            static_tensor = static_tensor_full
+        else:
+            gather_positions: List[int] = []
+            unknown_cols: List[str] = []
+            for col in columns:
+                idx = id_position_map.get(col)
+                if idx is None:
+                    unknown_cols.append(col)
+                else:
+                    gather_positions.append(idx)
+            if unknown_cols:
+                raise ValueError(
+                    f"Test series '{fp}' contains unknown ids not seen during training: {unknown_cols}"
+                )
+            if gather_positions:
+                index_tensor = torch.tensor(
+                    gather_positions, dtype=torch.long, device=device
+                )
+            else:
+                index_tensor = torch.empty(0, dtype=torch.long, device=device)
+            series_ids_tensor = index_tensor
+            if static_tensor_full is not None:
+                if index_tensor.numel() == 0:
+                    static_tensor = static_tensor_full.new_zeros(
+                        (0, static_tensor_full.size(1))
+                    )
+                else:
+                    static_tensor = torch.index_select(
+                        static_tensor_full, 0, index_tensor
+                    )
+            else:
+                static_tensor = None
         X = wide.values.astype(np.float32)
         # transform by scaler
         if method == "none" or scaler is None:
@@ -210,9 +345,20 @@ def predict_once(cfg: Dict) -> str:
 
         with torch.inference_mode(), amp_autocast(cfg_used["train"]["amp"] and device.type == "cuda"):
             if cfg_used["model"]["mode"] == "direct":
-                mu_pred, _ = forecast_direct_batch(model, xb)
+                mu_pred, _ = forecast_direct_batch(
+                    model,
+                    xb,
+                    series_static=static_tensor,
+                    series_ids=series_ids_tensor,
+                )
             else:
-                mu_pred, _ = forecast_recursive_batch(model, xb, pred_len)
+                mu_pred, _ = forecast_recursive_batch(
+                    model,
+                    xb,
+                    pred_len,
+                    series_static=static_tensor,
+                    series_ids=series_ids_tensor,
+                )
 
         Pn = mu_pred.squeeze(0).float().cpu().numpy()  # [H, N]
         # inverse transform & clip
