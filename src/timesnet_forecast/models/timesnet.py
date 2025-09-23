@@ -74,7 +74,7 @@ class FFTPeriodSelector(nn.Module):
             return empty_idx, empty_amp.to(dtype)
 
         amp_mean = amp_mean.to(dtype)
-        amp_mean[0] = 0.0  # Remove DC component
+        amp_mean[0] = amp_mean.new_tensor(float("-inf"))  # Remove DC component
 
         available = amp_mean.numel() - 1
         k = min(self.k, available)
