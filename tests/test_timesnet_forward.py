@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 # Ensure the project src is on the path for imports
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
@@ -43,6 +44,36 @@ def test_forward_shape_and_head_processing():
     mu_head, sigma_head = model(long_x[:, :L, :])
     assert mu_long.shape == mu_head.shape == (B, H, N)
     assert sigma_long.shape == sigma_head.shape == (B, H, N)
+
+
+def test_timesnet_pre_embedding_norm_adapts_to_feature_count():
+    torch.manual_seed(0)
+    B, L, H, N = 2, 12, 4, 1
+    model = TimesNet(
+        input_len=L,
+        pred_len=H,
+        d_model=8,
+        d_ff=16,
+        n_layers=1,
+        k_periods=1,
+        kernel_set=[(3, 3)],
+        dropout=0.0,
+        activation="gelu",
+        mode="direct",
+        id_embed_dim=0,
+        static_proj_dim=2,
+    )
+
+    xb = torch.randn(B, L, N)
+    with torch.no_grad():
+        model(xb)
+    assert isinstance(model.pre_embedding_norm, nn.Identity)
+
+    static_features = torch.randn(N, 5)
+    with torch.no_grad():
+        model(xb, series_static=static_features)
+    assert isinstance(model.pre_embedding_norm, nn.LayerNorm)
+    assert tuple(model.pre_embedding_norm.normalized_shape) == (3,)
 
 
 def test_timesnet_applies_per_series_floor():
