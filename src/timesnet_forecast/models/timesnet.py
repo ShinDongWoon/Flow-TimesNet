@@ -479,7 +479,6 @@ class TimesNet(nn.Module):
         self.pre_embedding_norm: nn.Module | None = None
         self.pre_embedding_dropout = nn.Dropout(self.dropout)
         self.static_feature_norm: nn.LayerNorm | None = None
-        self.value_series_norm: nn.LayerNorm | None = None
         self._augmented_in_features: int | None = None
         self._per_series_feature_dim: int | None = None
         self._static_in_features: int | None = None
@@ -501,17 +500,6 @@ class TimesNet(nn.Module):
         time_len = int(x.size(1))
         time_dim = int(x_mark.size(-1)) if x_mark is not None else 0
         static_out_dim = 0
-        if (
-            self.value_series_norm is None
-            or tuple(self.value_series_norm.normalized_shape) != (time_len,)
-        ):
-            self.value_series_norm = nn.LayerNorm(time_len).to(
-                device=x.device, dtype=x.dtype
-            )
-        else:
-            self.value_series_norm = self.value_series_norm.to(
-                device=x.device, dtype=x.dtype
-            )
         if series_static is not None:
             if series_static.ndim == 2:
                 static_ref = series_static
@@ -726,12 +714,7 @@ class TimesNet(nn.Module):
         self._ensure_embedding(enc_x, mark_slice, series_static, series_ids)
         target_steps = self.pred_len if self.mode == "direct" else self._out_steps
         time_len = enc_x.size(1)
-        value_features = enc_x
-        if self.value_series_norm is not None:
-            value_features = self.value_series_norm(
-                enc_x.permute(0, 2, 1)
-            ).permute(0, 2, 1)
-        per_series_features: list[torch.Tensor] = [value_features.unsqueeze(-1)]
+        per_series_features: list[torch.Tensor] = [enc_x.unsqueeze(-1)]
 
         static_components: list[torch.Tensor] = []
 
