@@ -365,11 +365,46 @@ class DataEmbedding(nn.Module):
     def forward(
         self, x: torch.Tensor, x_mark: torch.Tensor | None = None
     ) -> torch.Tensor:
-        value = self.value_embedding(x)
-        pos = self.position_embedding(x)
+        if x.ndim not in (3, 4):
+            raise ValueError(
+                "DataEmbedding expects input shaped [B, L, C] or [B, L, N, C]"
+            )
+
+        mark: torch.Tensor | None
+        if x.ndim == 4:
+            B, L, N, C = x.shape
+            x_flat = x.reshape(B * N, L, C)
+            if x_mark is None:
+                mark = None
+            else:
+                if x_mark.ndim == 3:
+                    if x_mark.shape[0] != B or x_mark.shape[1] != L:
+                        raise ValueError(
+                            "x_mark must match batch/time dimensions of x"
+                        )
+                    mark_expanded = x_mark.unsqueeze(2).expand(-1, -1, N, -1)
+                elif x_mark.ndim == 4:
+                    if x_mark.shape[:3] != (B, L, N):
+                        raise ValueError(
+                            "x_mark must align with [B, L, N] dimensions of x"
+                        )
+                    mark_expanded = x_mark
+                else:
+                    raise ValueError(
+                        "x_mark must have shape [B, L, T] or [B, L, N, T]"
+                    )
+                mark = mark_expanded.reshape(B * N, L, mark_expanded.size(-1))
+        else:
+            x_flat = x
+            if x_mark is not None and x_mark.ndim != 3:
+                raise ValueError("x_mark must share dimensions [B, L, T]")
+            mark = x_mark
+
+        value = self.value_embedding(x_flat)
+        pos = self.position_embedding(x_flat)
         temporal = (
-            self.temporal_embedding(x_mark)
-            if self.temporal_embedding is not None and x_mark is not None
+            self.temporal_embedding(mark)
+            if self.temporal_embedding is not None and mark is not None
             else None
         )
         if isinstance(temporal, torch.Tensor):
@@ -378,7 +413,11 @@ class DataEmbedding(nn.Module):
             out = value + pos
         if self.use_norm:
             out = self.norm(out)
-        return self.dropout(out)
+        out = self.dropout(out)
+
+        if x.ndim == 4:
+            return out.view(B, L, N, out.size(-1))
+        return out
 
 
 class TimesNet(nn.Module):
@@ -595,7 +634,6 @@ class TimesNet(nn.Module):
             id_feature_dim = self.id_embed_dim
 
         total_per_series = 1 + static_out_dim + id_feature_dim
-        total_in = c_in * total_per_series
 
         static_feature_dim = static_out_dim + id_feature_dim
         if static_feature_dim > 0:
@@ -627,26 +665,26 @@ class TimesNet(nn.Module):
             self.embedding is None
             or self.output_proj is None
             or self.sigma_proj is None
-            or self._augmented_in_features != total_in
+            or self._per_series_feature_dim != total_per_series
         )
         if rebuild_embedding:
             time_arg = None if time_dim == 0 else time_dim
             self.embedding = DataEmbedding(
-                c_in=total_in,
+                c_in=total_per_series,
                 d_model=self.d_model,
                 dropout=self.dropout,
                 time_features=time_arg,
                 use_norm=self.use_embedding_norm,
             ).to(device=x.device, dtype=x.dtype)
             self.embedding_time_features = time_dim
-            self.output_proj = nn.Linear(self.d_model, c_in).to(
+            self.output_proj = nn.Linear(self.d_model, 1).to(
                 device=x.device, dtype=x.dtype
             )
-            self.sigma_proj = nn.Linear(self.d_model, c_in).to(
+            self.sigma_proj = nn.Linear(self.d_model, 1).to(
                 device=x.device, dtype=x.dtype
             )
             self.output_dim = c_in
-            self._augmented_in_features = total_in
+            self._augmented_in_features = total_per_series
             self._per_series_feature_dim = total_per_series
         else:
             if self.output_dim != c_in:
@@ -660,6 +698,7 @@ class TimesNet(nn.Module):
             self.output_proj = self.output_proj.to(device=x.device, dtype=x.dtype)
             self.sigma_proj = self.sigma_proj.to(device=x.device, dtype=x.dtype)
             self._per_series_feature_dim = total_per_series
+            self._augmented_in_features = total_per_series
 
         if total_per_series <= 1:
             # A per-series LayerNorm with a single feature would zero-out the
@@ -805,19 +844,27 @@ class TimesNet(nn.Module):
             self.pre_embedding_norm is not None
         ), "pre_embedding_norm should have been initialised by _ensure_embedding"
         combined = self.pre_embedding_norm(combined)
-        combined = combined.reshape(B, time_len, -1)
         combined = self.pre_embedding_dropout(combined)
         features = self.embedding(combined, mark_slice)  # type: ignore[arg-type]
+        if features.ndim != 4:
+            raise RuntimeError(
+                "Embedding output must preserve [B, L, N, d_model] dimensions"
+            )
         if features.shape[-1] != self.d_model:
             raise RuntimeError(
                 "Embedding output dimension mismatch with configured d_model"
             )
         d_model = features.size(-1)
-        feat_t = features.permute(0, 2, 1).contiguous()
-        feat_flat = feat_t.reshape(B * d_model, self.input_len)
+        if features.size(1) != self.input_len:
+            raise RuntimeError("Embedded sequence length mismatch with input_len")
+        features_bn = features.reshape(B * N, self.input_len, d_model)
+        feat_t = features_bn.permute(0, 2, 1).contiguous()
+        feat_flat = feat_t.reshape(B * N * d_model, self.input_len)
         extended = self.predict_linear(feat_flat)
-        extended = extended.view(B, d_model, self.input_len + self.pred_len)
+        extended = extended.view(B * N, d_model, self.input_len + self.pred_len)
         features = extended.permute(0, 2, 1).contiguous()
+        total_len = features.size(1)
+        features = features.view(B, total_len, N, d_model)
 
         if self.debug_memory and features.is_cuda and torch.cuda.is_available():
             mem_bytes = torch.cuda.memory_allocated(features.device)
@@ -831,28 +878,33 @@ class TimesNet(nn.Module):
         for block in self.blocks:
             object.__setattr__(block, "period_selector", self.period_selector)
 
-        preview_periods, _ = self.period_selector(features)
+        seq_features = features.view(B * N, total_len, d_model)
+
+        preview_periods, _ = self.period_selector(seq_features)
         if preview_periods.numel() == 0:
             mu = enc_x.new_zeros(B, self._out_steps, N)
             sigma = self._sigma_from_ref(mu)
             return mu, sigma
 
         for block in self.blocks:
-            if features.shape[-1] != self.d_model:
+            if seq_features.shape[-1] != self.d_model:
                 raise RuntimeError(
                     "Residual input to TimesBlock must maintain d_model channels"
                 )
             if self.use_checkpoint:
-                updated = checkpoint(block, features, use_reentrant=False)
+                updated = checkpoint(block, seq_features, use_reentrant=False)
             else:
-                updated = block(features)
-            delta = updated - features
-            features = features + self.residual_dropout(delta)
-            features = self.layer_norm(features)
-        target_features = features[:, -target_steps:, :].contiguous()
-        mu = self.output_proj(target_features)  # type: ignore[operator]
+                updated = block(seq_features)
+            delta = updated - seq_features
+            seq_features = seq_features + self.residual_dropout(delta)
+            seq_features = self.layer_norm(seq_features)
+        features = seq_features.view(B, total_len, N, d_model)
+        target_features = features[:, -target_steps:, :, :].contiguous()
+        target_flat = target_features.reshape(B * target_steps * N, d_model)
+        mu = self.output_proj(target_flat)  # type: ignore[operator]
+        mu = mu.view(B, target_steps, N)
         assert self.sigma_proj is not None  # for type checkers
         floor = self._sigma_from_ref(mu)
-        sigma_head = self.sigma_proj(target_features)
-        sigma = F.softplus(sigma_head) + floor
+        sigma_head = self.sigma_proj(target_flat)
+        sigma = F.softplus(sigma_head.view(B, target_steps, N)) + floor
         return mu, sigma
