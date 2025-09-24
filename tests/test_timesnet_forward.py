@@ -3,6 +3,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import pytest
 
 # Ensure the project src is on the path for imports
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
@@ -233,3 +234,27 @@ def test_timesnet_static_id_normalization_preserves_scale():
 
     assert mu_rel_change < 0.2
     assert sigma_rel_change < 0.2
+
+
+def test_timesnet_parameters_require_warmup():
+    B, L, N = 1, 8, 2
+    model = TimesNet(
+        input_len=L,
+        pred_len=2,
+        d_model=4,
+        d_ff=8,
+        n_layers=1,
+        k_periods=1,
+        kernel_set=[(3, 3)],
+        dropout=0.0,
+        activation="gelu",
+        mode="direct",
+    )
+
+    with pytest.raises(RuntimeError):
+        _ = list(model.parameters())
+
+    sample = torch.randn(B, L, N)
+    model.build_with_sample(sample)
+    params = list(model.parameters())
+    assert params

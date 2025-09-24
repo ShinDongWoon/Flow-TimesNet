@@ -526,6 +526,55 @@ class TimesNet(nn.Module):
         self._series_id_reference: torch.Tensor | None = None
         self.debug_memory: bool = False
 
+    def _assert_modules_built(self) -> None:
+        """Ensure lazy modules have been initialised before parameter access."""
+
+        if self.embedding is None or self.output_proj is None or self.sigma_proj is None:
+            raise RuntimeError(
+                "TimesNet modules are lazily initialised. "
+                "Call ``build_with_sample`` or run a dummy forward pass "
+                "before accessing model parameters or creating an optimiser."
+            )
+
+    def parameters(self, recurse: bool = True):  # type: ignore[override]
+        self._assert_modules_built()
+        return super().parameters(recurse=recurse)
+
+    def named_parameters(self, prefix: str = "", recurse: bool = True):  # type: ignore[override]
+        self._assert_modules_built()
+        return super().named_parameters(prefix=prefix, recurse=recurse)
+
+    def build_with_sample(
+        self,
+        x: torch.Tensor,
+        x_mark: torch.Tensor | None = None,
+        series_static: torch.Tensor | None = None,
+        series_ids: torch.Tensor | None = None,
+    ) -> None:
+        """Initialise lazy modules using a sample batch.
+
+        This helper allows external training scripts to materialise the
+        embedding and output heads before constructing an optimiser without
+        performing a full forward pass through the expensive temporal blocks.
+        """
+
+        if x.ndim != 3:
+            raise ValueError("build_with_sample expects input shaped [B, T, N]")
+        if x.size(1) < self.input_len:
+            raise ValueError(
+                "Input sequence is shorter than model.input_len; "
+                "provide at least input_len timesteps for warm-up."
+            )
+        if x_mark is not None and x_mark.shape[:2] != x.shape[:2]:
+            raise ValueError("x_mark must share batch/time dimensions with x")
+        mark_slice = x_mark[:, -self.input_len :, :] if x_mark is not None else None
+        self._ensure_embedding(
+            x[:, -self.input_len :, :],
+            mark_slice,
+            series_static,
+            series_ids,
+        )
+
     def _ensure_embedding(
         self,
         x: torch.Tensor,
@@ -634,6 +683,7 @@ class TimesNet(nn.Module):
             id_feature_dim = self.id_embed_dim
 
         total_per_series = 1 + static_out_dim + id_feature_dim
+        augmented_in_features = c_in * total_per_series
 
         static_feature_dim = static_out_dim + id_feature_dim
         if static_feature_dim > 0:
@@ -666,25 +716,26 @@ class TimesNet(nn.Module):
             or self.output_proj is None
             or self.sigma_proj is None
             or self._per_series_feature_dim != total_per_series
+            or self._augmented_in_features != augmented_in_features
         )
         if rebuild_embedding:
             time_arg = None if time_dim == 0 else time_dim
             self.embedding = DataEmbedding(
-                c_in=total_per_series,
+                c_in=augmented_in_features,
                 d_model=self.d_model,
                 dropout=self.dropout,
                 time_features=time_arg,
                 use_norm=self.use_embedding_norm,
             ).to(device=x.device, dtype=x.dtype)
             self.embedding_time_features = time_dim
-            self.output_proj = nn.Linear(self.d_model, 1).to(
+            self.output_proj = nn.Linear(self.d_model, c_in).to(
                 device=x.device, dtype=x.dtype
             )
-            self.sigma_proj = nn.Linear(self.d_model, 1).to(
+            self.sigma_proj = nn.Linear(self.d_model, c_in).to(
                 device=x.device, dtype=x.dtype
             )
             self.output_dim = c_in
-            self._augmented_in_features = total_per_series
+            self._augmented_in_features = augmented_in_features
             self._per_series_feature_dim = total_per_series
         else:
             if self.output_dim != c_in:
@@ -697,8 +748,10 @@ class TimesNet(nn.Module):
             self.embedding = self.embedding.to(device=x.device, dtype=x.dtype)
             self.output_proj = self.output_proj.to(device=x.device, dtype=x.dtype)
             self.sigma_proj = self.sigma_proj.to(device=x.device, dtype=x.dtype)
+            if self.output_proj.out_features != c_in or self.sigma_proj.out_features != c_in:
+                raise ValueError("Output projection dimensions changed between calls")
             self._per_series_feature_dim = total_per_series
-            self._augmented_in_features = total_per_series
+            self._augmented_in_features = augmented_in_features
 
         if total_per_series <= 1:
             # A per-series LayerNorm with a single feature would zero-out the
@@ -845,26 +898,26 @@ class TimesNet(nn.Module):
         ), "pre_embedding_norm should have been initialised by _ensure_embedding"
         combined = self.pre_embedding_norm(combined)
         combined = self.pre_embedding_dropout(combined)
+        combined = combined.reshape(B, time_len, -1)
+        if self._augmented_in_features is not None and combined.size(-1) != self._augmented_in_features:
+            raise RuntimeError("Augmented feature dimension mismatch before embedding")
         features = self.embedding(combined, mark_slice)  # type: ignore[arg-type]
-        if features.ndim != 4:
+        if features.ndim != 3:
             raise RuntimeError(
-                "Embedding output must preserve [B, L, N, d_model] dimensions"
+                "Embedding output must have shape [B, L, d_model]"
             )
-        if features.shape[-1] != self.d_model:
+        if features.size(1) != self.input_len:
+            raise RuntimeError("Embedded sequence length mismatch with input_len")
+        if features.size(-1) != self.d_model:
             raise RuntimeError(
                 "Embedding output dimension mismatch with configured d_model"
             )
-        d_model = features.size(-1)
-        if features.size(1) != self.input_len:
-            raise RuntimeError("Embedded sequence length mismatch with input_len")
-        features_bn = features.reshape(B * N, self.input_len, d_model)
-        feat_t = features_bn.permute(0, 2, 1).contiguous()
-        feat_flat = feat_t.reshape(B * N * d_model, self.input_len)
+        feat_t = features.permute(0, 2, 1).contiguous()
+        feat_flat = feat_t.reshape(B * self.d_model, self.input_len)
         extended = self.predict_linear(feat_flat)
-        extended = extended.view(B * N, d_model, self.input_len + self.pred_len)
+        extended = extended.view(B, self.d_model, self.input_len + self.pred_len)
         features = extended.permute(0, 2, 1).contiguous()
         total_len = features.size(1)
-        features = features.view(B, total_len, N, d_model)
 
         if self.debug_memory and features.is_cuda and torch.cuda.is_available():
             mem_bytes = torch.cuda.memory_allocated(features.device)
@@ -878,11 +931,12 @@ class TimesNet(nn.Module):
         for block in self.blocks:
             object.__setattr__(block, "period_selector", self.period_selector)
 
-        seq_features = features.view(B * N, total_len, d_model)
+        seq_features = features
 
         preview_periods, _ = self.period_selector(seq_features)
         if preview_periods.numel() == 0:
-            mu = enc_x.new_zeros(B, self._out_steps, N)
+            output_channels = self.output_dim if self.output_dim is not None else N
+            mu = enc_x.new_zeros(B, target_steps, output_channels)
             sigma = self._sigma_from_ref(mu)
             return mu, sigma
 
@@ -898,13 +952,11 @@ class TimesNet(nn.Module):
             delta = updated - seq_features
             seq_features = seq_features + self.residual_dropout(delta)
             seq_features = self.layer_norm(seq_features)
-        features = seq_features.view(B, total_len, N, d_model)
-        target_features = features[:, -target_steps:, :, :].contiguous()
-        target_flat = target_features.reshape(B * target_steps * N, d_model)
-        mu = self.output_proj(target_flat)  # type: ignore[operator]
-        mu = mu.view(B, target_steps, N)
+        features = seq_features
+        target_features = features[:, -target_steps:, :].contiguous()
+        mu = self.output_proj(target_features)
         assert self.sigma_proj is not None  # for type checkers
         floor = self._sigma_from_ref(mu)
-        sigma_head = self.sigma_proj(target_flat)
-        sigma = F.softplus(sigma_head.view(B, target_steps, N)) + floor
+        sigma_head = self.sigma_proj(target_features)
+        sigma = F.softplus(sigma_head) + floor
         return mu, sigma

@@ -49,6 +49,7 @@ def _run_short_training(seed: int) -> tuple[torch.Tensor, Dict[str, torch.Tensor
         mode="direct",
     )
 
+    model.build_with_sample(X[:1])
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
     history = []
     batch_size = 8
