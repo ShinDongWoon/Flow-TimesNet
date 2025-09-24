@@ -248,7 +248,22 @@ def predict_once(cfg: Dict) -> str:
         )
         if cfg_used["train"]["channels_last"]:
             dummy = dummy.unsqueeze(-1).to(memory_format=torch.channels_last).squeeze(-1)
-        model(dummy)
+        warmup_kwargs = {}
+        if static_tensor_full is not None:
+            warmup_kwargs["series_static"] = static_tensor_full
+        if full_series_ids_tensor is not None:
+            warmup_kwargs["series_ids"] = full_series_ids_tensor
+        if warmup_kwargs:
+            try:
+                model(dummy, **warmup_kwargs)
+            except TypeError as err:
+                err_str = str(err)
+                if "series_static" in err_str or "series_ids" in err_str:
+                    model(dummy)
+                else:
+                    raise
+        else:
+            model(dummy)
     state = torch.load(model_file, map_location="cpu")
     # Checkpoints saved with torch.compile or DataParallel may prefix parameter names.
     clean_state = {
