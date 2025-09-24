@@ -9,6 +9,29 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 
+def _module_dtype_from_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Return a numerically stable dtype based on ``dtype``."""
+
+    if dtype in (torch.float16, torch.bfloat16):
+        return torch.float32
+    return dtype
+
+
+def _module_dtype_from_tensor(tensor: torch.Tensor | None) -> torch.dtype:
+    """Return a numerically stable dtype for module parameters."""
+
+    if tensor is None:
+        return torch.get_default_dtype()
+    return _module_dtype_from_dtype(tensor.dtype)
+
+
+def _module_to_reference(module: nn.Module, reference: torch.Tensor) -> nn.Module:
+    """Move ``module`` to ``reference``'s device using a safe dtype."""
+
+    target_dtype = _module_dtype_from_tensor(reference)
+    return module.to(device=reference.device, dtype=target_dtype)
+
+
 class FFTPeriodSelector(nn.Module):
     """Shared dominant period selector based on FFT magnitude spectra."""
 
@@ -265,6 +288,7 @@ class TimesBlock(nn.Module):
         if hidden <= 0:
             raise ValueError("Derived hidden dimension must be positive")
         self.d_ff = int(hidden)
+        target_dtype = _module_dtype_from_dtype(dtype)
         if self._activation_name == "relu":
             mid_activation: nn.Module = nn.ReLU()
         else:
@@ -287,7 +311,7 @@ class TimesBlock(nn.Module):
                 act=self._activation_name,
                 bottleneck_ratio=self.bottleneck_ratio,
             ),
-        ).to(device=device, dtype=dtype)
+        ).to(device=device, dtype=target_dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply weighted period residuals to ``x``."""
@@ -304,7 +328,7 @@ class TimesBlock(nn.Module):
                 )
             self._build_layers(x.size(-1), device=x.device, dtype=x.dtype)
         else:
-            self.inception = self.inception.to(device=x.device, dtype=x.dtype)
+            self.inception = _module_to_reference(self.inception, x)
             if self.d_model is not None and x.size(-1) != self.d_model:
                 raise ValueError("Number of channels changed between calls")
 
@@ -407,6 +431,7 @@ class PerSeriesEmbedding(nn.Module):
         B, L, N, F = features.shape
         device = features.device
         dtype = features.dtype
+        module_dtype = _module_dtype_from_dtype(dtype)
 
         feats = features
         if self.use_norm and F > 1:
@@ -415,20 +440,24 @@ class PerSeriesEmbedding(nn.Module):
                 assert isinstance(self.feature_norm, nn.LayerNorm)
                 needs_new = tuple(self.feature_norm.normalized_shape) != (F,)
             if needs_new:
-                self.feature_norm = nn.LayerNorm(F).to(device=device, dtype=dtype)
+                self.feature_norm = nn.LayerNorm(F).to(
+                    device=device, dtype=module_dtype
+                )
             else:
-                self.feature_norm = self.feature_norm.to(device=device, dtype=dtype)
+                self.feature_norm = self.feature_norm.to(
+                    device=device, dtype=module_dtype
+                )
             feats = self.feature_norm(feats)
 
         base_signal = features[..., 0].reshape(B * N, L, 1)
         flat = feats.reshape(B * N, L, F)
         if self.value_proj is None or self.value_proj.in_features != F:
-            self.value_proj = nn.Linear(F, 1).to(device=device, dtype=dtype)
+            self.value_proj = nn.Linear(F, 1).to(device=device, dtype=module_dtype)
             with torch.no_grad():
                 self.value_proj.weight.zero_()
                 self.value_proj.bias.zero_()
         else:
-            self.value_proj = self.value_proj.to(device=device, dtype=dtype)
+            self.value_proj = self.value_proj.to(device=device, dtype=module_dtype)
         effect = self.value_proj(flat)
         projected = (base_signal + effect).view(B, L, N)
 
@@ -444,11 +473,11 @@ class PerSeriesEmbedding(nn.Module):
             time_dim = int(x_mark.size(-1))
             if self.temporal_proj is None or self.temporal_proj.in_features != time_dim:
                 self.temporal_proj = nn.Linear(time_dim, 1).to(
-                    device=device, dtype=dtype
+                    device=device, dtype=module_dtype
                 )
             else:
                 self.temporal_proj = self.temporal_proj.to(
-                    device=device, dtype=dtype
+                    device=device, dtype=module_dtype
                 )
             temporal = self.temporal_proj(x_mark).expand(-1, -1, N)
 
@@ -696,12 +725,12 @@ class TimesNet(nn.Module):
                 proj_dim = (
                     self.static_proj_dim if self.static_proj_dim is not None else static_in
                 )
-                self.static_proj = nn.Linear(static_in, proj_dim).to(
-                    device=x.device, dtype=x.dtype
+                self.static_proj = _module_to_reference(
+                    nn.Linear(static_in, proj_dim), x
                 )
                 if self.static_layernorm:
-                    self.static_norm = nn.LayerNorm(proj_dim).to(
-                        device=x.device, dtype=x.dtype
+                    self.static_norm = _module_to_reference(
+                        nn.LayerNorm(proj_dim), x
                     )
                 else:
                     self.static_norm = nn.Identity()
@@ -712,17 +741,15 @@ class TimesNet(nn.Module):
                     raise ValueError(
                         "series_static feature dimension changed between calls"
                     )
-                self.static_proj = self.static_proj.to(device=x.device, dtype=x.dtype)
+                self.static_proj = _module_to_reference(self.static_proj, x)
                 if self.static_norm is not None:
-                    self.static_norm = self.static_norm.to(
-                        device=x.device, dtype=x.dtype
-                    )
+                    self.static_norm = _module_to_reference(self.static_norm, x)
                 self._static_out_dim = int(self.static_proj.out_features)
             static_out_dim = self._static_out_dim
         elif self.static_proj is not None:
-            self.static_proj = self.static_proj.to(device=x.device, dtype=x.dtype)
+            self.static_proj = _module_to_reference(self.static_proj, x)
             if self.static_norm is not None:
-                self.static_norm = self.static_norm.to(device=x.device, dtype=x.dtype)
+                self.static_norm = _module_to_reference(self.static_norm, x)
             static_out_dim = int(self.static_proj.out_features)
             self._static_out_dim = static_out_dim
         else:
@@ -750,14 +777,14 @@ class TimesNet(nn.Module):
                         c_in, device=x.device, dtype=torch.long
                     )
                 vocab = int(ids_reference.max().item()) + 1 if ids_reference.numel() > 0 else c_in
-                self.series_embedding = nn.Embedding(vocab, self.id_embed_dim).to(
-                    device=x.device, dtype=x.dtype
+                self.series_embedding = _module_to_reference(
+                    nn.Embedding(vocab, self.id_embed_dim), x
                 )
                 self._series_id_vocab = vocab
                 self._series_id_reference = ids_reference.to(device=x.device)
             else:
-                self.series_embedding = self.series_embedding.to(
-                    device=x.device, dtype=x.dtype
+                self.series_embedding = _module_to_reference(
+                    self.series_embedding, x
                 )
                 if ids_reference is not None:
                     vocab = int(ids_reference.max().item()) + 1 if ids_reference.numel() > 0 else c_in
@@ -771,7 +798,10 @@ class TimesNet(nn.Module):
                         c_in, device=x.device, dtype=torch.long
                     )
                 self._series_id_vocab = int(self.series_embedding.num_embeddings)
-            if self._series_id_reference is not None and self._series_id_reference.numel() != c_in:
+            if (
+                self._series_id_reference is not None
+                and self._series_id_reference.numel() != c_in
+            ):
                 raise ValueError("series identifier count changed between calls")
             id_feature_dim = int(self.series_embedding.embedding_dim)
 
@@ -785,12 +815,12 @@ class TimesNet(nn.Module):
                 or tuple(self.static_feature_norm.normalized_shape)
                 != (static_feature_dim,)
             ):
-                self.static_feature_norm = nn.LayerNorm(static_feature_dim).to(
-                    device=x.device, dtype=x.dtype
+                self.static_feature_norm = _module_to_reference(
+                    nn.LayerNorm(static_feature_dim), x
                 )
             else:
-                self.static_feature_norm = self.static_feature_norm.to(
-                    device=x.device, dtype=x.dtype
+                self.static_feature_norm = _module_to_reference(
+                    self.static_feature_norm, x
                 )
         else:
             self.static_feature_norm = None
@@ -816,12 +846,12 @@ class TimesNet(nn.Module):
                     total_per_series,
                 )
             if needs_new:
-                self.pre_embedding_norm = nn.LayerNorm(total_per_series).to(
-                    device=x.device, dtype=x.dtype
+                self.pre_embedding_norm = _module_to_reference(
+                    nn.LayerNorm(total_per_series), x
                 )
             else:
-                self.pre_embedding_norm = self.pre_embedding_norm.to(
-                    device=x.device, dtype=x.dtype
+                self.pre_embedding_norm = _module_to_reference(
+                    self.pre_embedding_norm, x
                 )
         self.pre_embedding_dropout = self.pre_embedding_dropout.to(device=x.device)
 
@@ -829,43 +859,48 @@ class TimesNet(nn.Module):
             raise ValueError("Temporal feature dimension changed between calls")
 
         if self.embedding is None:
-            self.embedding = PerSeriesEmbedding(
-                dropout=self.dropout, use_norm=self.use_embedding_norm
-            ).to(device=x.device, dtype=x.dtype)
+            self.embedding = _module_to_reference(
+                PerSeriesEmbedding(
+                    dropout=self.dropout, use_norm=self.use_embedding_norm
+                ),
+                x,
+            )
         else:
-            self.embedding = self.embedding.to(device=x.device, dtype=x.dtype)
+            self.embedding = _module_to_reference(self.embedding, x)
         self.embedding_time_features = time_dim
 
-        self.predict_linear = self.predict_linear.to(device=x.device, dtype=x.dtype)
+        self.predict_linear = self.predict_linear.to(
+            device=x.device, dtype=_module_dtype_from_tensor(x)
+        )
 
         if self.layer_norm is None or (
             isinstance(self.layer_norm, nn.LayerNorm)
             and tuple(self.layer_norm.normalized_shape) != (self.d_model,)
         ):
-            self.layer_norm = nn.LayerNorm(self.d_model).to(
-                device=x.device, dtype=x.dtype
+            self.layer_norm = _module_to_reference(
+                nn.LayerNorm(self.d_model), x
             )
         else:
-            self.layer_norm = self.layer_norm.to(device=x.device, dtype=x.dtype)
+            self.layer_norm = _module_to_reference(self.layer_norm, x)
 
         if self.output_proj is None or self.output_proj.in_channels != self.d_model:
-            self.output_proj = nn.Conv1d(self.d_model, self.d_model, kernel_size=1).to(
-                device=x.device, dtype=x.dtype
+            self.output_proj = _module_to_reference(
+                nn.Conv1d(self.d_model, self.d_model, kernel_size=1), x
             )
             with torch.no_grad():
                 self.output_proj.weight.zero_()
                 self.output_proj.bias.zero_()
         else:
-            self.output_proj = self.output_proj.to(device=x.device, dtype=x.dtype)
+            self.output_proj = _module_to_reference(self.output_proj, x)
         if self.sigma_proj is None or self.sigma_proj.in_channels != self.d_model:
-            self.sigma_proj = nn.Conv1d(self.d_model, self.d_model, kernel_size=1).to(
-                device=x.device, dtype=x.dtype
+            self.sigma_proj = _module_to_reference(
+                nn.Conv1d(self.d_model, self.d_model, kernel_size=1), x
             )
             with torch.no_grad():
                 self.sigma_proj.weight.zero_()
                 self.sigma_proj.bias.zero_()
         else:
-            self.sigma_proj = self.sigma_proj.to(device=x.device, dtype=x.dtype)
+            self.sigma_proj = _module_to_reference(self.sigma_proj, x)
 
         self.output_dim = self.d_model
 
