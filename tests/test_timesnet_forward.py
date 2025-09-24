@@ -107,3 +107,48 @@ def test_timesnet_sigma_head_produces_finite_loss():
         post_update_loss = gaussian_nll_loss(mu_eval, sigma_eval, y).mean()
         assert torch.isfinite(post_update_loss)
         assert torch.all(sigma_eval > 0)
+
+
+def test_timesnet_static_and_id_features_pipeline():
+    torch.manual_seed(0)
+    B, L, H, N, static_dim = 3, 18, 5, 4, 6
+    model = TimesNet(
+        input_len=L,
+        pred_len=H,
+        d_model=16,
+        d_ff=32,
+        n_layers=2,
+        k_periods=2,
+        kernel_set=[(3, 3)],
+        dropout=0.1,
+        activation="gelu",
+        mode="direct",
+        id_embed_dim=8,
+        static_proj_dim=10,
+    )
+
+    # Build lazy layers with full feature inputs
+    static_ref = torch.randn(N, static_dim)
+    ids_ref = torch.arange(N, dtype=torch.long)
+    with torch.no_grad():
+        model(torch.zeros(1, L, N), series_static=static_ref, series_ids=ids_ref)
+
+    assert model.series_embedding is not None
+    assert model.series_embedding.embedding_dim == model.id_embed_dim == 8
+    assert model.static_proj is not None
+    assert model.static_proj.out_features == 10
+
+    xb = torch.randn(B, L, N)
+    mu, sigma = model(xb, series_static=static_ref, series_ids=ids_ref)
+    assert mu.shape == (B, H, N)
+    assert sigma.shape == (B, H, N)
+    assert torch.all(sigma > 0)
+
+    # Batched static/id tensors should also be accepted
+    static_batched = static_ref.unsqueeze(0)
+    ids_batched = ids_ref.unsqueeze(0)
+    mu_batched, sigma_batched = model(
+        xb[:1], series_static=static_batched, series_ids=ids_batched
+    )
+    assert mu_batched.shape == (1, H, N)
+    assert sigma_batched.shape == (1, H, N)

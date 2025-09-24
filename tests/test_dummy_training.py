@@ -23,6 +23,11 @@ def test_dummy_training_smape_wsmape():
     freqs = [2, 4]
     data = torch.stack([10 + torch.sin(2 * math.pi * f * t / T) for f in freqs], dim=-1)
 
+    static_features = torch.tensor(
+        [[1.0, -0.5, 0.25], [0.5, 1.0, -0.75]], dtype=torch.float32
+    )
+    series_ids = torch.arange(N, dtype=torch.long)
+
     train_series = data[:60]
     Xs, Ys = [], []
     for i in range(len(train_series) - input_len - pred_len + 1):
@@ -42,10 +47,12 @@ def test_dummy_training_smape_wsmape():
         dropout=0.0,
         activation="gelu",
         mode="direct",
+        id_embed_dim=4,
+        static_proj_dim=3,
     )
     # Lazily build model parameters
     with torch.no_grad():
-        _ = model(X[:1])
+        _ = model(X[:1], series_static=static_features, series_ids=series_ids)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
     for _ in range(30):
@@ -54,7 +61,7 @@ def test_dummy_training_smape_wsmape():
             xb = X[idx[j : j + 4]]
             yb = Y[idx[j : j + 4]]
             optimizer.zero_grad()
-            mu, sigma = model(xb)
+            mu, sigma = model(xb, series_static=static_features, series_ids=series_ids)
             loss_tensor = gaussian_nll_loss(mu, sigma, yb)
             loss = loss_tensor.mean()
             loss.backward()
@@ -63,7 +70,11 @@ def test_dummy_training_smape_wsmape():
     input_seq = data[60 - input_len : 60]
     actual = data[60 : 60 + pred_len]
     with torch.no_grad():
-        pred_mu, pred_sigma = model(input_seq.unsqueeze(0))
+        pred_mu, pred_sigma = model(
+            input_seq.unsqueeze(0),
+            series_static=static_features,
+            series_ids=series_ids,
+        )
         pred = pred_mu.squeeze(0)
         assert torch.all(pred_sigma > 0)
 
