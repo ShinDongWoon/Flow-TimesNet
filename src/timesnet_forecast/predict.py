@@ -298,6 +298,14 @@ def predict_once(cfg: Dict) -> str:
         if cfg_used["train"]["channels_last"]:
             dummy = dummy.unsqueeze(-1).to(memory_format=torch.channels_last).squeeze(-1)
         warmup_kwargs = {}
+        if time_features_enabled and meta_dim > 0:
+            warmup_kwargs["x_mark"] = torch.zeros(
+                1,
+                input_len,
+                meta_dim,
+                device=device,
+                dtype=torch.float32,
+            )
         if static_tensor_full is not None:
             warmup_kwargs["series_static"] = static_tensor_full
         if full_series_ids_tensor is not None:

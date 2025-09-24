@@ -829,6 +829,15 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         "series_static": warmup_series_static,
         "series_ids": series_ids_default,
     }
+    warmup_kwargs = {k: v for k, v in warmup_kwargs.items() if v is not None}
+    if time_features_enabled and time_feature_dim > 0:
+        warmup_kwargs["x_mark"] = torch.zeros(
+            1,
+            input_len,
+            time_feature_dim,
+            device=device,
+            dtype=torch.float32,
+        )
     with torch.no_grad():
         dummy = torch.zeros(1, input_len, len(ids), device=device)
         model(dummy, **warmup_kwargs)
