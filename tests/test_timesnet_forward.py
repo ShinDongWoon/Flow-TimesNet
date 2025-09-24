@@ -152,3 +152,53 @@ def test_timesnet_static_and_id_features_pipeline():
     )
     assert mu_batched.shape == (1, H, N)
     assert sigma_batched.shape == (1, H, N)
+
+
+def test_timesnet_static_id_normalization_preserves_scale():
+    torch.manual_seed(0)
+    B, L, H, N, static_dim = 2, 12, 3, 3, 5
+    model = TimesNet(
+        input_len=L,
+        pred_len=H,
+        d_model=8,
+        d_ff=16,
+        n_layers=1,
+        k_periods=1,
+        kernel_set=[(3, 3)],
+        dropout=0.0,
+        activation="gelu",
+        mode="direct",
+        id_embed_dim=6,
+        static_proj_dim=7,
+    )
+
+    static_ref = torch.randn(N, static_dim)
+    ids_ref = torch.arange(N, dtype=torch.long)
+
+    with torch.no_grad():
+        model(torch.zeros(1, L, N), series_static=static_ref, series_ids=ids_ref)
+
+    model.eval()
+    xb = torch.randn(B, L, N)
+    mu_ref, sigma_ref = model(xb, series_static=static_ref, series_ids=ids_ref)
+
+    scaled_static = static_ref * 250.0
+    mu_scaled, sigma_scaled = model(
+        xb, series_static=scaled_static, series_ids=ids_ref
+    )
+
+    assert torch.all(torch.isfinite(mu_scaled))
+    assert torch.all(torch.isfinite(sigma_scaled))
+
+    mu_ref_mean = mu_ref.abs().mean()
+    mu_scaled_mean = mu_scaled.abs().mean()
+    sigma_ref_mean = sigma_ref.abs().mean()
+    sigma_scaled_mean = sigma_scaled.abs().mean()
+
+    mu_rel_change = (mu_ref_mean - mu_scaled_mean).abs() / mu_ref_mean.clamp(min=1e-6)
+    sigma_rel_change = (sigma_ref_mean - sigma_scaled_mean).abs() / sigma_ref_mean.clamp(
+        min=1e-6
+    )
+
+    assert mu_rel_change < 0.2
+    assert sigma_rel_change < 0.2

@@ -478,6 +478,8 @@ class TimesNet(nn.Module):
         self.static_norm: nn.Module | None = None
         self.pre_embedding_norm: nn.LayerNorm | None = None
         self.pre_embedding_dropout = nn.Dropout(self.dropout)
+        self.static_feature_norm: nn.LayerNorm | None = None
+        self.value_series_norm: nn.LayerNorm | None = None
         self._augmented_in_features: int | None = None
         self._per_series_feature_dim: int | None = None
         self._static_in_features: int | None = None
@@ -496,8 +498,20 @@ class TimesNet(nn.Module):
         """Lazily instantiate embedding/output projection when dimensions are known."""
 
         c_in = int(x.size(-1))
+        time_len = int(x.size(1))
         time_dim = int(x_mark.size(-1)) if x_mark is not None else 0
         static_out_dim = 0
+        if (
+            self.value_series_norm is None
+            or tuple(self.value_series_norm.normalized_shape) != (time_len,)
+        ):
+            self.value_series_norm = nn.LayerNorm(time_len).to(
+                device=x.device, dtype=x.dtype
+            )
+        else:
+            self.value_series_norm = self.value_series_norm.to(
+                device=x.device, dtype=x.dtype
+            )
         if series_static is not None:
             if series_static.ndim == 2:
                 static_ref = series_static
@@ -595,6 +609,23 @@ class TimesNet(nn.Module):
         total_per_series = 1 + static_out_dim + id_feature_dim
         total_in = c_in * total_per_series
 
+        static_feature_dim = static_out_dim + id_feature_dim
+        if static_feature_dim > 0:
+            if (
+                self.static_feature_norm is None
+                or tuple(self.static_feature_norm.normalized_shape)
+                != (static_feature_dim,)
+            ):
+                self.static_feature_norm = nn.LayerNorm(static_feature_dim).to(
+                    device=x.device, dtype=x.dtype
+                )
+            else:
+                self.static_feature_norm = self.static_feature_norm.to(
+                    device=x.device, dtype=x.dtype
+                )
+        else:
+            self.static_feature_norm = None
+
         if (
             isinstance(self.min_sigma_vector, torch.Tensor)
             and self.min_sigma_vector.numel() > 0
@@ -644,9 +675,10 @@ class TimesNet(nn.Module):
 
         if (
             self.pre_embedding_norm is None
-            or tuple(self.pre_embedding_norm.normalized_shape) != (total_in,)
+            or tuple(self.pre_embedding_norm.normalized_shape)
+            != (total_per_series,)
         ):
-            self.pre_embedding_norm = nn.LayerNorm(total_in).to(
+            self.pre_embedding_norm = nn.LayerNorm(total_per_series).to(
                 device=x.device, dtype=x.dtype
             )
         else:
@@ -685,7 +717,14 @@ class TimesNet(nn.Module):
         self._ensure_embedding(enc_x, mark_slice, series_static, series_ids)
         target_steps = self.pred_len if self.mode == "direct" else self._out_steps
         time_len = enc_x.size(1)
-        per_series_features: list[torch.Tensor] = [enc_x.unsqueeze(-1)]
+        value_features = enc_x
+        if self.value_series_norm is not None:
+            value_features = self.value_series_norm(
+                enc_x.permute(0, 2, 1)
+            ).permute(0, 2, 1)
+        per_series_features: list[torch.Tensor] = [value_features.unsqueeze(-1)]
+
+        static_components: list[torch.Tensor] = []
 
         if self.static_proj is not None:
             assert self.static_proj.in_features is not None
@@ -718,8 +757,7 @@ class TimesNet(nn.Module):
             static_proj = self.static_proj(static_tensor)
             if self.static_norm is not None:
                 static_proj = self.static_norm(static_proj)
-            static_rep = static_proj.unsqueeze(1).expand(-1, time_len, -1, -1)
-            per_series_features.append(static_rep)
+            static_components.append(static_proj)
 
         if self.series_embedding is not None and self.id_embed_dim > 0:
             if series_ids is None:
@@ -757,15 +795,25 @@ class TimesNet(nn.Module):
                 self._series_id_reference = ids_tensor[0].detach().clone()
             ids_tensor = ids_tensor.to(device=enc_x.device, dtype=torch.long)
             id_embed = self.series_embedding(ids_tensor)
-            id_rep = id_embed.unsqueeze(1).expand(-1, time_len, -1, -1)
-            per_series_features.append(id_rep)
+            static_components.append(id_embed)
 
-        combined = torch.cat(per_series_features, dim=-1)
-        combined = combined.reshape(B, time_len, -1)
+        if static_components:
+            static_concat = torch.cat(static_components, dim=-1)
+            if self.static_feature_norm is not None:
+                static_concat = self.static_feature_norm(static_concat)
+            static_rep = static_concat.unsqueeze(1).expand(-1, time_len, -1, -1)
+            per_series_features.append(static_rep)
+
+        combined = (
+            torch.cat(per_series_features, dim=-1)
+            if len(per_series_features) > 1
+            else per_series_features[0]
+        )
         assert (
             self.pre_embedding_norm is not None
         ), "pre_embedding_norm should have been initialised by _ensure_embedding"
         combined = self.pre_embedding_norm(combined)
+        combined = combined.reshape(B, time_len, -1)
         combined = self.pre_embedding_dropout(combined)
         features = self.embedding(combined, mark_slice)  # type: ignore[arg-type]
         if features.shape[-1] != self.d_model:
