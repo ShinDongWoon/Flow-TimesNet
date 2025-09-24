@@ -75,7 +75,9 @@ class Config:
         # maintain backwards compatibility with older config files that do not
         # specify them explicitly.
         model_cfg.setdefault("id_embed_dim", 32)
-        model_cfg.setdefault("static_proj_dim", 32)
+        # Preserve the legacy fallback behaviour where omitting static_proj_dim
+        # keeps the projection width tied to the input feature dimension.
+        model_cfg.setdefault("static_proj_dim", None)
         model_cfg.setdefault("static_layernorm", True)
         return Config(raw=base)
 
