@@ -1,16 +1,38 @@
 from __future__ import annotations
 
-from typing import Dict, Sequence
+from typing import Dict, Sequence, Optional, Any
+
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
+from ..utils.time_features import build_time_features
+
+
+def _coerce_datetime_index(
+    index: Optional[pd.DatetimeIndex | np.ndarray], expected_len: int
+) -> Optional[pd.DatetimeIndex]:
+    if index is None:
+        return None
+    if isinstance(index, pd.DatetimeIndex):
+        idx = index
+    else:
+        idx = pd.to_datetime(np.asarray(index))
+    if len(idx) != expected_len:
+        raise ValueError(
+            "time_index length must match the first dimension of wide_values"
+        )
+    return idx
+
 
 class SlidingWindowDataset(Dataset):
-    """
-    Produce (X, Y) windows from wide-format [T, N] series.
-    direct mode: Y length = ``pred_len``
-    recursive mode: Y length = 1 by default, but can be overridden.
+    """Sliding-window access to wide-format time series arrays.
+
+    The dataset returns tuples structured as ``(x, y, mask, x_mark, y_mark,``
+    ``series_static, series_ids)`` where temporal mark tensors may be ``None``
+    when time feature construction is disabled. Downstream consumers should
+    therefore guard against missing marks before use.
     """
     def __init__(
         self,
@@ -23,6 +45,9 @@ class SlidingWindowDataset(Dataset):
         valid_mask: np.ndarray | None = None,  # [T, N]
         series_static: np.ndarray | None = None,
         series_ids: Sequence[int] | np.ndarray | None = None,
+        time_index: pd.DatetimeIndex | np.ndarray | None = None,
+        time_features: np.ndarray | None = None,
+        time_feature_config: Dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         assert mode in ("direct", "recursive")
@@ -55,6 +80,61 @@ class SlidingWindowDataset(Dataset):
         self._X_tensor = torch.from_numpy(self.X)
         self._M_tensor = torch.from_numpy(self.M)
 
+        self.time_feature_dim: int = 0
+        self.time_feature_config = dict(time_feature_config or {})
+        idx = _coerce_datetime_index(time_index, self.T)
+        marks_tensor: torch.Tensor | None = None
+        if time_features is not None:
+            feats = np.asarray(time_features)
+            if feats.shape[0] != self.T:
+                raise ValueError(
+                    "time_features must align with the temporal dimension of wide_values"
+                )
+            if feats.ndim == 1:
+                feats = feats.reshape(-1, 1)
+            if feats.ndim != 2:
+                raise ValueError(
+                    "time_features must be a 2D array of shape [T, F]"
+                )
+            self.time_feature_dim = int(feats.shape[1])
+            if self.time_feature_dim > 0:
+                marks_tensor = torch.from_numpy(
+                    feats.astype(np.float32, copy=False)
+                )
+        elif idx is not None and self.time_feature_config.get("enabled", False):
+            feats = build_time_features(idx, self.time_feature_config)
+            if feats.ndim == 1:
+                feats = feats.reshape(-1, 1)
+            if feats.shape[0] != self.T:
+                raise ValueError(
+                    "Computed time features must align with wide_values"
+                )
+            self.time_feature_dim = int(feats.shape[1]) if feats.ndim == 2 else 0
+            if self.time_feature_dim > 0:
+                marks_tensor = torch.from_numpy(feats)
+        elif time_feature_config and time_feature_config.get("enabled", False):
+            raise ValueError(
+                "time_feature_config.enabled is True but no time_index or precomputed time_features were provided"
+            )
+        if marks_tensor is not None:
+            if torch.cuda.is_available():
+                self.time_marks = marks_tensor.pin_memory()
+            else:
+                self.time_marks = marks_tensor
+        else:
+            self.time_marks = None
+        if isinstance(self.time_feature_dim, int) and self.time_feature_dim <= 0:
+            self.time_marks = None
+
+        if self.time_marks is not None:
+            self.time_feature_dim = int(self.time_marks.size(-1))
+
+        self._time_freq = idx.freqstr if idx is not None else None
+        if torch.cuda.is_available():
+            self._empty_time_mark = torch.empty(0, dtype=torch.float32).pin_memory()
+        else:
+            self._empty_time_mark = torch.empty(0, dtype=torch.float32)
+
         if series_static is not None:
             static_arr = np.asarray(series_static, dtype=np.float32)
             if static_arr.ndim == 1:
@@ -80,7 +160,7 @@ class SlidingWindowDataset(Dataset):
     def __len__(self) -> int:
         return int(len(self.idxs))
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, ...]:
+    def __getitem__(self, idx: int) -> tuple[object, ...]:
         s = int(self.idxs[idx])
         if self.time_shift > 0:
             delta = np.random.randint(-self.time_shift, self.time_shift + 1)
@@ -92,9 +172,27 @@ class SlidingWindowDataset(Dataset):
             x_tensor = x_tensor + noise
         y_tensor = self._X_tensor[e : e + self.H, :].clone()
         mask_tensor = self._M_tensor[e : e + self.H, :].clone()
-        items: list[torch.Tensor] = [x_tensor, y_tensor, mask_tensor]
+        if self.time_marks is not None:
+            x_mark = self.time_marks[s:e, :].clone()
+            y_mark = self.time_marks[e : e + self.H, :].clone()
+        else:
+            x_mark = self._empty_time_mark
+            y_mark = self._empty_time_mark
+        items: list[object] = [x_tensor, y_tensor, mask_tensor, x_mark, y_mark]
         if self.series_static is not None:
             items.append(self.series_static)
         if self.series_ids is not None:
             items.append(self.series_ids)
         return tuple(items)
+
+    @staticmethod
+    def has_time_marks(batch: Sequence[object]) -> bool:
+        if not isinstance(batch, (list, tuple)):
+            return False
+        if len(batch) < 5:
+            return False
+        return batch[3] is not None and batch[4] is not None
+
+    @property
+    def time_frequency(self) -> Optional[str]:
+        return self._time_freq

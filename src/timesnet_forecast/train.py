@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 import math
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Iterable
 import numpy as np
 import pandas as pd
 import torch
@@ -107,6 +107,9 @@ def _build_dataloader(
     augment: Dict | None = None,
     series_static: List[np.ndarray | None] | None = None,
     series_ids: List[np.ndarray | None] | None = None,
+    time_indices: List[pd.DatetimeIndex | np.ndarray | None] | None = None,
+    time_features: List[np.ndarray | None] | None = None,
+    time_feature_config: Dict | None = None,
 ) -> DataLoader:
     if len(arrays) != len(masks):
         raise ValueError("arrays and masks must have the same length")
@@ -114,6 +117,10 @@ def _build_dataloader(
         raise ValueError("series_static must match arrays length when provided")
     if series_ids is not None and len(series_ids) != len(arrays):
         raise ValueError("series_ids must match arrays length when provided")
+    if time_indices is not None and len(time_indices) != len(arrays):
+        raise ValueError("time_indices must match arrays length when provided")
+    if time_features is not None and len(time_features) != len(arrays):
+        raise ValueError("time_features must match arrays length when provided")
     datasets = [
         SlidingWindowDataset(
             a,
@@ -125,6 +132,9 @@ def _build_dataloader(
             valid_mask=m,
             series_static=series_static[i] if series_static is not None else None,
             series_ids=series_ids[i] if series_ids is not None else None,
+            time_index=time_indices[i] if time_indices is not None else None,
+            time_features=time_features[i] if time_features is not None else None,
+            time_feature_config=time_feature_config,
         )
         for i, (a, m) in enumerate(zip(arrays, masks))
     ]
@@ -144,35 +154,106 @@ def _build_dataloader(
     )
 
 
-def _unpack_batch(batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+def _iter_datasets(dataset) -> Iterable[SlidingWindowDataset]:
+    if isinstance(dataset, ConcatDataset):
+        for sub in dataset.datasets:
+            yield from _iter_datasets(sub)
+    elif isinstance(dataset, SlidingWindowDataset):
+        yield dataset
+
+
+def _time_feature_dim_from_dataset(dataset) -> int:
+    for ds in _iter_datasets(dataset):
+        dim = getattr(ds, "time_feature_dim", 0)
+        if dim:
+            return int(dim)
+    return 0
+
+
+def _time_frequency_from_dataset(dataset) -> str | None:
+    for ds in _iter_datasets(dataset):
+        freq = getattr(ds, "time_frequency", None)
+        if freq:
+            return str(freq)
+    return None
+
+
+def _normalize_optional(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        if all(v is None for v in value):
+            return None
+    if isinstance(value, torch.Tensor) and value.numel() == 0:
+        return None
+    return value
+
+
+def _unpack_batch(
+    batch,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
     if not isinstance(batch, (list, tuple)):
         raise TypeError("batch must be a tuple or list of tensors")
-    if len(batch) == 3:
-        xb, yb, mask = batch
-        static = None
-        series_ids = None
-    elif len(batch) == 4:
-        xb, yb, mask, static = batch
-        series_ids = None
-    elif len(batch) == 5:
-        xb, yb, mask, static, series_ids = batch
-    else:
+    if len(batch) < 3:
         raise ValueError(f"Unexpected batch size: {len(batch)}")
-    return xb, yb, mask, static, series_ids
+    xb, yb, mask = batch[0], batch[1], batch[2]
+    next_idx = 3
+    x_mark: torch.Tensor | None = None
+    y_mark: torch.Tensor | None = None
+    if len(batch) >= 5:
+        x_mark = _normalize_optional(batch[3])
+        y_mark = _normalize_optional(batch[4])
+        next_idx = 5
+    static: torch.Tensor | None = None
+    series_ids: torch.Tensor | None = None
+    if len(batch) > next_idx:
+        static = batch[next_idx]
+        next_idx += 1
+    if len(batch) > next_idx:
+        series_ids = batch[next_idx]
+        next_idx += 1
+    if len(batch) != next_idx:
+        raise ValueError(f"Unexpected batch size: {len(batch)}")
+    return xb, yb, mask, x_mark, y_mark, static, series_ids
 
 
 def _call_model_optional(
     model: nn.Module,
     xb: torch.Tensor,
+    x_mark: torch.Tensor | None,
     series_static: torch.Tensor | None,
     series_ids: torch.Tensor | None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    kwargs: Dict[str, torch.Tensor] = {}
+    if x_mark is not None:
+        kwargs["x_mark"] = x_mark
+    if series_static is not None:
+        kwargs["series_static"] = series_static
+    if series_ids is not None:
+        kwargs["series_ids"] = series_ids
     try:
-        return model(xb, series_static=series_static, series_ids=series_ids)
+        return model(xb, **kwargs)
     except TypeError as err:
         err_str = str(err)
-        if "series_static" in err_str or "series_ids" in err_str:
-            return model(xb)
+        fallback_keys = ["series_static", "series_ids", "x_mark"]
+        for key in fallback_keys:
+            if key in kwargs and key in err_str:
+                kwargs.pop(key)
+                try:
+                    return model(xb, **kwargs)
+                except TypeError as err_inner:
+                    err_str = str(err_inner)
+                    continue
         raise
 
 
@@ -365,11 +446,15 @@ def _eval_wsmape(
     default_series_ids = torch.arange(len(ids), dtype=torch.long, device=device)
     with torch.inference_mode(), amp_autocast(True if device.type == "cuda" else False):
         for batch in loader:
-            xb, yb, mask, static, series_idx = _unpack_batch(batch)
+            xb, yb, mask, x_mark, y_mark, static, series_idx = _unpack_batch(batch)
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
             mask_dev = move_to_device(mask, device)
             loss_mask = mask_dev.to(yb.dtype) if use_loss_mask else None
+            if x_mark is not None:
+                x_mark = x_mark.to(device=device, non_blocking=True)
+            if y_mark is not None:
+                y_mark = y_mark.to(device=device, non_blocking=True)
             if static is not None:
                 static = move_to_device(static, device)
             if series_idx is not None:
@@ -381,7 +466,7 @@ def _eval_wsmape(
             _assert_min_len(xb, _model_input_len(model))
             if mode == "direct":
                 mu, _ = _call_model_optional(
-                    model, xb, static, series_idx
+                    model, xb, x_mark, static, series_idx
                 )
             else:
                 # recursive multi-step forecast during validation
@@ -389,6 +474,8 @@ def _eval_wsmape(
                     model,
                     xb,
                     pred_len,
+                    x_mark=x_mark,
+                    y_mark=y_mark,
                     series_static=static,
                     series_ids=series_idx,
                 )
@@ -425,11 +512,15 @@ def _eval_metrics(
     default_series_ids = torch.arange(len(ids), dtype=torch.long, device=device)
     with torch.inference_mode(), amp_autocast(True if device.type == "cuda" else False):
         for batch in loader:
-            xb, yb, mask, static, series_idx = _unpack_batch(batch)
+            xb, yb, mask, x_mark, y_mark, static, series_idx = _unpack_batch(batch)
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
             mask_dev = move_to_device(mask, device)
             loss_mask = mask_dev.to(yb.dtype) if use_loss_mask else None
+            if x_mark is not None:
+                x_mark = x_mark.to(device=device, non_blocking=True)
+            if y_mark is not None:
+                y_mark = y_mark.to(device=device, non_blocking=True)
             if static is not None:
                 static = move_to_device(static, device)
             if series_idx is not None:
@@ -443,6 +534,7 @@ def _eval_metrics(
                 mu, sigma = _call_model_optional(
                     model,
                     xb,
+                    x_mark,
                     static,
                     series_idx,
                 )
@@ -451,6 +543,8 @@ def _eval_metrics(
                     model,
                     xb,
                     pred_len,
+                    x_mark=x_mark,
+                    y_mark=y_mark,
                     series_static=static,
                     series_ids=series_idx,
                 )
@@ -496,6 +590,12 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
 
     # --- data loading
     schema = io_utils.resolve_schema(cfg)
+    data_cfg = cfg.setdefault("data", {})
+    time_feature_cfg_raw = data_cfg.get("time_features") or {}
+    time_feature_cfg = dict(time_feature_cfg_raw)
+    time_feature_cfg.setdefault("enabled", False)
+    time_features_enabled = bool(time_feature_cfg.get("enabled", False))
+    data_cfg["time_features"] = time_feature_cfg
     enc = cfg["data"]["encoding"]
     train_path = cfg["data"]["train_csv"]
     df = pd.read_csv(train_path, encoding=enc)
@@ -516,6 +616,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     norm_per_series = cfg["preprocess"]["normalize_per_series"]
     eps = cfg["preprocess"]["eps"]
 
+    train_time_indices: List[pd.DatetimeIndex | None] | None = None
+    val_time_indices: List[pd.DatetimeIndex | None] | None = None
     if cfg["train"]["val"]["strategy"] == "holdout":
         trn_df, val_df = make_holdout_slices(wide, cfg["train"]["val"]["holdout_days"])
         trn_mask_df, val_mask_df = make_holdout_slices(mask_wide, cfg["train"]["val"]["holdout_days"])
@@ -532,6 +634,12 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         val_arrays = [val_norm.to_numpy(dtype=np.float32, copy=False)]
         train_mask_arrays = [trn_mask_df.to_numpy(dtype=np.float32, copy=False)]
         val_mask_arrays = [val_mask_df.to_numpy(dtype=np.float32, copy=False)]
+        if time_features_enabled:
+            train_time_indices = [pd.DatetimeIndex(trn_norm.index)]
+            val_time_indices = [pd.DatetimeIndex(val_norm.index)]
+        else:
+            train_time_indices = None
+            val_time_indices = None
     else:
         val_cfg = cfg["train"]["val"]
         fold_iter = make_rolling_slices(
@@ -555,6 +663,12 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         val_arrays: List[np.ndarray] = []
         train_mask_arrays: List[np.ndarray] = []
         val_mask_arrays: List[np.ndarray] = []
+        if time_features_enabled:
+            train_time_indices = []
+            val_time_indices = []
+        else:
+            train_time_indices = None
+            val_time_indices = None
         for (tr_df, va_df), (tr_mask_df, va_mask_df) in zip(
             make_rolling_slices(
                 wide_norm, val_cfg["rolling_folds"], val_cfg["rolling_step_days"], val_cfg["holdout_days"]
@@ -567,6 +681,10 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             val_arrays.append(va_df.to_numpy(dtype=np.float32, copy=False))
             train_mask_arrays.append(tr_mask_df.to_numpy(dtype=np.float32, copy=False))
             val_mask_arrays.append(va_mask_df.to_numpy(dtype=np.float32, copy=False))
+            if time_features_enabled:
+                assert train_time_indices is not None and val_time_indices is not None
+                train_time_indices.append(pd.DatetimeIndex(tr_df.index))
+                val_time_indices.append(pd.DatetimeIndex(va_df.index))
 
     # --- model hyper-parameters derived from config
     cfg.setdefault("model", {})
@@ -589,6 +707,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         augment=cfg["data"].get("augment"),
         series_static=train_static_list,
         series_ids=train_id_list,
+        time_indices=train_time_indices,
+        time_feature_config=time_feature_cfg if time_features_enabled else None,
     )
     dl_val = _build_dataloader(
         val_arrays, val_mask_arrays, input_len, pred_len, mode, batch_size=cfg["train"]["batch_size"],
@@ -599,9 +719,28 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         augment=None,
         series_static=val_static_list,
         series_ids=val_id_list,
+        time_indices=val_time_indices,
+        time_feature_config=time_feature_cfg if time_features_enabled else None,
     )
     if len(dl_val.dataset) == 0:
         raise ValueError("Validation split has no windows; increase train.val.holdout_days or adjust model.input_len/pred_len.")
+    time_feature_dim = _time_feature_dim_from_dataset(dl_train.dataset)
+    dataset_freq = _time_frequency_from_dataset(dl_train.dataset)
+    base_index = wide.index if isinstance(wide.index, pd.DatetimeIndex) else None
+    inferred_freq = dataset_freq
+    if inferred_freq is None and base_index is not None:
+        inferred_freq = getattr(base_index, "freqstr", None)
+        if inferred_freq is None:
+            inferred_freq = pd.infer_freq(base_index)
+    cfg["data"]["time_features"]["feature_dim"] = int(time_feature_dim)
+    if inferred_freq is not None:
+        cfg["data"]["time_features"]["freq"] = inferred_freq
+    time_feature_meta = {
+        "enabled": bool(time_features_enabled and time_feature_dim > 0),
+        "feature_dim": int(time_feature_dim),
+        "config": dict(time_feature_cfg),
+        "freq": inferred_freq,
+    }
     warmup_series_static = torch.from_numpy(series_static_np).to(
         device=device, dtype=torch.float32
     )
@@ -690,6 +829,15 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         "series_static": warmup_series_static,
         "series_ids": series_ids_default,
     }
+    warmup_kwargs = {k: v for k, v in warmup_kwargs.items() if v is not None}
+    if time_features_enabled and time_feature_dim > 0:
+        warmup_kwargs["x_mark"] = torch.zeros(
+            1,
+            input_len,
+            time_feature_dim,
+            device=device,
+            dtype=torch.float32,
+        )
     with torch.no_grad():
         dummy = torch.zeros(1, input_len, len(ids), device=device)
         model(dummy, **warmup_kwargs)
@@ -853,12 +1001,13 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         graph_captured = False
         static_series_buf: torch.Tensor | None = None
         static_ids_buf: torch.Tensor | None = None
+        static_mark_buf: torch.Tensor | None = None
         for w in range(warmup_iters):
             try:
                 batch_w = next(train_iter)
             except StopIteration:
                 break
-            xb_w, yb_w, mask_w, static_w, series_ids_w = _unpack_batch(batch_w)
+            xb_w, yb_w, mask_w, x_mark_w, y_mark_w, static_w, series_ids_w = _unpack_batch(batch_w)
             xb_w = xb_w.to(device, non_blocking=True)
             yb_w = yb_w.to(device, non_blocking=True)
             if use_loss_masking:
@@ -866,6 +1015,10 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 mb_w = mask_w.to(yb_w.dtype)
             else:
                 mb_w = torch.ones_like(yb_w, dtype=yb_w.dtype, device=device)
+            if x_mark_w is not None:
+                x_mark_w = x_mark_w.to(device=device, non_blocking=True)
+            if y_mark_w is not None:
+                y_mark_w = y_mark_w.to(device=device, non_blocking=True)
             if static_w is not None:
                 static_w = static_w.to(device=device, non_blocking=True)
             if series_ids_w is not None:
@@ -880,6 +1033,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                 mu_w, sigma_w = model(
                     xb_w,
+                    x_mark=x_mark_w,
                     series_static=static_w,
                     series_ids=series_ids_w,
                 )
@@ -901,7 +1055,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         except StopIteration:
             train_iter = iter(dl_train)
             batch0 = next(train_iter)
-        xb0, yb0, mask0, static0, series_ids0 = _unpack_batch(batch0)
+        xb0, yb0, mask0, x_mark0, y_mark0, static0, series_ids0 = _unpack_batch(batch0)
         xb0 = xb0.to(device, non_blocking=True)
         yb0 = yb0.to(device, non_blocking=True)
         if use_loss_masking:
@@ -909,6 +1063,10 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             mb0 = mask0.to(yb0.dtype)
         else:
             mb0 = torch.ones_like(yb0, dtype=yb0.dtype, device=device)
+        if x_mark0 is not None:
+            x_mark0 = x_mark0.to(device=device, non_blocking=True)
+        if y_mark0 is not None:
+            y_mark0 = y_mark0.to(device=device, non_blocking=True)
         if static0 is not None:
             static0 = static0.to(device=device, non_blocking=True)
         if series_ids0 is not None:
@@ -925,6 +1083,11 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         static_x.copy_(xb0)
         static_y.copy_(yb0)
         static_m.copy_(mb0)
+        if x_mark0 is not None:
+            static_mark_buf = torch.empty_like(x_mark0)
+            static_mark_buf.copy_(x_mark0)
+        else:
+            static_mark_buf = None
         if static0 is not None:
             static_series_buf = torch.empty_like(static0)
             static_series_buf.copy_(static0)
@@ -941,6 +1104,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 _assert_min_len(static_x, _model_input_len(model))
                 static_mu, static_sigma = model(
                     static_x,
+                    x_mark=static_mark_buf,
                     series_static=static_series_buf,
                     series_ids=static_ids_buf,
                 )
@@ -962,12 +1126,23 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             xb: torch.Tensor,
             yb: torch.Tensor,
             mb: torch.Tensor,
+            x_mark: torch.Tensor | None,
             static_feat: torch.Tensor | None,
             series_idx: torch.Tensor,
         ) -> float:
             static_x.copy_(xb)
             static_y.copy_(yb)
             static_m.copy_(mb)
+            if static_mark_buf is not None:
+                if x_mark is None:
+                    raise RuntimeError(
+                        "x_mark must be provided during CUDA graph replay when time features are enabled"
+                    )
+                static_mark_buf.copy_(x_mark)
+            elif x_mark is not None:
+                raise RuntimeError(
+                    "x_mark provided but CUDA graph captured without temporal buffer"
+                )
             if static_series_buf is not None:
                 if static_feat is None:
                     raise RuntimeError(
@@ -993,7 +1168,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         iter_time_total = 0.0
         for i, batch in enumerate(tqdm(dl_train, desc=f"Epoch {ep}/{epochs}", leave=False)):
             iter_start = time.perf_counter()
-            xb, yb, mask, static_feat, series_idx = _unpack_batch(batch)
+            xb, yb, mask, x_mark, y_mark, static_feat, series_idx = _unpack_batch(batch)
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
             if use_loss_masking:
@@ -1001,6 +1176,10 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 mb = mask.to(yb.dtype)
             else:
                 mb = torch.ones_like(yb, dtype=yb.dtype, device=device)
+            if x_mark is not None:
+                x_mark = x_mark.to(device=device, non_blocking=True)
+            if y_mark is not None:
+                y_mark = y_mark.to(device=device, non_blocking=True)
             if static_feat is not None:
                 static_feat = static_feat.to(device=device, non_blocking=True)
             if series_idx is not None:
@@ -1014,11 +1193,12 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             _assert_min_len(xb, _model_input_len(model))
             after_copy = time.perf_counter()
             if use_graphs:
-                loss_val = graph_step(xb, yb, mb, static_feat, series_idx)
+                loss_val = graph_step(xb, yb, mb, x_mark, static_feat, series_idx)
             else:
                 with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                     mu, sigma = model(
                         xb,
+                        x_mark=x_mark,
                         series_static=static_feat,
                         series_ids=series_idx,
                     )
@@ -1111,6 +1291,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             "ids": ids,
             "static_features": series_static_np,
             "feature_names": static_feature_names,
+            "time_features": time_feature_meta,
         },
         scaler_path,
     )

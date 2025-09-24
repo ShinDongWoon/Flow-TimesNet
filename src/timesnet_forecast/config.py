@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional
 import copy
 import yaml
 import os
@@ -58,6 +58,68 @@ def apply_overrides(cfg: Dict[str, Any], overrides: Iterable[str]) -> Dict[str, 
     return out
 
 
+DEFAULT_TIME_FEATURES: List[str] = [
+    "day_of_week",
+    "day_of_month",
+    "month",
+    "day_of_year",
+]
+
+
+@dataclass
+class TimeFeatureConfig:
+    enabled: bool = False
+    features: List[str] = field(default_factory=lambda: DEFAULT_TIME_FEATURES.copy())
+    encoding: Any = "cyclical"
+    normalize: bool = True
+    freq: Optional[str] = None
+    feature_dim: Optional[int] = None
+
+    @classmethod
+    def from_mapping(cls, mapping: Dict[str, Any] | None) -> "TimeFeatureConfig":
+        if mapping is None:
+            return cls()
+        data = dict(mapping)
+        enabled = bool(data.get("enabled", False))
+        feats = data.get("features")
+        if enabled:
+            if not isinstance(feats, list) or not feats:
+                raise ValueError(
+                    "data.time_features.features must be a non-empty list when enabled is true"
+                )
+            features = [str(f) for f in feats]
+        else:
+            if isinstance(feats, list) and feats:
+                features = [str(f) for f in feats]
+            else:
+                features = DEFAULT_TIME_FEATURES.copy()
+        encoding = data.get("encoding", "cyclical")
+        normalize = bool(data.get("normalize", True))
+        freq = data.get("freq")
+        feature_dim = data.get("feature_dim")
+        return cls(
+            enabled=enabled,
+            features=features,
+            encoding=encoding,
+            normalize=normalize,
+            freq=freq,
+            feature_dim=feature_dim if feature_dim is None else int(feature_dim),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "enabled": self.enabled,
+            "features": list(self.features),
+            "encoding": self.encoding,
+            "normalize": self.normalize,
+        }
+        if self.freq is not None:
+            payload["freq"] = self.freq
+        if self.feature_dim is not None:
+            payload["feature_dim"] = int(self.feature_dim)
+        return payload
+
+
 @dataclass
 class Config:
     raw: Dict[str, Any]
@@ -79,6 +141,9 @@ class Config:
         # keeps the projection width tied to the input feature dimension.
         model_cfg.setdefault("static_proj_dim", None)
         model_cfg.setdefault("static_layernorm", True)
+        data_cfg = base.setdefault("data", {})
+        time_cfg = TimeFeatureConfig.from_mapping(data_cfg.get("time_features"))
+        data_cfg["time_features"] = time_cfg.to_dict()
         return Config(raw=base)
 
     def get(self, path: str, default: Any = None) -> Any:
