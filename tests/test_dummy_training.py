@@ -59,7 +59,6 @@ def test_dummy_training_smape_wsmape():
         "output_proj": model.output_proj,
         "sigma_proj": model.sigma_proj,
         "static_proj": model.static_proj,
-        "pre_embedding_norm": model.pre_embedding_norm,
     }
     if model.series_embedding is not None:
         modules_to_check["series_embedding"] = model.series_embedding

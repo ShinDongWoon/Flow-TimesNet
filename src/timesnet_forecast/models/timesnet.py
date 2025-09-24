@@ -476,7 +476,7 @@ class TimesNet(nn.Module):
         self.series_embedding: nn.Embedding | None = None
         self.static_proj: nn.Linear | None = None
         self.static_norm: nn.Module | None = None
-        self.pre_embedding_norm: nn.LayerNorm | None = None
+        self.pre_embedding_norm: nn.Module = nn.Identity()
         self.pre_embedding_dropout = nn.Dropout(self.dropout)
         self.static_feature_norm: nn.LayerNorm | None = None
         self.value_series_norm: nn.LayerNorm | None = None
@@ -673,18 +673,7 @@ class TimesNet(nn.Module):
             self.sigma_proj = self.sigma_proj.to(device=x.device, dtype=x.dtype)
             self._per_series_feature_dim = total_per_series
 
-        if (
-            self.pre_embedding_norm is None
-            or tuple(self.pre_embedding_norm.normalized_shape)
-            != (total_per_series,)
-        ):
-            self.pre_embedding_norm = nn.LayerNorm(total_per_series).to(
-                device=x.device, dtype=x.dtype
-            )
-        else:
-            self.pre_embedding_norm = self.pre_embedding_norm.to(
-                device=x.device, dtype=x.dtype
-            )
+        self.pre_embedding_norm = self.pre_embedding_norm.to(device=x.device)
         self.pre_embedding_dropout = self.pre_embedding_dropout.to(device=x.device)
 
     def _sigma_from_ref(self, ref: torch.Tensor) -> torch.Tensor:
@@ -809,10 +798,6 @@ class TimesNet(nn.Module):
             if len(per_series_features) > 1
             else per_series_features[0]
         )
-        assert (
-            self.pre_embedding_norm is not None
-        ), "pre_embedding_norm should have been initialised by _ensure_embedding"
-        combined = self.pre_embedding_norm(combined)
         combined = combined.reshape(B, time_len, -1)
         combined = self.pre_embedding_dropout(combined)
         features = self.embedding(combined, mark_slice)  # type: ignore[arg-type]

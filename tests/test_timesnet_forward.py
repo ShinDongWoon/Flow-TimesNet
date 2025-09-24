@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 # Ensure the project src is on the path for imports
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
@@ -43,6 +44,48 @@ def test_forward_shape_and_head_processing():
     mu_head, sigma_head = model(long_x[:, :L, :])
     assert mu_long.shape == mu_head.shape == (B, H, N)
     assert sigma_long.shape == sigma_head.shape == (B, H, N)
+
+
+def test_timesnet_skips_pre_embedding_normalization():
+    torch.manual_seed(0)
+    B, L, H, N = 2, 12, 4, 1
+    model = TimesNet(
+        input_len=L,
+        pred_len=H,
+        d_model=8,
+        d_ff=16,
+        n_layers=1,
+        k_periods=1,
+        kernel_set=[(3, 3)],
+        dropout=0.0,
+        activation="gelu",
+        mode="direct",
+        id_embed_dim=0,
+    )
+
+    xb = torch.randn(B, L, N)
+    with torch.no_grad():
+        model(xb)
+
+    captured: dict[str, torch.Tensor] = {}
+
+    assert model.embedding is not None
+
+    def hook(module: nn.Module, inputs: tuple[torch.Tensor, ...], output: torch.Tensor) -> None:
+        captured["value_input"] = inputs[0].detach().clone()
+
+    handle = model.embedding.value_embedding.register_forward_hook(hook)
+    try:
+        with torch.no_grad():
+            model(xb)
+    finally:
+        handle.remove()
+
+    assert "value_input" in captured
+
+    assert model.value_series_norm is not None
+    expected = model.value_series_norm(xb.permute(0, 2, 1)).permute(0, 2, 1)
+    assert torch.allclose(captured["value_input"], expected.reshape(B, L, -1))
 
 
 def test_timesnet_applies_per_series_floor():
