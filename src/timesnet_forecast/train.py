@@ -602,8 +602,12 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     )
     if len(dl_val.dataset) == 0:
         raise ValueError("Validation split has no windows; increase train.val.holdout_days or adjust model.input_len/pred_len.")
-
-    series_ids_default = torch.arange(len(ids), dtype=torch.long, device=device)
+    warmup_series_static = torch.from_numpy(series_static_np).to(
+        device=device, dtype=torch.float32
+    )
+    series_ids_default = torch.from_numpy(series_id_array).to(
+        device=device, dtype=torch.long
+    )
 
     use_loss_masking = bool(cfg["train"].get("use_loss_masking", False))
 
@@ -682,13 +686,24 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     ).to(device)
 
     # Lazily build model parameters so that downstream utilities see them
+    warmup_kwargs = {
+        "series_static": warmup_series_static,
+        "series_ids": series_ids_default,
+    }
     with torch.no_grad():
         dummy = torch.zeros(1, input_len, len(ids), device=device)
-        model(dummy)
+        model(dummy, **warmup_kwargs)
         if cfg["train"]["channels_last"]:
             model.to(memory_format=torch.channels_last)
+            dummy_cl = dummy.to(memory_format=torch.channels_last) if dummy.dim() == 4 else dummy
+            model(dummy_cl, **warmup_kwargs)
     if cfg["train"]["compile"]:
-        model = maybe_compile(model, True, warmup_args=(dummy,))
+        model = maybe_compile(
+            model,
+            True,
+            warmup_args=(dummy,),
+            warmup_kwargs=warmup_kwargs,
+        )
 
     if isinstance(getattr(model, "min_sigma_vector", None), torch.Tensor) and model.min_sigma_vector.numel() > 0:
         min_sigma: float | torch.Tensor = model.min_sigma_vector

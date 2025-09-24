@@ -54,7 +54,27 @@ def test_dummy_training_smape_wsmape():
     with torch.no_grad():
         _ = model(X[:1], series_static=static_features, series_ids=series_ids)
 
+    modules_to_check = {
+        "embedding": model.embedding,
+        "output_proj": model.output_proj,
+        "sigma_proj": model.sigma_proj,
+        "static_proj": model.static_proj,
+        "pre_embedding_norm": model.pre_embedding_norm,
+    }
+    if model.series_embedding is not None:
+        modules_to_check["series_embedding"] = model.series_embedding
+    for name, module in modules_to_check.items():
+        assert module is not None, f"{name} should be initialised after warm-up"
+
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    param_group_params = [set(id(p) for p in group["params"]) for group in optimizer.param_groups]
+    for name, module in modules_to_check.items():
+        params = list(module.parameters())
+        assert params, f"{name} should expose parameters after warm-up"
+        for group in param_group_params:
+            assert all(id(param) in group for param in params), (
+                f"{name} parameters must be present in every optimizer param group"
+            )
     for _ in range(30):
         idx = torch.randperm(X.size(0))
         for j in range(0, len(idx), 4):
