@@ -37,7 +37,7 @@ train:
   grad_clip_norm: 1.0
   amp: true
   compile: false
-  deterministic: true
+  deterministic: false
   cuda_graphs: false         # Mutually exclusive with compile
   use_checkpoint: false      # Enable activation checkpointing to save memory at the cost of speed
   min_sigma: 1.0e-3
@@ -77,7 +77,7 @@ model:
   activation: "gelu"
   bottleneck_ratio: 3.0      # Bottleneck width ≈ min(in,out)/ratio (>1 contracts, <1 expands)
   use_embedding_norm: true
-  id_embed_dim: 32           # Per-series identifier embedding dimension (set to 0 to disable)
+  id_embed_dim: 0           # Per-series identifier embedding dimension (set to 0 to disable)
   static_proj_dim: 32        # Projection size for static covariates (set to null to keep input dim)
   static_layernorm: true     # Apply LayerNorm after projecting static covariates
 
