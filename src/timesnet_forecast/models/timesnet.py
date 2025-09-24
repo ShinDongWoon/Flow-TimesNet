@@ -476,7 +476,7 @@ class TimesNet(nn.Module):
         self.series_embedding: nn.Embedding | None = None
         self.static_proj: nn.Linear | None = None
         self.static_norm: nn.Module | None = None
-        self.pre_embedding_norm: nn.LayerNorm | None = None
+        self.pre_embedding_norm: nn.Module | None = None
         self.pre_embedding_dropout = nn.Dropout(self.dropout)
         self.static_feature_norm: nn.LayerNorm | None = None
         self.value_series_norm: nn.LayerNorm | None = None
@@ -673,18 +673,27 @@ class TimesNet(nn.Module):
             self.sigma_proj = self.sigma_proj.to(device=x.device, dtype=x.dtype)
             self._per_series_feature_dim = total_per_series
 
-        if (
-            self.pre_embedding_norm is None
-            or tuple(self.pre_embedding_norm.normalized_shape)
-            != (total_per_series,)
-        ):
-            self.pre_embedding_norm = nn.LayerNorm(total_per_series).to(
-                device=x.device, dtype=x.dtype
-            )
+        if total_per_series <= 1:
+            # A per-series LayerNorm with a single feature would zero-out the
+            # dynamic value channel entirely, so bypass normalization in this case.
+            if not isinstance(self.pre_embedding_norm, nn.Identity):
+                self.pre_embedding_norm = nn.Identity()
+            self.pre_embedding_norm = self.pre_embedding_norm.to(device=x.device)
         else:
-            self.pre_embedding_norm = self.pre_embedding_norm.to(
-                device=x.device, dtype=x.dtype
-            )
+            needs_new = not isinstance(self.pre_embedding_norm, nn.LayerNorm)
+            if not needs_new:
+                assert isinstance(self.pre_embedding_norm, nn.LayerNorm)
+                needs_new = tuple(self.pre_embedding_norm.normalized_shape) != (
+                    total_per_series,
+                )
+            if needs_new:
+                self.pre_embedding_norm = nn.LayerNorm(total_per_series).to(
+                    device=x.device, dtype=x.dtype
+                )
+            else:
+                self.pre_embedding_norm = self.pre_embedding_norm.to(
+                    device=x.device, dtype=x.dtype
+                )
         self.pre_embedding_dropout = self.pre_embedding_dropout.to(device=x.device)
 
     def _sigma_from_ref(self, ref: torch.Tensor) -> torch.Tensor:
