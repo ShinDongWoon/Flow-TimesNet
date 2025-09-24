@@ -77,7 +77,7 @@ model:
   activation: "gelu"
   bottleneck_ratio: 3.0      # Bottleneck width ≈ min(in,out)/ratio (>1 contracts, <1 expands)
   use_embedding_norm: false
-  id_embed_dim: 32           # Per-series identifier embedding dimension (set to 0 to disable)
+  id_embed_dim: 0           # Per-series identifier embedding dimension (set to 0 to disable)
   static_proj_dim: 32        # Projection size for static covariates (set to null to keep input dim)
   static_layernorm: true     # Apply LayerNorm after projecting static covariates
 
