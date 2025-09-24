@@ -13,7 +13,7 @@ data:
     add_noise_std: 0.0       # 표준편차; 0이면 사용 안 함
     time_shift: 0            # 입력 시퀀스 시작 위치 랜덤 시프트 범위
   time_features:
-    enabled: false
+    enabled: true
     features: [day_of_week, day_of_month, month, day_of_year]
     encoding: cyclical       # cyclical|onehot|numeric (or per-feature mapping)
     normalize: true
@@ -37,7 +37,7 @@ train:
   grad_clip_norm: 1.0
   amp: true
   compile: false
-  deterministic: false
+  deterministic: true
   cuda_graphs: false         # Mutually exclusive with compile
   use_checkpoint: false      # Enable activation checkpointing to save memory at the cost of speed
   min_sigma: 1.0e-3
