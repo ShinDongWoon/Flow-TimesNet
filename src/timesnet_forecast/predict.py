@@ -6,63 +6,101 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import torch
+from pandas.tseries.frequencies import to_offset
 
 from .config import Config
 from .utils.logging import console
 from .utils.torch_opt import amp_autocast
 from .utils import io as io_utils
 from .models.timesnet import TimesNet
+from .utils.time_features import build_time_features
 
 
 def _select_device(req: str) -> torch.device:
     if req == "cuda" and torch.cuda.is_available():
         return torch.device("cuda:0")
     return torch.device("cpu")
-def forecast_direct_batch(
+def _invoke_model(
     model: TimesNet,
-    last_seq: torch.Tensor,
+    xb: torch.Tensor,
+    *,
+    x_mark: torch.Tensor | None = None,
     series_static: torch.Tensor | None = None,
     series_ids: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    kwargs: Dict[str, torch.Tensor] = {}
+    if x_mark is not None:
+        kwargs["x_mark"] = x_mark
+    if series_static is not None:
+        kwargs["series_static"] = series_static
+    if series_ids is not None:
+        kwargs["series_ids"] = series_ids
     try:
-        return model(
-            last_seq,
-            series_static=series_static,
-            series_ids=series_ids,
-        )
+        return model(xb, **kwargs)
     except TypeError as err:
         err_str = str(err)
-        if "series_static" in err_str or "series_ids" in err_str:
-            return model(last_seq)
+        for key in ["series_static", "series_ids", "x_mark"]:
+            if key in kwargs and key in err_str:
+                kwargs.pop(key)
+                try:
+                    return model(xb, **kwargs)
+                except TypeError as inner_err:
+                    err_str = str(inner_err)
+                    continue
         raise
+
+
+def forecast_direct_batch(
+    model: TimesNet,
+    last_seq: torch.Tensor,
+    x_mark: torch.Tensor | None = None,
+    series_static: torch.Tensor | None = None,
+    series_ids: torch.Tensor | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _invoke_model(
+        model,
+        last_seq,
+        x_mark=x_mark,
+        series_static=series_static,
+        series_ids=series_ids,
+    )
 
 
 def forecast_recursive_batch(
     model: TimesNet,
     last_seq: torch.Tensor,
     H: int,
+    x_mark: torch.Tensor | None = None,
+    y_mark: torch.Tensor | None = None,
     series_static: torch.Tensor | None = None,
     series_ids: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     mus: List[torch.Tensor] = []
     sigmas: List[torch.Tensor] = []
     seq = last_seq
-    for _ in range(H):
-        try:
-            mu_step, sigma_step = model(
-                seq,
-                series_static=series_static,
-                series_ids=series_ids,
-            )
-        except TypeError as err:
-            err_str = str(err)
-            if "series_static" in err_str or "series_ids" in err_str:
-                mu_step, sigma_step = model(seq)
-            else:
-                raise
+    mark_seq = x_mark
+    for step in range(H):
+        mu_step, sigma_step = _invoke_model(
+            model,
+            seq,
+            x_mark=mark_seq,
+            series_static=series_static,
+            series_ids=series_ids,
+        )
         mus.append(mu_step)
         sigmas.append(sigma_step)
         seq = torch.cat([seq[:, 1:, :], mu_step], dim=1)
+        if mark_seq is not None:
+            if y_mark is None:
+                raise ValueError(
+                    "Temporal features provided for history but missing future marks during recursive forecast"
+                )
+            if y_mark.size(1) <= step:
+                raise ValueError(
+                    "y_mark does not provide enough future steps for recursive forecasting"
+                )
+            next_mark = y_mark[:, step : step + 1, :]
+            mark_seq = torch.cat([mark_seq[:, 1:, :], next_mark], dim=1)
     return torch.cat(mus, dim=1), torch.cat(sigmas, dim=1)
 
 
@@ -91,6 +129,17 @@ def predict_once(cfg: Dict) -> str:
     ids: List[str] = list(scaler_meta["ids"])
     method = scaler_meta["method"]
     scaler = scaler_meta["scaler"]
+    data_time_cfg = dict(cfg_used.get("data", {}).get("time_features") or {})
+    time_feature_meta = scaler_meta.get("time_features") or {}
+    meta_config = dict(time_feature_meta.get("config") or data_time_cfg)
+    meta_enabled = bool(time_feature_meta.get("enabled", meta_config.get("enabled", False)))
+    meta_dim = int(time_feature_meta.get("feature_dim", meta_config.get("feature_dim", 0)) or 0)
+    meta_freq = time_feature_meta.get("freq") or meta_config.get("freq")
+    meta_config.setdefault("enabled", meta_enabled)
+    cfg_used.setdefault("data", {}).setdefault("time_features", {}).update(
+        {"feature_dim": meta_dim, "freq": meta_freq, "enabled": meta_enabled}
+    )
+    time_features_enabled = bool(meta_enabled and meta_dim > 0)
 
     static_features_np = None
     static_feature_ids: List[str] | None = None
@@ -360,6 +409,42 @@ def predict_once(cfg: Dict) -> str:
             )
         last_seq = Xn[-input_len:, :]
         xb = torch.from_numpy(last_seq).unsqueeze(0)
+        x_mark_tensor: torch.Tensor | None = None
+        y_mark_tensor: torch.Tensor | None = None
+        if time_features_enabled:
+            history_index = pd.DatetimeIndex(wide.index)
+            recent_index = history_index[-input_len:]
+            active_cfg = dict(meta_config)
+            active_cfg["enabled"] = True
+            freq_str = meta_freq or cfg_used.get("data", {}).get("time_features", {}).get("freq")
+            if freq_str is None:
+                freq_str = pd.infer_freq(history_index)
+            if freq_str is None:
+                console().print(
+                    "[yellow]Unable to infer frequency for time features during prediction; temporal marks disabled for this batch.[/yellow]"
+                )
+            else:
+                try:
+                    offset = to_offset(freq_str)
+                except (ValueError, TypeError) as err:
+                    console().print(
+                        f"[yellow]Invalid frequency '{freq_str}' for time features ({err}); disabling temporal marks for this batch.[/yellow]"
+                    )
+                else:
+                    future_index = pd.date_range(
+                        recent_index[-1] + offset, periods=pred_len, freq=offset
+                    )
+                    combined_index = recent_index.append(future_index)
+                    marks_np = build_time_features(combined_index, active_cfg)
+                    if marks_np.shape[1] != meta_dim:
+                        console().print(
+                            "[yellow]Time feature dimension mismatch during prediction; temporal marks disabled for this batch.[/yellow]"
+                        )
+                    else:
+                        x_mark_np = marks_np[:input_len]
+                        y_mark_np = marks_np[input_len:]
+                        x_mark_tensor = torch.from_numpy(x_mark_np).unsqueeze(0)
+                        y_mark_tensor = torch.from_numpy(y_mark_np).unsqueeze(0)
         if cfg_used["train"]["channels_last"]:
             xb = xb.unsqueeze(-1).to(
                 device=device,
@@ -368,12 +453,21 @@ def predict_once(cfg: Dict) -> str:
             ).squeeze(-1)
         else:
             xb = xb.to(device, non_blocking=True)
+        if x_mark_tensor is not None:
+            x_mark_tensor = x_mark_tensor.to(
+                device=device, dtype=xb.dtype, non_blocking=True
+            )
+        if y_mark_tensor is not None:
+            y_mark_tensor = y_mark_tensor.to(
+                device=device, dtype=xb.dtype, non_blocking=True
+            )
 
         with torch.inference_mode(), amp_autocast(cfg_used["train"]["amp"] and device.type == "cuda"):
             if cfg_used["model"]["mode"] == "direct":
                 mu_pred, _ = forecast_direct_batch(
                     model,
                     xb,
+                    x_mark=x_mark_tensor,
                     series_static=static_tensor,
                     series_ids=series_ids_tensor,
                 )
@@ -382,6 +476,8 @@ def predict_once(cfg: Dict) -> str:
                     model,
                     xb,
                     pred_len,
+                    x_mark=x_mark_tensor,
+                    y_mark=y_mark_tensor,
                     series_static=static_tensor,
                     series_ids=series_ids_tensor,
                 )
