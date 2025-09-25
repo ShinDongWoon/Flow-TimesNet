@@ -32,7 +32,7 @@ train:
   batch_size: 256
   accumulation_steps: 1
   lr_warmup_steps: 50       # conservative warmup for unnormalized SMAPE training
-  lr: 1.0e-3
+  lr: 3.0e-4
   weight_decay: 1.0e-6
   grad_clip_norm: 1.0
   amp: true
@@ -42,7 +42,7 @@ train:
   use_checkpoint: false      # Enable activation checkpointing to save memory at the cost of speed
   min_sigma: 1.0e-3
   min_sigma_method: "per_series_median"   # global|per_series_median aggregation for target std
-  min_sigma_scale: 0.1       # floor multiplier applied to train target std
+  min_sigma_scale: 0.05       # floor multiplier applied to train target std
   lr_scheduler:
     type: "cosine"
     T_max: ${train.epochs}   # or explicit integer
