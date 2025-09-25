@@ -395,12 +395,24 @@ class TimesBlock(nn.Module):
         if amplitudes.dim() == 1:
             amplitudes = amplitudes.view(1, -1).expand(B, -1)
         amp = amplitudes[:, valid_indices] if amplitudes.numel() > 0 else amplitudes
-        weights_flat = F.softmax(amp, dim=1) if amp.numel() > 0 else amp
-        if weights_flat.numel() > 0:
-            weight_sum = weights_flat.sum(dim=1)
-            target = torch.ones_like(weight_sum)
-            if not torch.allclose(weight_sum, target, atol=1e-4, rtol=1e-3):
-                raise RuntimeError("Residual weights must sum to 1 per sample")
+        if amp.numel() > 0:
+            softmax_dtype = amp.dtype
+            if softmax_dtype in (torch.float16, torch.bfloat16):
+                amp_for_softmax = amp.to(dtype=torch.float32)
+                weights_float = F.softmax(amp_for_softmax, dim=1)
+            else:
+                weights_float = F.softmax(amp, dim=1)
+            eps = torch.finfo(weights_float.dtype).eps
+            weight_sum = weights_float.sum(dim=1, keepdim=True)
+            zero_mask = weight_sum <= eps
+            if zero_mask.any():
+                uniform = torch.full_like(weights_float, 1.0 / weights_float.size(1))
+                weights_float = torch.where(zero_mask, uniform, weights_float)
+                weight_sum = torch.where(zero_mask, torch.ones_like(weight_sum), weight_sum)
+            weights_float = weights_float / weight_sum.clamp_min(eps)
+            weights_flat = weights_float.to(dtype=amp.dtype)
+        else:
+            weights_flat = amp
         weights = weights_flat.view(B, 1, 1, -1)
         combined = (stacked * weights).sum(dim=-1)
         return x + combined
@@ -1146,7 +1158,14 @@ class TimesNet(nn.Module):
             mark_slice = x_mark[:, -self.input_len :, :]
         else:
             mark_slice = None
-        enc_x_value = x[:, -self.input_len :, :]
+        enc_x_value = x[:, -self.input_len :, :].clone()
+        if torch.any(~torch.isfinite(enc_x_value)):
+            if not enc_x_value.is_floating_point():
+                raise RuntimeError(
+                    "TimesNet input contains non-finite values in non-floating tensor"
+                )
+            invalid_mask = ~torch.isfinite(enc_x_value)
+            enc_x_value = enc_x_value.masked_fill(invalid_mask, 0.0)
         enc_x_features = enc_x_value.clone()
         self._ensure_embedding(enc_x_features, mark_slice, series_static, series_ids)
         target_steps = self.pred_len if self.mode == "direct" else self._out_steps
