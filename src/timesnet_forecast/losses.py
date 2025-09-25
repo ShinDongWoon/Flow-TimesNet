@@ -14,8 +14,12 @@ def negative_binomial_mask(
     finite_mask = torch.isfinite(y) & torch.isfinite(rate) & torch.isfinite(dispersion)
     if mask is not None:
         mask_bool = mask.to(dtype=torch.bool)
-        if mask_bool.shape != finite_mask.shape:
-            mask_bool = mask_bool.expand_as(finite_mask)
+        if mask_bool.ndim < finite_mask.ndim:
+            mask_bool = mask_bool.reshape(
+                *mask_bool.shape,
+                *([1] * (finite_mask.ndim - mask_bool.ndim)),
+            )
+        mask_bool = mask_bool.expand_as(finite_mask)
         finite_mask = finite_mask & mask_bool
     return finite_mask
 
