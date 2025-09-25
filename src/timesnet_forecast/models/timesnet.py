@@ -916,7 +916,13 @@ class TimesNet(nn.Module):
                 raise ValueError(
                     "series_static must have shape [N, F] or [B, N, F]"
                 )
-            static_proj = self.static_proj(static_input.to(enc_x.dtype))
+            static_proj = self.static_proj(
+                static_input.to(
+                    device=enc_x.device,
+                    dtype=enc_x.dtype,
+                    non_blocking=enc_x.is_cuda,
+                )
+            )
             if self.static_norm is not None:
                 static_proj = self.static_norm(static_proj)
             context_components.append(static_proj)
