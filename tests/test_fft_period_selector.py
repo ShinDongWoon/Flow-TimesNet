@@ -100,3 +100,19 @@ def test_fft_period_selector_amp_non_power_of_two_sequence():
     assert torch.allclose(amplitudes_amp, amplitudes_ref, atol=1e-3, rtol=1e-3)
     assert x_amp.grad is not None
     assert torch.allclose(x_amp.grad, grad_ref, atol=1e-3, rtol=1e-3)
+
+
+def test_fft_period_selector_enforces_min_cycles():
+    L = 28
+    t = torch.arange(L, dtype=torch.float32)
+    weekly = torch.sin(2 * math.pi * t / 7)
+    x = weekly.view(1, L, 1)
+
+    selector = FFTPeriodSelector(k_periods=3, pmax=L)
+    periods, amplitudes = selector(x)
+
+    assert periods.numel() > 0
+    assert torch.all(periods < L)
+    cycles = (L + periods - 1) // periods
+    assert torch.any(cycles >= 2)
+    assert amplitudes.shape[0] == 1

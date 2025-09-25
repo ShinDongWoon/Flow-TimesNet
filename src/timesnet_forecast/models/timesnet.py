@@ -107,9 +107,9 @@ class FFTPeriodSelector(nn.Module):
             empty_amp = torch.zeros(B, 0, dtype=amp_samples.dtype, device=device)
             return empty_idx, empty_amp.to(dtype)
 
-        freq_indices = torch.arange(amp_mean.numel(), device=device, dtype=dtype)
-        tie_break = freq_indices * torch.finfo(dtype).eps
-        scores = amp_mean - tie_break
+        freq_indices = torch.arange(amp_mean.numel(), device=device, dtype=torch.long)
+        log_indices = torch.log1p(freq_indices.to(torch.float32))
+        scores = amp_mean - 1e-8 * log_indices.to(dtype)
         _, indices = torch.topk(scores, k=k, largest=True)
         safe_indices = indices.to(device=device, dtype=torch.long).clamp_min(1)
         sample_values = amp_samples.gather(
@@ -117,12 +117,24 @@ class FFTPeriodSelector(nn.Module):
         )
 
         L_t = torch.tensor(L, dtype=torch.long, device=device)
+        upper_bound = min(self.pmax, max(L - 1, self.min_period_threshold))
+        if upper_bound < self.min_period_threshold:
+            empty_idx = torch.zeros(0, dtype=torch.long, device=device)
+            empty_amp = torch.zeros(B, 0, dtype=amp_samples.dtype, device=device)
+            return empty_idx, empty_amp.to(dtype)
+
         periods = (L_t + safe_indices - 1) // safe_indices
-        periods = torch.clamp(
-            periods,
-            min=self.min_period_threshold,
-            max=self.pmax,
-        )
+        periods = torch.clamp(periods, min=self.min_period_threshold, max=upper_bound)
+
+        cycles = (L_t + periods - 1) // periods
+        valid_mask = cycles >= 2
+        if not torch.any(valid_mask):
+            empty_idx = torch.zeros(0, dtype=torch.long, device=device)
+            empty_amp = torch.zeros(B, 0, dtype=amp_samples.dtype, device=device)
+            return empty_idx, empty_amp.to(dtype)
+
+        periods = periods[valid_mask]
+        sample_values = sample_values[:, valid_mask]
 
         return periods, sample_values.to(dtype)
 
@@ -280,6 +292,7 @@ class TimesBlock(nn.Module):
         # ``period_selector`` is injected from ``TimesNet`` after instantiation to
         # avoid registering the shared selector multiple times.
         self.period_selector: FFTPeriodSelector | None = None
+        self._period_calls: int = 0
 
     def _build_layers(self, channels: int, device: torch.device, dtype: torch.dtype) -> None:
         if channels <= 0:
@@ -322,6 +335,7 @@ class TimesBlock(nn.Module):
         if self.period_selector is None:
             raise RuntimeError("TimesBlock.period_selector has not been set")
 
+        self._period_calls = getattr(self, "_period_calls", 0) + 1
         if self.inception is None:
             if self._configured_d_model is not None and x.size(-1) != self._configured_d_model:
                 raise ValueError(
@@ -1019,14 +1033,14 @@ class TimesNet(nn.Module):
                 )
         self.pre_embedding_dropout = self.pre_embedding_dropout.to(device=x.device)
 
-        if (
-            isinstance(self.min_sigma_vector, torch.Tensor)
-            and self.min_sigma_vector.numel() > 0
-            and self.min_sigma_vector.shape[-1] != c_in
-        ):
-            raise ValueError(
-                "min_sigma_vector length does not match number of series"
-            )
+        if isinstance(self.min_sigma_vector, torch.Tensor) and self.min_sigma_vector.numel() > 0:
+            current = int(self.min_sigma_vector.shape[-1])
+            if current < c_in:
+                raise ValueError(
+                    "min_sigma_vector length does not match number of series"
+                )
+            if current != c_in:
+                self.min_sigma_vector = self.min_sigma_vector[..., :c_in]
 
         if self.embedding_time_features is not None and self.embedding_time_features != time_dim:
             raise ValueError("Temporal feature dimension changed between calls")
