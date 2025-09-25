@@ -88,8 +88,9 @@ class FFTPeriodSelector(nn.Module):
             fft_input = x.to(fft_dtype) if x.dtype != fft_dtype else x
             spec = torch.fft.rfft(fft_input, dim=1)
             amp = torch.abs(spec)
-        amp_mean = amp.mean(dim=(0, 2))
-        amp_samples = amp.mean(dim=2)
+        amp_channel_median = amp.median(dim=2).values
+        amp_mean = amp_channel_median.mean(dim=0)
+        amp_samples = amp_channel_median
 
         if amp_mean.numel() <= 1:
             empty_idx = torch.zeros(0, dtype=torch.long, device=device)
@@ -333,6 +334,10 @@ class TimesBlock(nn.Module):
                 raise ValueError("Number of channels changed between calls")
 
         periods, amplitudes = self.period_selector(x)
+        valid = int((periods > 0).sum().item())
+        total = int(periods.numel())
+        self._valid_period_calls = getattr(self, "_valid_period_calls", 0) + valid
+        self._zero_period_calls = getattr(self, "_zero_period_calls", 0) + (total - valid)
         if periods.numel() == 0:
             return x
 
@@ -675,7 +680,7 @@ class TimesNet(nn.Module):
         self.kernel_set = list(kernel_set)
         self.period_selector = FFTPeriodSelector(
             k_periods=self.k_periods,
-            pmax=self.input_len + self.pred_len,
+            pmax=self.input_len,
             min_period_threshold=min_period_threshold,
         )
         self.blocks = nn.ModuleList(
@@ -1101,7 +1106,7 @@ class TimesNet(nn.Module):
 
         self.output_dim = self.input_channels
 
-    def _sigma_from_ref(self, ref: torch.Tensor) -> torch.Tensor:
+    def _dispersion_floor_from_ref(self, ref: torch.Tensor) -> torch.Tensor:
         if isinstance(self.min_sigma_vector, torch.Tensor) and self.min_sigma_vector.numel() > 0:
             floor = self.min_sigma_vector.to(device=ref.device, dtype=ref.dtype)
             return floor.expand_as(ref).clone()
@@ -1278,7 +1283,7 @@ class TimesNet(nn.Module):
         for block in self.blocks:
             object.__setattr__(block, "period_selector", self.period_selector)
 
-        def _apply_late_bias(mu_tensor: torch.Tensor) -> torch.Tensor:
+        def _apply_late_bias(pre_activation: torch.Tensor) -> torch.Tensor:
             if (
                 context_concat is not None
                 and self.late_bias_head is not None
@@ -1293,29 +1298,25 @@ class TimesNet(nn.Module):
                 bias = self.late_bias_head(c)
                 bias = bias.permute(0, 2, 1).contiguous()
                 gate = self.late_bias_gate.to(
-                    dtype=mu_tensor.dtype, device=mu_tensor.device
+                    dtype=pre_activation.dtype, device=pre_activation.device
                 )
-                mu_tensor = mu_tensor + gate * bias.to(
-                    dtype=mu_tensor.dtype, device=mu_tensor.device
+                pre_activation = pre_activation + gate * bias.to(
+                    dtype=pre_activation.dtype, device=pre_activation.device
                 )
-            return mu_tensor
+            return pre_activation
 
-        preview_periods, _ = self.period_selector(seq_features)
-        if preview_periods.numel() > 0 and torch.any(preview_periods <= 0):
-            raise RuntimeError("Selected periods must be positive")
-        if preview_periods.numel() > 0:
-            for block in self.blocks:
-                if seq_features.shape[-1] != self.d_model:
-                    raise RuntimeError(
-                        "Residual input to TimesBlock must maintain d_model channels"
-                    )
-                if self.use_checkpoint:
-                    updated = checkpoint(block, seq_features, use_reentrant=False)
-                else:
-                    updated = block(seq_features)
-                delta = updated - seq_features
-                seq_features = seq_features + self.residual_dropout(delta)
-                seq_features = self.layer_norm(seq_features)
+        for block in self.blocks:
+            if seq_features.shape[-1] != self.d_model:
+                raise RuntimeError(
+                    "Residual input to TimesBlock must maintain d_model channels"
+                )
+            if self.use_checkpoint:
+                updated = checkpoint(block, seq_features, use_reentrant=False)
+            else:
+                updated = block(seq_features)
+            delta = updated - seq_features
+            seq_features = seq_features + self.residual_dropout(delta)
+            seq_features = self.layer_norm(seq_features)
 
         features_final = seq_features
         features_bn = features_final.permute(0, 2, 1).contiguous()
@@ -1331,20 +1332,25 @@ class TimesNet(nn.Module):
         else:
             baseline_bn = baseline_bn_full.contiguous()
         assert self.output_proj is not None  # for type checkers
+        assert self.mu_head is not None  # for type checkers
         mu_delta_bn = self.output_proj(baseline_bn)
         mu_hidden = (baseline_bn + mu_delta_bn).permute(0, 2, 1).contiguous()
-        mu = self.mu_head(mu_hidden) + history_tail
-        mu = _apply_late_bias(mu)
+        rate_preact = self.mu_head(mu_hidden) + history_tail
+        rate_preact = _apply_late_bias(rate_preact)
+        rate = F.softplus(rate_preact) + 1e-6
         assert self.sigma_proj is not None  # for type checkers
         sigma_bn = self.sigma_proj(baseline_bn)
         sigma_hidden = sigma_bn.permute(0, 2, 1).contiguous()
+        assert self.sigma_head is not None  # for type checkers
         sigma_head = self.sigma_head(sigma_hidden)
-        floor = self._sigma_from_ref(mu)
-        sigma = F.softplus(sigma_head) + floor
-        if torch.any(sigma <= 0):
-            raise RuntimeError("Predicted sigma must be strictly positive")
-        if mu.shape != (B, target_steps, N):
-            raise RuntimeError("Predicted mu has incorrect shape")
-        if sigma.shape != (B, target_steps, N):
-            raise RuntimeError("Predicted sigma has incorrect shape")
-        return mu, sigma
+        floor = self._dispersion_floor_from_ref(rate)
+        dispersion = F.softplus(sigma_head) + floor + 1e-6
+        if torch.any(~torch.isfinite(rate)) or torch.any(rate <= 0):
+            raise RuntimeError("Predicted rate must be finite and strictly positive")
+        if torch.any(~torch.isfinite(dispersion)) or torch.any(dispersion <= 0):
+            raise RuntimeError("Predicted dispersion must be finite and strictly positive")
+        if rate.shape != (B, target_steps, N):
+            raise RuntimeError("Predicted rate has incorrect shape")
+        if dispersion.shape != (B, target_steps, N):
+            raise RuntimeError("Predicted dispersion has incorrect shape")
+        return rate, dispersion

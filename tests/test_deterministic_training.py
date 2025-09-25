@@ -9,7 +9,7 @@ import torch
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 from timesnet_forecast.models.timesnet import TimesNet
-from timesnet_forecast.train import gaussian_nll_loss
+from timesnet_forecast.losses import negative_binomial_nll
 from timesnet_forecast.utils.seed import seed_everything
 
 
@@ -61,8 +61,8 @@ def _run_short_training(seed: int) -> tuple[torch.Tensor, Dict[str, torch.Tensor
             xb = X[idx]
             yb = Y[idx]
             optimizer.zero_grad()
-            mu, sigma = model(xb)
-            loss = gaussian_nll_loss(mu, sigma, yb).mean()
+            rate, dispersion = model(xb)
+            loss = negative_binomial_nll(yb, rate, dispersion)
             loss.backward()
             optimizer.step()
             total_loss += float(loss.detach())
