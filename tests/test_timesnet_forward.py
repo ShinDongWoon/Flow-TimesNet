@@ -47,6 +47,29 @@ def test_forward_shape_and_head_processing():
     assert dispersion_long.shape == dispersion_head.shape == (B, H, N)
 
 
+def test_timesnet_blocks_track_period_calls():
+    torch.manual_seed(0)
+    B, L, H, N = 1, 12, 3, 1
+    model = TimesNet(
+        input_len=L,
+        pred_len=H,
+        d_model=8,
+        d_ff=16,
+        n_layers=2,
+        k_periods=2,
+        kernel_set=[(3, 3)],
+        dropout=0.0,
+        activation="gelu",
+        mode="direct",
+    )
+    x = torch.randn(B, L, N)
+    with torch.no_grad():
+        model(x)
+    period_counts = [getattr(block, "_period_calls", 0) for block in model.blocks]
+    assert len(period_counts) == 2
+    assert all(count > 0 for count in period_counts)
+
+
 def test_timesnet_pre_embedding_norm_adapts_to_feature_count():
     torch.manual_seed(0)
     B, L, H, N = 2, 12, 4, 1

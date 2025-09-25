@@ -8,7 +8,7 @@ import torch
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
-from timesnet_forecast.losses import negative_binomial_nll
+from timesnet_forecast.losses import negative_binomial_mask, negative_binomial_nll
 
 
 def test_negative_binomial_nll_matches_manual():
@@ -20,17 +20,18 @@ def test_negative_binomial_nll_matches_manual():
 
     alpha = torch.clamp(dispersion, min=1e-8)
     mu = torch.clamp(rate, min=1e-8)
-    r = 1.0 / alpha
-    log_p = torch.log(r) - torch.log(r + mu)
-    log1m_p = torch.log(mu) - torch.log(r + mu)
-    manual = -(
-        torch.lgamma(y + r)
-        - torch.lgamma(r)
+    log1p_alpha_mu = torch.log1p(alpha * mu)
+    log_alpha = torch.log(alpha)
+    log_mu = torch.log(mu)
+    inv_alpha = 1.0 / alpha
+    manual_ll = (
+        torch.lgamma(y + inv_alpha)
+        - torch.lgamma(inv_alpha)
         - torch.lgamma(y + 1.0)
-        + r * log_p
-        + y * log1m_p
+        + inv_alpha * (-log1p_alpha_mu)
+        + y * (log_alpha + log_mu - log1p_alpha_mu)
     )
-    assert torch.allclose(loss, manual.mean())
+    assert torch.allclose(loss, -manual_ll.mean())
 
 
 def test_negative_binomial_nll_respects_mask():
@@ -45,19 +46,33 @@ def test_negative_binomial_nll_respects_mask():
     # Manual computation using only the unmasked elements
     alpha = torch.clamp(dispersion, min=1e-8)
     mu = torch.clamp(rate, min=1e-8)
-    r = 1.0 / alpha
-    log_p = torch.log(r) - torch.log(r + mu)
-    log1m_p = torch.log(mu) - torch.log(r + mu)
+    inv_alpha = 1.0 / alpha
+    log1p_alpha_mu = torch.log1p(alpha * mu)
+    log_alpha = torch.log(alpha)
+    log_mu = torch.log(mu)
     log_prob = (
-        torch.lgamma(y + r)
-        - torch.lgamma(r)
+        torch.lgamma(y + inv_alpha)
+        - torch.lgamma(inv_alpha)
         - torch.lgamma(y + 1.0)
-        + r * log_p
-        + y * log1m_p
+        + inv_alpha * (-log1p_alpha_mu)
+        + y * (log_alpha + log_mu - log1p_alpha_mu)
     )
     manual_masked = -(log_prob * mask).sum() / mask.sum()
 
     assert torch.allclose(masked_loss, manual_masked)
+
+
+def test_negative_binomial_mask_ignores_zeros_but_masks_nans():
+    y = torch.tensor([[[0.0, float("nan")]]])
+    rate = torch.tensor([[[1.0, 2.0]]])
+    dispersion = torch.tensor([[[0.5, 0.5]]])
+    base_mask = torch.ones_like(y)
+
+    valid_mask = negative_binomial_mask(y, rate, dispersion, base_mask)
+    assert valid_mask.dtype == torch.bool
+    assert valid_mask.shape == y.shape
+    assert valid_mask[0, 0, 0]
+    assert not valid_mask[0, 0, 1]
 
 
 def test_negative_binomial_nll_autocast_stability():

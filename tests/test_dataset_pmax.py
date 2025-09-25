@@ -78,17 +78,65 @@ def test_sliding_window_static_features_collate_shape():
     assert m0.dtype == torch.float32
     assert s0.dtype == torch.float32
     assert ids0.dtype == torch.long
-    assert s0.shape == static.shape
-    assert ids0.shape == series_ids.shape
+    assert s0.shape == (1, static.shape[1])
+    assert ids0.shape == (1,)
     assert isinstance(x_mark, torch.Tensor) and x_mark.numel() == 0
     assert isinstance(y_mark, torch.Tensor) and y_mark.numel() == 0
 
     loader = torch.utils.data.DataLoader(ds, batch_size=2, shuffle=False)
     xb, yb, mb, xmb, ymb, sb, idb = next(iter(loader))
-    assert sb.shape == (2, static.shape[0], static.shape[1])
-    assert idb.shape == (2, series_ids.shape[0])
+    assert xb.shape == (2, 3, 1)
+    assert yb.shape == (2, 2, 1)
+    assert sb.shape == (2, 1, static.shape[1])
+    assert idb.shape == (2, 1)
     assert isinstance(xmb, torch.Tensor) and xmb.numel() == 0
     assert isinstance(ymb, torch.Tensor) and ymb.numel() == 0
+
+
+def test_sliding_window_series_are_isolated_per_sample():
+    values = np.stack(
+        [
+            np.linspace(1.0, 6.0, num=6, dtype=np.float32),
+            np.linspace(10.0, 60.0, num=6, dtype=np.float32),
+        ],
+        axis=1,
+    )
+    ds = SlidingWindowDataset(
+        values,
+        input_len=2,
+        pred_len=1,
+        mode="direct",
+        augment=None,
+    )
+
+    x_first, y_first, *_ = ds[0]
+    x_second, y_second, *_ = ds[1]
+    np.testing.assert_allclose(x_first.squeeze(-1).numpy(), [1.0, 2.0])
+    np.testing.assert_allclose(y_first.squeeze(-1).numpy(), [3.0])
+    np.testing.assert_allclose(x_second.squeeze(-1).numpy(), [10.0, 20.0])
+    np.testing.assert_allclose(y_second.squeeze(-1).numpy(), [30.0])
+
+    loader = torch.utils.data.DataLoader(ds, batch_size=2, shuffle=False)
+    xb, _, _, _, _ = next(iter(loader))[:5]
+    assert xb.shape == (2, 2, 1)
+    np.testing.assert_allclose(xb[0].squeeze(-1).numpy(), [1.0, 2.0])
+    np.testing.assert_allclose(xb[1].squeeze(-1).numpy(), [10.0, 20.0])
+
+
+def test_dataframe_loader_preserves_single_series_shape():
+    dates = pd.date_range("2024-01-01", periods=4, freq="D")
+    records = []
+    for name, values in {"A": [1, 2, 3, 4], "B": [10, 11, 12, 13]}.items():
+        for d, v in zip(dates, values):
+            records.append({"date": d, "id": name, "target": v})
+    df = pd.DataFrame(records)
+    wide = df.pivot(index="date", columns="id", values="target").sort_index(axis=1)
+    values = wide.to_numpy(dtype=np.float32)
+    ds = SlidingWindowDataset(values, input_len=2, pred_len=1, mode="direct")
+
+    x_sample, y_sample, *_ = ds[0]
+    assert x_sample.shape == (2, 1)
+    assert y_sample.shape == (1, 1)
 
 
 def test_sliding_window_time_features_marks():
