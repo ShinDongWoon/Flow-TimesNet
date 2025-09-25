@@ -15,7 +15,7 @@ from tqdm import tqdm
 from .config import Config, save_yaml
 from .utils.logging import console, print_config
 from .utils.seed import seed_everything
-from .losses import negative_binomial_nll
+from .losses import negative_binomial_mask, negative_binomial_nll
 from .utils.torch_opt import (
     amp_autocast,
     maybe_compile,
@@ -190,6 +190,30 @@ def _normalize_optional(value):
     if isinstance(value, torch.Tensor) and value.numel() == 0:
         return None
     return value
+
+
+def _stack_series_columns(
+    per_id_values: Dict[int, List[np.ndarray]], n_ids: int
+) -> np.ndarray:
+    if n_ids <= 0:
+        return np.zeros((0, 0), dtype=np.float32)
+    columns: List[np.ndarray] = []
+    expected_len: int | None = None
+    for sid in range(n_ids):
+        series_list = per_id_values.get(sid, [])
+        if series_list:
+            flat_values = [np.asarray(v, dtype=np.float32).reshape(-1) for v in series_list]
+            col = np.concatenate(flat_values, axis=0)
+        else:
+            col = np.zeros(0, dtype=np.float32)
+        if expected_len is None:
+            expected_len = int(col.shape[0])
+        elif int(col.shape[0]) != expected_len:
+            raise ValueError("Mismatched series lengths detected during evaluation")
+        columns.append(col.reshape(-1, 1))
+    if expected_len is None:
+        return np.zeros((0, n_ids), dtype=np.float32)
+    return np.concatenate(columns, axis=1)
 
 
 def _unpack_batch(
@@ -442,8 +466,8 @@ def _eval_wsmape(
     use_loss_mask: bool = False,
 ) -> float:
     model.eval()
-    ys: List[np.ndarray] = []
-    preds: List[np.ndarray] = []
+    per_id_targets: Dict[int, List[np.ndarray]] = {i: [] for i in range(len(ids))}
+    per_id_preds: Dict[int, List[np.ndarray]] = {i: [] for i in range(len(ids))}
     default_series_ids = torch.arange(len(ids), dtype=torch.long, device=device)
     with torch.inference_mode(), amp_autocast(True if device.type == "cuda" else False):
         for batch in loader:
@@ -451,7 +475,10 @@ def _eval_wsmape(
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
             mask_dev = move_to_device(mask, device)
-            loss_mask = mask_dev.to(yb.dtype) if use_loss_mask else None
+            if use_loss_mask:
+                base_mask = mask_dev > 0.0
+            else:
+                base_mask = torch.ones_like(yb, dtype=torch.bool, device=device)
             if x_mark is not None:
                 x_mark = x_mark.to(device=device, non_blocking=True)
             if y_mark is not None:
@@ -481,16 +508,29 @@ def _eval_wsmape(
                     series_ids=series_idx,
                 )
                 rate = rate[:, : yb.shape[1], :]
-            if loss_mask is not None:
-                yb_eval = yb * loss_mask
-                rate_eval = rate * loss_mask
-            else:
-                yb_eval = yb
-                rate_eval = rate
-            ys.append(yb_eval.detach().float().cpu().numpy())
-            preds.append(rate_eval.detach().float().cpu().numpy())
-    Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
-    P = np.concatenate(preds, axis=0).reshape(-1, len(ids))
+            nb_mask = negative_binomial_mask(
+                yb,
+                rate,
+                torch.ones_like(rate, dtype=rate.dtype, device=rate.device),
+                base_mask,
+            )
+            mask_for_eval = nb_mask.to(yb.dtype)
+            yb_eval = yb * mask_for_eval
+            rate_eval = rate * mask_for_eval
+
+            series_idx = series_idx if series_idx is not None else default_series_ids
+            if series_idx.dim() == 1:
+                series_idx = series_idx.unsqueeze(0).expand(yb_eval.size(0), -1)
+            series_idx_cpu = series_idx.detach().cpu()
+            y_cpu = yb_eval.detach().float().cpu()
+            rate_cpu = rate_eval.detach().float().cpu()
+            for b in range(y_cpu.size(0)):
+                for n in range(y_cpu.size(2)):
+                    sid = int(series_idx_cpu[b, n].item())
+                    per_id_targets.setdefault(sid, []).append(y_cpu[b, :, n].numpy().reshape(-1))
+                    per_id_preds.setdefault(sid, []).append(rate_cpu[b, :, n].numpy().reshape(-1))
+    Y = _stack_series_columns(per_id_targets, len(ids))
+    P = _stack_series_columns(per_id_preds, len(ids))
     return wsmape_grouped(Y, P, ids=ids, weights=None)
 
 
@@ -506,8 +546,8 @@ def _eval_metrics(
     min_sigma: float | torch.Tensor = 0.0,
 ) -> Dict[str, float]:
     model.eval()
-    ys: List[np.ndarray] = []
-    preds: List[np.ndarray] = []
+    per_id_targets: Dict[int, List[np.ndarray]] = {i: [] for i in range(len(ids))}
+    per_id_preds: Dict[int, List[np.ndarray]] = {i: [] for i in range(len(ids))}
     nll_num = 0.0
     nll_den = 0.0
     default_series_ids = torch.arange(len(ids), dtype=torch.long, device=device)
@@ -517,7 +557,10 @@ def _eval_metrics(
             xb = move_to_device(xb, device)  # [B, L, N]
             yb = move_to_device(yb, device)  # [B, H_or_1, N]
             mask_dev = move_to_device(mask, device)
-            loss_mask = mask_dev.to(yb.dtype) if use_loss_mask else None
+            if use_loss_mask:
+                base_mask = mask_dev > 0.0
+            else:
+                base_mask = torch.ones_like(yb, dtype=torch.bool, device=device)
             if x_mark is not None:
                 x_mark = x_mark.to(device=device, non_blocking=True)
             if y_mark is not None:
@@ -551,29 +594,34 @@ def _eval_metrics(
                 )
                 rate = rate[:, : yb.shape[1], :]
                 dispersion = dispersion[:, : yb.shape[1], :]
-            if loss_mask is not None:
-                mask_for_loss = loss_mask.to(yb.dtype)
-                yb_eval = yb * mask_for_loss
-                rate_eval = rate * mask_for_loss
-            else:
-                mask_for_loss = torch.ones_like(yb, dtype=yb.dtype, device=yb.device)
-                yb_eval = yb
-                rate_eval = rate
+            nb_mask = negative_binomial_mask(yb, rate, dispersion, base_mask)
+            mask_for_loss = nb_mask.to(yb.dtype)
+            yb_eval = yb * mask_for_loss
+            rate_eval = rate * mask_for_loss
             nb_loss = negative_binomial_nll(
                 y=yb,
                 rate=rate,
                 dispersion=dispersion,
-                mask=mask_for_loss,
+                mask=nb_mask,
             )
             mask_total = float(mask_for_loss.sum().item())
             if mask_total <= 0.0:
                 mask_total = float(yb.numel()) if yb.numel() > 0 else 1.0
             nll_num += float(nb_loss.item()) * mask_total
             nll_den += mask_total
-            ys.append(yb_eval.detach().float().cpu().numpy())
-            preds.append(rate_eval.detach().float().cpu().numpy())
-    Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
-    P = np.concatenate(preds, axis=0).reshape(-1, len(ids))
+            series_idx = series_idx if series_idx is not None else default_series_ids
+            if series_idx.dim() == 1:
+                series_idx = series_idx.unsqueeze(0).expand(yb_eval.size(0), -1)
+            series_idx_cpu = series_idx.detach().cpu()
+            y_cpu = yb_eval.detach().float().cpu()
+            rate_cpu = rate_eval.detach().float().cpu()
+            for b in range(y_cpu.size(0)):
+                for n in range(y_cpu.size(2)):
+                    sid = int(series_idx_cpu[b, n].item())
+                    per_id_targets.setdefault(sid, []).append(y_cpu[b, :, n].numpy().reshape(-1))
+                    per_id_preds.setdefault(sid, []).append(rate_cpu[b, :, n].numpy().reshape(-1))
+    Y = _stack_series_columns(per_id_targets, len(ids))
+    P = _stack_series_columns(per_id_preds, len(ids))
     smape = smape_mean(Y, P)
     denom = nll_den if nll_den > 0 else 1.0
     return {"nll": nll_num / denom, "smape": smape}
@@ -733,6 +781,19 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     )
     if len(dl_val.dataset) == 0:
         raise ValueError("Validation split has no windows; increase train.val.holdout_days or adjust model.input_len/pred_len.")
+    train_series_count = len(ids)
+    train_sample_count = len(dl_train.dataset)
+    train_batches_per_epoch = len(dl_train) if hasattr(dl_train, "__len__") else "?"
+    approx_windows_per_series = (
+        train_sample_count // train_series_count if train_series_count > 0 else 0
+    )
+    console().print(
+        (
+            "[cyan]Train dataset: "
+            f"{train_series_count} series × ~{approx_windows_per_series} windows = {train_sample_count} samples; "
+            f"batches/epoch={train_batches_per_epoch} at batch_size={cfg['train']['batch_size']}[/cyan]"
+        )
+    )
     time_feature_dim = _time_feature_dim_from_dataset(dl_train.dataset)
     dataset_freq = _time_frequency_from_dataset(dl_train.dataset)
     base_index = wide.index if isinstance(wide.index, pd.DatetimeIndex) else None
@@ -753,6 +814,11 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     warmup_series_static = torch.from_numpy(series_static_np).to(
         device=device, dtype=torch.float32
     )
+    warmup_series_static_single: torch.Tensor | None
+    if warmup_series_static.numel() > 0:
+        warmup_series_static_single = warmup_series_static[:1, :]
+    else:
+        warmup_series_static_single = None
     series_ids_default = torch.from_numpy(series_id_array).to(
         device=device, dtype=torch.long
     )
@@ -834,9 +900,14 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     ).to(device)
 
     # Lazily build model parameters so that downstream utilities see them
+    warmup_ids_single: torch.Tensor | None
+    if series_ids_default.numel() > 0:
+        warmup_ids_single = series_ids_default[:1]
+    else:
+        warmup_ids_single = None
     warmup_kwargs = {
-        "series_static": warmup_series_static,
-        "series_ids": series_ids_default,
+        "series_static": warmup_series_static_single,
+        "series_ids": warmup_ids_single,
     }
     warmup_kwargs = {k: v for k, v in warmup_kwargs.items() if v is not None}
     if time_features_enabled and time_feature_dim > 0:
@@ -847,8 +918,16 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             device=device,
             dtype=torch.float32,
         )
+    original_min_sigma_buffer: torch.Tensor | None = None
+    if (
+        isinstance(model.min_sigma_vector, torch.Tensor)
+        and model.min_sigma_vector.numel() > 0
+    ):
+        original_min_sigma_buffer = model.min_sigma_vector
+        model.min_sigma_vector = model.min_sigma_vector[..., :1]
+
     with torch.no_grad():
-        dummy = torch.zeros(1, input_len, len(ids), device=device)
+        dummy = torch.zeros(1, input_len, 1, device=device)
         model(dummy, **warmup_kwargs)
         if cfg["train"]["channels_last"]:
             model.to(memory_format=torch.channels_last)
@@ -861,6 +940,9 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             warmup_args=(dummy,),
             warmup_kwargs=warmup_kwargs,
         )
+
+    if original_min_sigma_buffer is not None:
+        model.min_sigma_vector = original_min_sigma_buffer
 
     if isinstance(getattr(model, "min_sigma_vector", None), torch.Tensor) and model.min_sigma_vector.numel() > 0:
         min_sigma: float | torch.Tensor = model.min_sigma_vector
@@ -909,7 +991,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
 
     sched_cfg = cfg["train"].get("lr_scheduler", {})
     scheduler: torch.optim.lr_scheduler._LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None
-    sched_type = sched_cfg.get("type")
+    sched_type = sched_cfg.get("type") or "cosine"
     if sched_type == "ReduceLROnPlateau":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optim,
@@ -966,24 +1048,16 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         cfg["train"]["lr_warmup_steps_effective"] = 0
         cfg["train"]["lr_warmup_epochs_effective"] = 0
         cfg["train"]["lr_warmup_start_factor_effective"] = 1.0
-
-    warmup_active = (
-        cfg["train"].get("lr_warmup_epochs_effective", 0) > 0
-        and scheduler is not None
-        and hasattr(scheduler, "base_lrs")
-    )
-    if warmup_active:
-        initial_lrs: List[float] = []
-        for base_lr, param_group in zip(scheduler.base_lrs, optim.param_groups):
-            warmup_lr = base_lr * warmup_start_factor
+    elif sched_type == "cosine" and warmup_epochs > 0:
+        warmup_lr = float(cfg["train"]["lr"]) * warmup_start_factor
+        for param_group in optim.param_groups:
             param_group["lr"] = warmup_lr
-            initial_lrs.append(warmup_lr)
-        if hasattr(scheduler, "_last_lr"):
-            scheduler._last_lr = initial_lrs
+        if scheduler is not None and hasattr(scheduler, "_last_lr"):
+            scheduler._last_lr = [warmup_lr for _ in scheduler._last_lr]
         if isinstance(scheduler, torch.optim.lr_scheduler.SequentialLR):
             for sub_scheduler in scheduler._schedulers:
                 if hasattr(sub_scheduler, "_last_lr"):
-                    sub_scheduler._last_lr = initial_lrs
+                    sub_scheduler._last_lr = [warmup_lr for _ in sub_scheduler._last_lr]
 
     try:
         grad_scaler = torch.amp.GradScaler(
@@ -1021,9 +1095,9 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             yb_w = yb_w.to(device, non_blocking=True)
             if use_loss_masking:
                 mask_w = mask_w.to(device, non_blocking=True)
-                mb_w = mask_w.to(yb_w.dtype)
+                base_mask_w = mask_w > 0.0
             else:
-                mb_w = torch.ones_like(yb_w, dtype=yb_w.dtype, device=device)
+                base_mask_w = torch.ones_like(yb_w, dtype=torch.bool, device=device)
             if x_mark_w is not None:
                 x_mark_w = x_mark_w.to(device=device, non_blocking=True)
             if y_mark_w is not None:
@@ -1046,12 +1120,13 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                     series_static=static_w,
                     series_ids=series_ids_w,
                 )
+                nb_mask_w = negative_binomial_mask(yb_w, rate_w, dispersion_w, base_mask_w)
                 loss_w = (
                     negative_binomial_nll(
                         y=yb_w,
                         rate=rate_w,
                         dispersion=dispersion_w,
-                        mask=mb_w,
+                        mask=nb_mask_w,
                     )
                     / accum_steps
                 )
@@ -1074,9 +1149,9 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         yb0 = yb0.to(device, non_blocking=True)
         if use_loss_masking:
             mask0 = mask0.to(device, non_blocking=True)
-            mb0 = mask0.to(yb0.dtype)
+            base_mask0 = mask0 > 0.0
         else:
-            mb0 = torch.ones_like(yb0, dtype=yb0.dtype, device=device)
+            base_mask0 = torch.ones_like(yb0, dtype=torch.bool, device=device)
         if x_mark0 is not None:
             x_mark0 = x_mark0.to(device=device, non_blocking=True)
         if y_mark0 is not None:
@@ -1093,10 +1168,10 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             xb0 = xb0.to(memory_format=torch.channels_last)
         static_x = torch.empty_like(xb0)
         static_y = torch.empty_like(yb0)
-        static_m = torch.empty_like(mb0)
+        static_m = torch.empty_like(base_mask0)
         static_x.copy_(xb0)
         static_y.copy_(yb0)
-        static_m.copy_(mb0)
+        static_m.copy_(base_mask0)
         if x_mark0 is not None:
             static_mark_buf = torch.empty_like(x_mark0)
             static_mark_buf.copy_(x_mark0)
@@ -1110,6 +1185,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             static_ids_buf.copy_(series_ids0)
         capture_stream = torch.cuda.Stream()
         graph = torch.cuda.CUDAGraph()
+        mask_stats_buf = torch.zeros(1, dtype=torch.float64, device=device)
         optim.zero_grad(set_to_none=True)
         model.eval()
         with torch.cuda.stream(capture_stream):
@@ -1122,12 +1198,16 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                     series_static=static_series_buf,
                     series_ids=static_ids_buf,
                 )
+                static_nb_mask = negative_binomial_mask(
+                    static_y, static_rate, static_dispersion, static_m
+                )
                 static_loss = negative_binomial_nll(
                     y=static_y,
                     rate=static_rate,
                     dispersion=static_dispersion,
-                    mask=static_m,
+                    mask=static_nb_mask,
                 )
+                mask_stats_buf[0] = static_nb_mask.sum().to(mask_stats_buf.dtype)
                 static_scaled = static_loss / accum_steps
             grad_scaler.scale(static_scaled).backward()
             graph.capture_end()
@@ -1141,14 +1221,14 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         def graph_step(
             xb: torch.Tensor,
             yb: torch.Tensor,
-            mb: torch.Tensor,
+            base_mask: torch.Tensor,
             x_mark: torch.Tensor | None,
             static_feat: torch.Tensor | None,
             series_idx: torch.Tensor,
-        ) -> float:
+        ) -> tuple[float, float, float]:
             static_x.copy_(xb)
             static_y.copy_(yb)
-            static_m.copy_(mb)
+            static_m.copy_(base_mask)
             if static_mark_buf is not None:
                 if x_mark is None:
                     raise RuntimeError(
@@ -1172,7 +1252,9 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             if static_ids_buf is not None:
                 static_ids_buf.copy_(series_idx)
             graph.replay()
-            return float(static_loss.item())
+            mask_true = float(mask_stats_buf[0].item())
+            mask_total = float(static_y.numel())
+            return float(static_loss.item()), mask_true, mask_total
 
     print_config(cfg, current_lr=optim.param_groups[0]["lr"])
     for ep in range(1, epochs + 1):
@@ -1182,6 +1264,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         num_batches = len(dl_train)
         copy_time_total = 0.0
         iter_time_total = 0.0
+        mask_true_total = 0.0
+        mask_total = 0.0
         for i, batch in enumerate(tqdm(dl_train, desc=f"Epoch {ep}/{epochs}", leave=False)):
             iter_start = time.perf_counter()
             xb, yb, mask, x_mark, y_mark, static_feat, series_idx = _unpack_batch(batch)
@@ -1189,9 +1273,9 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             yb = yb.to(device, non_blocking=True)
             if use_loss_masking:
                 mask = mask.to(device, non_blocking=True)
-                mb = mask.to(yb.dtype)
+                base_mask_batch = mask > 0.0
             else:
-                mb = torch.ones_like(yb, dtype=yb.dtype, device=device)
+                base_mask_batch = torch.ones_like(yb, dtype=torch.bool, device=device)
             if x_mark is not None:
                 x_mark = x_mark.to(device=device, non_blocking=True)
             if y_mark is not None:
@@ -1209,7 +1293,11 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             _assert_min_len(xb, _model_input_len(model))
             after_copy = time.perf_counter()
             if use_graphs:
-                loss_val = graph_step(xb, yb, mb, x_mark, static_feat, series_idx)
+                loss_val, mask_true_inc, mask_total_inc = graph_step(
+                    xb, yb, base_mask_batch, x_mark, static_feat, series_idx
+                )
+                mask_true_total += mask_true_inc
+                mask_total += mask_total_inc
             else:
                 with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                     rate, dispersion = model(
@@ -1218,15 +1306,20 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                         series_static=static_feat,
                         series_ids=series_idx,
                     )
+                    nb_mask_batch = negative_binomial_mask(
+                        yb, rate, dispersion, base_mask_batch
+                    )
                     loss_value = negative_binomial_nll(
                         y=yb,
                         rate=rate,
                         dispersion=dispersion,
-                        mask=mb,
+                        mask=nb_mask_batch,
                     )
                     loss = loss_value / accum_steps
                 grad_scaler.scale(loss).backward()
                 loss_val = float(loss_value.item())
+                mask_true_total += float(nb_mask_batch.sum().item())
+                mask_total += float(nb_mask_batch.numel())
             iter_end = time.perf_counter()
             copy_time_total += after_copy - iter_start
             iter_time_total += max(iter_end - iter_start, 1e-12)
@@ -1247,6 +1340,12 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                     f"(prep {copy_time_total:.4f}s / iter {iter_time_total:.4f}s)[/cyan]"
                 )
             )
+
+        if mask_total > 0.0:
+            coverage = mask_true_total / mask_total
+        else:
+            coverage = 0.0
+        console().print(f"[blue]Epoch {ep} loss mask coverage: {coverage:.4f}[/blue]")
 
         eval_metrics = _eval_metrics(
             model,

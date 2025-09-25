@@ -61,6 +61,8 @@ class SlidingWindowDataset(Dataset):
         else:
             self.M = valid_mask.astype(np.float32)
         self.T, self.N = self.X.shape
+        if self.N <= 0:
+            raise ValueError("wide_values must contain at least one series column")
         self.L = int(input_len)
         if mode == "direct":
             self.H = int(pred_len)
@@ -157,32 +159,45 @@ class SlidingWindowDataset(Dataset):
         else:
             self.series_ids = None
 
+        self._windows_per_series = int(len(self.idxs))
+
     def __len__(self) -> int:
-        return int(len(self.idxs))
+        return int(self._windows_per_series * self.N)
 
     def __getitem__(self, idx: int) -> tuple[object, ...]:
-        s = int(self.idxs[idx])
+        if self._windows_per_series <= 0:
+            raise IndexError("SlidingWindowDataset is empty")
+        window_idx = int(idx // self.N)
+        series_idx = int(idx % self.N)
+        if window_idx >= self._windows_per_series:
+            raise IndexError("index out of range for sliding windows")
+        s = int(self.idxs[window_idx])
         if self.time_shift > 0:
             delta = np.random.randint(-self.time_shift, self.time_shift + 1)
             s = int(np.clip(s + delta, 0, self.T - self.L - self.H))
         e = s + self.L
-        x_tensor = self._X_tensor[s:e, :].clone()
+        x_slice = self._X_tensor[s:e, series_idx]
         if self.add_noise_std > 0:
+            x_tensor = x_slice.clone().unsqueeze(-1)
             noise = torch.randn_like(x_tensor) * self.add_noise_std
             x_tensor = x_tensor + noise
-        y_tensor = self._X_tensor[e : e + self.H, :].clone()
-        mask_tensor = self._M_tensor[e : e + self.H, :].clone()
+        else:
+            x_tensor = x_slice.unsqueeze(-1)
+        y_tensor = self._X_tensor[e : e + self.H, series_idx].unsqueeze(-1)
+        mask_tensor = self._M_tensor[e : e + self.H, series_idx].unsqueeze(-1)
         if self.time_marks is not None:
-            x_mark = self.time_marks[s:e, :].clone()
-            y_mark = self.time_marks[e : e + self.H, :].clone()
+            x_mark = self.time_marks[s:e, :]
+            y_mark = self.time_marks[e : e + self.H, :]
         else:
             x_mark = self._empty_time_mark
             y_mark = self._empty_time_mark
         items: list[object] = [x_tensor, y_tensor, mask_tensor, x_mark, y_mark]
         if self.series_static is not None:
-            items.append(self.series_static)
+            static_slice = self.series_static[series_idx : series_idx + 1, :]
+            items.append(static_slice)
         if self.series_ids is not None:
-            items.append(self.series_ids)
+            id_slice = self.series_ids[series_idx : series_idx + 1]
+            items.append(id_slice)
         return tuple(items)
 
     @staticmethod
