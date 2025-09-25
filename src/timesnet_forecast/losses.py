@@ -12,7 +12,11 @@ def negative_binomial_nll(
 ) -> torch.Tensor:
     """Negative binomial negative log-likelihood averaged over valid elements."""
 
-    y = y.to(rate.dtype)
+    dtype = torch.float32
+    y = y.to(dtype)
+    rate = rate.to(dtype)
+    dispersion = dispersion.to(dtype)
+
     alpha = torch.clamp(dispersion, min=eps)
     mu = torch.clamp(rate, min=eps)
     r = 1.0 / alpha
@@ -26,7 +30,8 @@ def negative_binomial_nll(
         + y * log1m_p
     )
     if mask is not None:
-        log_prob = log_prob * mask.to(log_prob.dtype)
+        mask = mask.to(dtype)
+        log_prob = log_prob * mask
         denom = torch.clamp(mask.sum(), min=1.0)
     else:
         denom = log_prob.numel()
