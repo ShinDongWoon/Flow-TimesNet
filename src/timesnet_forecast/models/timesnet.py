@@ -79,7 +79,7 @@ class FFTPeriodSelector(nn.Module):
             and torch.is_autocast_enabled()
         )
         autocast_context = (
-            torch.cuda.amp.autocast(enabled=False)
+            torch.amp.autocast("cuda", enabled=False)
             if autocast_enabled
             else nullcontext()
         )
@@ -399,19 +399,20 @@ class PositionalEmbedding(nn.Module):
             raise ValueError("PositionalEmbedding expects input shaped [B, L, C]")
         B, L, _ = x.shape
         device = x.device
-        dtype = x.dtype
-        position = torch.arange(L, device=device, dtype=dtype).unsqueeze(1)
+        orig_dtype = x.dtype
+        calc_dtype = torch.float32
+        position = torch.arange(L, device=device, dtype=calc_dtype).unsqueeze(1)
         div_term = torch.exp(
-            torch.arange(0, self.d_model, 2, device=device, dtype=dtype)
+            torch.arange(0, self.d_model, 2, device=device, dtype=calc_dtype)
             * (-math.log(10000.0) / self.d_model)
         )
-        pe = torch.zeros(L, self.d_model, device=device, dtype=dtype)
+        pe = torch.zeros(L, self.d_model, device=device, dtype=calc_dtype)
         pe[:, 0::2] = torch.sin(position * div_term)
         cos_term = div_term
         if pe[:, 1::2].shape[1] != cos_term.shape[0]:
             cos_term = cos_term[: pe[:, 1::2].shape[1]]
         pe[:, 1::2] = torch.cos(position * cos_term)
-        return pe.unsqueeze(0).expand(B, -1, -1)
+        return pe.to(dtype=orig_dtype).unsqueeze(0).expand(B, -1, -1)
 
 
 class RMSNorm(nn.Module):
@@ -635,10 +636,11 @@ class TimesNet(nn.Module):
         id_embed_dim: int = 32,
         static_proj_dim: int | None = None,
         static_layernorm: bool = True,
-        use_zero_mean_context: bool = True,
-        context_rank: int = 8,
+        use_zero_mean_context: bool = False,
+        context_rank: int = 0,
         context_scale: float = 1e-2,
         use_constant_context_bias: bool = False,
+        use_late_bias_head: bool = True,
     ) -> None:
         super().__init__()
         del channels_last  # retained for backward compatibility
@@ -732,6 +734,9 @@ class TimesNet(nn.Module):
         self.context_proj: nn.Linear | None = None
         self.context_coeff: nn.Linear | None = None
         self.temporal_context: LowRankTemporalContext | None = None
+        self.late_bias_norm: nn.LayerNorm | None = None
+        self.late_bias_head: nn.Linear | None = None
+        self.register_parameter("late_bias_gate", None)
         self.pre_embedding_norm: nn.Module | None = None
         self.pre_embedding_dropout = nn.Dropout(self.dropout)
         self._static_in_features: int | None = None
@@ -741,6 +746,7 @@ class TimesNet(nn.Module):
         self.debug_memory: bool = False
         self.use_zero_mean_context = bool(use_zero_mean_context)
         self.use_constant_context_bias = bool(use_constant_context_bias)
+        self.use_late_bias_head = bool(use_late_bias_head)
         self.context_rank = int(context_rank)
         if self.context_rank < 0:
             raise ValueError("context_rank must be non-negative")
@@ -931,11 +937,60 @@ class TimesNet(nn.Module):
                     self.context_proj = _module_to_reference(self.context_proj, x)
             else:
                 self.context_proj = None
+            if self.use_late_bias_head:
+                if (
+                    self.late_bias_norm is None
+                    or tuple(self.late_bias_norm.normalized_shape)
+                    != (context_dim,)
+                ):
+                    self.late_bias_norm = _module_to_reference(
+                        nn.LayerNorm(context_dim), x
+                    )
+                else:
+                    self.late_bias_norm = _module_to_reference(
+                        self.late_bias_norm, x
+                    )
+                if (
+                    self.late_bias_head is None
+                    or self.late_bias_head.in_features != context_dim
+                    or self.late_bias_head.out_features != self._out_steps
+                ):
+                    head = nn.Linear(context_dim, self._out_steps)
+                    with torch.no_grad():
+                        head.weight.zero_()
+                        head.bias.zero_()
+                    self.late_bias_head = _module_to_reference(head, x)
+                else:
+                    self.late_bias_head = _module_to_reference(
+                        self.late_bias_head, x
+                    )
+                gate_shape = (1, self._out_steps, 1)
+                if (
+                    not isinstance(self.late_bias_gate, nn.Parameter)
+                    or tuple(self.late_bias_gate.shape) != gate_shape
+                ):
+                    gate_param = torch.full(
+                        gate_shape, 0.05, dtype=torch.float32, device=x.device
+                    )
+                    self.late_bias_gate = nn.Parameter(gate_param)
+                else:
+                    self.late_bias_gate.data = self.late_bias_gate.data.to(
+                        device=x.device, dtype=torch.float32
+                    )
+            else:
+                self.late_bias_norm = None
+                self.late_bias_head = None
+                if isinstance(self.late_bias_gate, nn.Parameter):
+                    self.late_bias_gate = None
         else:
             self.context_norm = None
             self.context_proj = None
             self.context_coeff = None
             self.temporal_context = None
+            self.late_bias_norm = None
+            self.late_bias_head = None
+            if isinstance(self.late_bias_gate, nn.Parameter):
+                self.late_bias_gate = None
 
         total_per_series = 1 + context_dim
         if total_per_series <= 1:
@@ -1073,12 +1128,14 @@ class TimesNet(nn.Module):
             mark_slice = x_mark[:, -self.input_len :, :]
         else:
             mark_slice = None
-        enc_x = x[:, -self.input_len :, :]
-        self._ensure_embedding(enc_x, mark_slice, series_static, series_ids)
+        enc_x_value = x[:, -self.input_len :, :]
+        enc_x_features = enc_x_value.clone()
+        self._ensure_embedding(enc_x_features, mark_slice, series_static, series_ids)
         target_steps = self.pred_len if self.mode == "direct" else self._out_steps
-        time_len = enc_x.size(1)
+        time_len = enc_x_value.size(1)
 
         context_components: list[torch.Tensor] = []
+        context_concat: torch.Tensor | None = None
 
         if self.static_proj is not None and series_static is not None:
             if series_static.ndim == 2:
@@ -1095,9 +1152,9 @@ class TimesNet(nn.Module):
                 )
             static_proj = self.static_proj(
                 static_input.to(
-                    device=enc_x.device,
-                    dtype=enc_x.dtype,
-                    non_blocking=enc_x.is_cuda,
+                    device=enc_x_features.device,
+                    dtype=enc_x_features.dtype,
+                    non_blocking=enc_x_features.is_cuda,
                 )
             )
             if self.static_norm is not None:
@@ -1108,10 +1165,12 @@ class TimesNet(nn.Module):
             if series_ids is None:
                 if self._series_id_reference is None:
                     ids_tensor = torch.arange(
-                        N, device=enc_x.device, dtype=torch.long
+                        N, device=enc_x_features.device, dtype=torch.long
                     ).unsqueeze(0)
                 else:
-                    ids_tensor = self._series_id_reference.view(1, -1).to(enc_x.device)
+                    ids_tensor = self._series_id_reference.view(1, -1).to(
+                        enc_x_features.device
+                    )
                     if ids_tensor.size(1) != N:
                         raise ValueError(
                             "Stored series identifiers do not match input dimension"
@@ -1136,9 +1195,13 @@ class TimesNet(nn.Module):
                     raise ValueError(
                         "series_ids length must match number of series"
                     )
-                ids_tensor = ids_tensor.to(device=enc_x.device, dtype=torch.long)
+                ids_tensor = ids_tensor.to(
+                    device=enc_x_features.device, dtype=torch.long
+                )
                 self._series_id_reference = ids_tensor[0].detach().clone()
-            ids_tensor = ids_tensor.to(device=enc_x.device, dtype=torch.long)
+            ids_tensor = ids_tensor.to(
+                device=enc_x_features.device, dtype=torch.long
+            )
             id_embed = self.series_embedding(ids_tensor)
             context_components.append(id_embed)
 
@@ -1155,32 +1218,36 @@ class TimesNet(nn.Module):
                     dtype=self.context_coeff.weight.dtype
                 )
                 coeff = self.context_coeff(coeff_input)
-                context_signal = self.temporal_context(coeff, enc_x.size(1))
+                context_signal = self.temporal_context(coeff, enc_x_features.size(1))
                 # Enforce that the temporal context remains 3D and avoids [B, L, N, C] tensors.
                 if context_signal.ndim == 4:
                     raise RuntimeError(
                         "Temporal context must remain 3D to avoid 4D tensors"
                     )
-                if context_signal.shape[:2] != enc_x.shape[:2]:
+                if context_signal.shape[:2] != enc_x_features.shape[:2]:
                     raise RuntimeError(
                         "Temporal context must align with [B, L] dimensions"
                     )
-                if context_signal.size(-1) != enc_x.size(-1):
+                if context_signal.size(-1) != enc_x_features.size(-1):
                     raise RuntimeError(
                         "Temporal context must align with input series dimension"
                     )
-                enc_x = enc_x + context_signal.to(dtype=enc_x.dtype)
+                enc_x_features = enc_x_features + context_signal.to(
+                    dtype=enc_x_features.dtype
+                )
             if self.use_constant_context_bias and self.context_proj is not None:
                 bias_input = context_concat.to(
                     dtype=self.context_proj.weight.dtype
                 )
                 bias = self.context_proj(bias_input).squeeze(-1)
-                enc_x = enc_x + bias.to(dtype=enc_x.dtype).unsqueeze(1)
+                enc_x_features = enc_x_features + bias.to(
+                    dtype=enc_x_features.dtype
+                ).unsqueeze(1)
 
-        if enc_x.ndim == 4:
+        if enc_x_features.ndim == 4:
             raise RuntimeError("Embedding input must remain 3D; found 4D tensor")
 
-        features = self.embedding(enc_x, mark_slice)
+        features = self.embedding(enc_x_features, mark_slice)
         if features.ndim != 3:
             raise RuntimeError(
                 "Embedding output must have shape [B, L, d_model]"
@@ -1199,12 +1266,12 @@ class TimesNet(nn.Module):
         total_len = features.size(1)
         baseline = features[:, -target_steps:, :].contiguous()
         hist_steps = min(target_steps, time_len)
-        history_tail = enc_x[:, -hist_steps:, :]
+        history_tail = enc_x_value[:, -hist_steps:, :]
         if hist_steps < target_steps:
             pad = history_tail[:, -1:, :].expand(-1, target_steps - hist_steps, -1)
             history_tail = torch.cat([history_tail, pad], dim=1)
 
-        history_tail = history_tail.to(enc_x.dtype)
+        history_tail = history_tail.to(enc_x_value.dtype)
 
         if self.debug_memory and features.is_cuda and torch.cuda.is_available():
             mem_bytes = torch.cuda.memory_allocated(features.device)
@@ -1220,12 +1287,35 @@ class TimesNet(nn.Module):
 
         seq_features = features
 
+        def _apply_late_bias(mu_tensor: torch.Tensor) -> torch.Tensor:
+            if (
+                context_concat is not None
+                and self.late_bias_head is not None
+                and self.late_bias_norm is not None
+                and isinstance(self.late_bias_gate, nn.Parameter)
+            ):
+                c = context_concat.to(
+                    dtype=self.late_bias_head.weight.dtype,
+                    device=self.late_bias_head.weight.device,
+                )
+                c = self.late_bias_norm(c)
+                bias = self.late_bias_head(c)
+                bias = bias.permute(0, 2, 1).contiguous()
+                gate = self.late_bias_gate.to(
+                    dtype=mu_tensor.dtype, device=mu_tensor.device
+                )
+                mu_tensor = mu_tensor + gate * bias.to(
+                    dtype=mu_tensor.dtype, device=mu_tensor.device
+                )
+            return mu_tensor
+
         preview_periods, _ = self.period_selector(seq_features)
         if preview_periods.numel() > 0 and torch.any(preview_periods <= 0):
             raise RuntimeError("Selected periods must be positive")
         if preview_periods.numel() == 0:
             mu_hidden = baseline
             mu = self.mu_head(mu_hidden) + history_tail
+            mu = _apply_late_bias(mu)
             sigma_hidden = self.sigma_head(baseline)
             floor = self._sigma_from_ref(mu)
             sigma = F.softplus(sigma_hidden) + floor
@@ -1250,6 +1340,7 @@ class TimesNet(nn.Module):
         mu_delta = mu_delta_bn.permute(0, 2, 1).contiguous()
         mu_hidden = baseline + mu_delta
         mu = self.mu_head(mu_hidden) + history_tail
+        mu = _apply_late_bias(mu)
         assert self.sigma_proj is not None  # for type checkers
         sigma_bn = self.sigma_proj(target_bn)
         sigma_hidden = sigma_bn.permute(0, 2, 1).contiguous()
