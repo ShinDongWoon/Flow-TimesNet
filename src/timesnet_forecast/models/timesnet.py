@@ -402,6 +402,10 @@ class TimesBlock(nn.Module):
                 weights_float = F.softmax(amp_for_softmax, dim=1)
             else:
                 weights_float = F.softmax(amp, dim=1)
+            if torch.any(~torch.isfinite(weights_float)):
+                raise RuntimeError(
+                    "TimesNet residual weights contain non-finite values; check input amplitudes"
+                )
             eps = torch.finfo(weights_float.dtype).eps
             weight_sum = weights_float.sum(dim=1, keepdim=True)
             zero_mask = weight_sum <= eps
