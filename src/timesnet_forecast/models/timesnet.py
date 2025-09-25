@@ -414,8 +414,31 @@ class PositionalEmbedding(nn.Module):
         return pe.unsqueeze(0).expand(B, -1, -1)
 
 
+class RMSNorm(nn.Module):
+    """Root-mean-square normalization with affine parameters."""
+
+    def __init__(self, d_model: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        if d_model <= 0:
+            raise ValueError("RMSNorm expects a positive embedding dimension")
+        self.eps = float(eps)
+        dim = int(d_model)
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.size(-1) != self.weight.numel():
+            raise ValueError("RMSNorm dimension mismatch")
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        scale = torch.rsqrt(variance + self.eps)
+        normed = x * scale
+        return normed * self.weight + self.bias
+
+
 class DataEmbedding(nn.Module):
     """Value + positional (+ optional temporal) embedding."""
+
+    _VALID_NORM_MODES = {"none", "layer", "rms", "decoupled"}
 
     def __init__(
         self,
@@ -424,6 +447,7 @@ class DataEmbedding(nn.Module):
         dropout: float,
         time_features: int | None = None,
         use_norm: bool = True,
+        embed_norm_mode: str | None = None,
     ) -> None:
         super().__init__()
         self.value_embedding = nn.Linear(int(c_in), int(d_model))
@@ -434,8 +458,38 @@ class DataEmbedding(nn.Module):
             )
         else:
             self.temporal_embedding = None
-        self.use_norm = bool(use_norm)
-        self.norm = nn.LayerNorm(int(d_model))
+        use_norm_flag = bool(use_norm)
+        if embed_norm_mode is None:
+            embed_norm_mode = "decoupled" if use_norm_flag else "none"
+        mode = embed_norm_mode.lower()
+        if mode not in self._VALID_NORM_MODES:
+            raise ValueError(
+                f"embed_norm_mode must be one of {sorted(self._VALID_NORM_MODES)}, got {embed_norm_mode!r}"
+            )
+        self.embed_norm_mode = mode
+        if not use_norm_flag and mode != "none":
+            # Preserve backward compatibility: explicit mode selection overrides use_norm flag.
+            use_norm_flag = True
+        self.use_norm = mode != "none"
+        self.norm: nn.Module | None
+        self.aux_norm: nn.Module | None
+        if mode == "layer":
+            self.norm = nn.LayerNorm(int(d_model))
+            self.aux_norm = None
+            self.register_parameter("gate", None)
+        elif mode == "rms":
+            self.norm = RMSNorm(int(d_model))
+            self.aux_norm = None
+            self.register_parameter("gate", None)
+        elif mode == "decoupled":
+            self.norm = None
+            self.aux_norm = nn.LayerNorm(int(d_model))
+            gate = torch.full((1, 1, int(d_model)), 0.1, dtype=torch.float32)
+            self.gate = nn.Parameter(gate)
+        else:  # none
+            self.norm = None
+            self.aux_norm = None
+            self.register_parameter("gate", None)
         self.dropout = nn.Dropout(float(dropout))
 
     def forward(
@@ -483,12 +537,25 @@ class DataEmbedding(nn.Module):
             if self.temporal_embedding is not None and mark is not None
             else None
         )
-        if isinstance(temporal, torch.Tensor):
-            out = value + pos + temporal
+        aux = pos + temporal if isinstance(temporal, torch.Tensor) else pos
+        if aux.ndim == 4 or value.ndim == 4:
+            raise AssertionError("DataEmbedding should not operate on 4D tensors")
+
+        if self.embed_norm_mode == "decoupled":
+            assert self.aux_norm is not None and isinstance(self.gate, torch.Tensor)
+            aux_normed = self.aux_norm(aux)
+            gate = self.gate
+            if gate.dtype != value.dtype:
+                gate = gate.to(value.dtype)
+            out = value + gate * aux_normed
         else:
-            out = value + pos
-        if self.use_norm:
-            out = self.norm(out)
+            out = value + aux
+            if self.embed_norm_mode == "layer":
+                assert self.norm is not None
+                out = self.norm(out)
+            elif self.embed_norm_mode == "rms":
+                assert self.norm is not None
+                out = self.norm(out)
         out = self.dropout(out)
 
         if x.ndim == 4:
@@ -562,6 +629,7 @@ class TimesNet(nn.Module):
         channels_last: bool = False,
         use_checkpoint: bool = True,
         use_embedding_norm: bool = True,
+        embed_norm_mode: str | None = None,
         min_sigma: float = 1e-3,
         min_sigma_vector: torch.Tensor | Sequence[float] | None = None,
         id_embed_dim: int = 32,
@@ -595,6 +663,11 @@ class TimesNet(nn.Module):
         self.dropout = float(dropout)
         self.use_checkpoint = bool(use_checkpoint)
         self.use_embedding_norm = bool(use_embedding_norm)
+        if embed_norm_mode is None:
+            resolved_mode = "decoupled" if self.use_embedding_norm else "none"
+        else:
+            resolved_mode = embed_norm_mode
+        self.embed_norm_mode = resolved_mode
         self.min_sigma = float(min_sigma)
         self.k_periods = int(k_periods)
         self.kernel_set = list(kernel_set)
@@ -906,6 +979,7 @@ class TimesNet(nn.Module):
                 dropout=self.dropout,
                 time_features=time_dim if time_dim > 0 else None,
                 use_norm=self.use_embedding_norm,
+                embed_norm_mode=self.embed_norm_mode,
             )
             self.embedding = _module_to_reference(embed, x)
         else:
