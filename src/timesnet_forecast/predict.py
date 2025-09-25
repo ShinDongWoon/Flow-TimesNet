@@ -75,21 +75,21 @@ def forecast_recursive_batch(
     series_static: torch.Tensor | None = None,
     series_ids: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    mus: List[torch.Tensor] = []
-    sigmas: List[torch.Tensor] = []
+    rates: List[torch.Tensor] = []
+    dispersions: List[torch.Tensor] = []
     seq = last_seq
     mark_seq = x_mark
     for step in range(H):
-        mu_step, sigma_step = _invoke_model(
+        rate_step, dispersion_step = _invoke_model(
             model,
             seq,
             x_mark=mark_seq,
             series_static=series_static,
             series_ids=series_ids,
         )
-        mus.append(mu_step)
-        sigmas.append(sigma_step)
-        seq = torch.cat([seq[:, 1:, :], mu_step], dim=1)
+        rates.append(rate_step)
+        dispersions.append(dispersion_step)
+        seq = torch.cat([seq[:, 1:, :], rate_step], dim=1)
         if mark_seq is not None:
             if y_mark is None:
                 raise ValueError(
@@ -101,7 +101,7 @@ def forecast_recursive_batch(
                 )
             next_mark = y_mark[:, step : step + 1, :]
             mark_seq = torch.cat([mark_seq[:, 1:, :], next_mark], dim=1)
-    return torch.cat(mus, dim=1), torch.cat(sigmas, dim=1)
+    return torch.cat(rates, dim=1), torch.cat(dispersions, dim=1)
 
 
 def predict_once(cfg: Dict) -> str:
@@ -472,7 +472,7 @@ def predict_once(cfg: Dict) -> str:
 
         with torch.inference_mode(), amp_autocast(cfg_used["train"]["amp"] and device.type == "cuda"):
             if cfg_used["model"]["mode"] == "direct":
-                mu_pred, _ = forecast_direct_batch(
+                rate_pred, _ = forecast_direct_batch(
                     model,
                     xb,
                     x_mark=x_mark_tensor,
@@ -480,7 +480,7 @@ def predict_once(cfg: Dict) -> str:
                     series_ids=series_ids_tensor,
                 )
             else:
-                mu_pred, _ = forecast_recursive_batch(
+                rate_pred, _ = forecast_recursive_batch(
                     model,
                     xb,
                     pred_len,
@@ -490,7 +490,7 @@ def predict_once(cfg: Dict) -> str:
                     series_ids=series_ids_tensor,
                 )
 
-        Pn = mu_pred.squeeze(0).float().cpu().numpy()  # [H, N]
+        Pn = rate_pred.squeeze(0).float().cpu().numpy()  # [H, N]
         # inverse transform & clip
         P = io_utils.inverse_transform(Pn, ids, scaler, method=method)
         P = np.clip(P, 0.0, None)

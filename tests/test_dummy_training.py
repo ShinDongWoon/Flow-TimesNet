@@ -10,7 +10,8 @@ import torch
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 from timesnet_forecast.models.timesnet import TimesNet
-from timesnet_forecast.train import gaussian_nll_loss, _eval_metrics
+from timesnet_forecast.losses import negative_binomial_nll
+from timesnet_forecast.train import _eval_metrics
 from timesnet_forecast.utils.metrics import wsmape_grouped, smape_mean
 
 
@@ -81,22 +82,24 @@ def test_dummy_training_smape_wsmape():
             xb = X[idx[j : j + 4]]
             yb = Y[idx[j : j + 4]]
             optimizer.zero_grad()
-            mu, sigma = model(xb, series_static=static_features, series_ids=series_ids)
-            loss_tensor = gaussian_nll_loss(mu, sigma, yb)
-            loss = loss_tensor.mean()
+            rate, dispersion = model(
+                xb, series_static=static_features, series_ids=series_ids
+            )
+            loss = negative_binomial_nll(yb, rate, dispersion)
             loss.backward()
             optimizer.step()
 
     input_seq = data[60 - input_len : 60]
     actual = data[60 : 60 + pred_len]
     with torch.no_grad():
-        pred_mu, pred_sigma = model(
+        pred_rate, pred_dispersion = model(
             input_seq.unsqueeze(0),
             series_static=static_features,
             series_ids=series_ids,
         )
-        pred = pred_mu.squeeze(0)
-        assert torch.all(pred_sigma > 0)
+        pred = pred_rate.squeeze(0)
+        assert torch.all(pred_rate > 0)
+        assert torch.all(pred_dispersion > 0)
 
     y_true = actual.numpy()
     y_pred = pred.numpy()
@@ -109,25 +112,25 @@ def test_dummy_training_smape_wsmape():
 
 
 def test_eval_metrics_returns_masked_nll():
-    mu = torch.tensor([[[1.5, 2.0], [2.0, 4.0]]], dtype=torch.float32)
-    sigma = torch.full_like(mu, 0.5)
+    rate = torch.tensor([[[1.5, 2.0], [2.0, 4.0]]], dtype=torch.float32)
+    dispersion = torch.full_like(rate, 0.5)
     target = torch.tensor([[[1.0, 2.5], [3.0, 1.0]]], dtype=torch.float32)
     mask = torch.tensor([[[1.0, 0.0], [1.0, 1.0]]], dtype=torch.float32)
 
     class DummyModel(torch.nn.Module):
-        def __init__(self, mu: torch.Tensor, sigma: torch.Tensor) -> None:
+        def __init__(self, rate: torch.Tensor, dispersion: torch.Tensor) -> None:
             super().__init__()
-            self.register_buffer("mu_buf", mu)
-            self.register_buffer("sigma_buf", sigma)
+            self.register_buffer("rate_buf", rate)
+            self.register_buffer("dispersion_buf", dispersion)
             self.input_len = 1
 
         def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             batch = x.shape[0]
-            mu = self.mu_buf.expand(batch, -1, -1)
-            sigma = self.sigma_buf.expand(batch, -1, -1)
-            return mu, sigma
+            rate = self.rate_buf.expand(batch, -1, -1)
+            dispersion = self.dispersion_buf.expand(batch, -1, -1)
+            return rate, dispersion
 
-    model = DummyModel(mu, sigma)
+    model = DummyModel(rate, dispersion)
     xb = torch.zeros((1, 3, 2), dtype=torch.float32)
     loader = [(xb, target, mask)]
     metrics = _eval_metrics(
@@ -142,11 +145,12 @@ def test_eval_metrics_returns_masked_nll():
         min_sigma=0.0,
     )
 
-    expected_loss = gaussian_nll_loss(mu, sigma, target)
-    expected_nll = float((expected_loss * mask).sum().item() / mask.sum().item())
+    expected_nll = float(
+        negative_binomial_nll(target, rate, dispersion, mask=mask).item()
+    )
     expected_smape = smape_mean(
         (target * mask).numpy().reshape(-1, 2),
-        (mu * mask).numpy().reshape(-1, 2),
+        (rate * mask).numpy().reshape(-1, 2),
     )
 
     assert metrics["nll"] == pytest.approx(expected_nll)

@@ -15,6 +15,7 @@ from tqdm import tqdm
 from .config import Config, save_yaml
 from .utils.logging import console, print_config
 from .utils.seed import seed_everything
+from .losses import negative_binomial_nll
 from .utils.torch_opt import (
     amp_autocast,
     maybe_compile,
@@ -442,7 +443,7 @@ def _eval_wsmape(
 ) -> float:
     model.eval()
     ys: List[np.ndarray] = []
-    ps: List[np.ndarray] = []
+    preds: List[np.ndarray] = []
     default_series_ids = torch.arange(len(ids), dtype=torch.long, device=device)
     with torch.inference_mode(), amp_autocast(True if device.type == "cuda" else False):
         for batch in loader:
@@ -465,12 +466,12 @@ def _eval_wsmape(
                 xb = xb.to(memory_format=torch.channels_last)
             _assert_min_len(xb, _model_input_len(model))
             if mode == "direct":
-                mu, _ = _call_model_optional(
+                rate, _ = _call_model_optional(
                     model, xb, x_mark, static, series_idx
                 )
             else:
                 # recursive multi-step forecast during validation
-                mu, _ = forecast_recursive_batch(
+                rate, _ = forecast_recursive_batch(
                     model,
                     xb,
                     pred_len,
@@ -479,17 +480,17 @@ def _eval_wsmape(
                     series_static=static,
                     series_ids=series_idx,
                 )
-                mu = mu[:, : yb.shape[1], :]
+                rate = rate[:, : yb.shape[1], :]
             if loss_mask is not None:
                 yb_eval = yb * loss_mask
-                mu_eval = mu * loss_mask
+                rate_eval = rate * loss_mask
             else:
                 yb_eval = yb
-                mu_eval = mu
+                rate_eval = rate
             ys.append(yb_eval.detach().float().cpu().numpy())
-            ps.append(mu_eval.detach().float().cpu().numpy())
+            preds.append(rate_eval.detach().float().cpu().numpy())
     Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
-    P = np.concatenate(ps, axis=0).reshape(-1, len(ids))
+    P = np.concatenate(preds, axis=0).reshape(-1, len(ids))
     return wsmape_grouped(Y, P, ids=ids, weights=None)
 
 
@@ -506,7 +507,7 @@ def _eval_metrics(
 ) -> Dict[str, float]:
     model.eval()
     ys: List[np.ndarray] = []
-    ps: List[np.ndarray] = []
+    preds: List[np.ndarray] = []
     nll_num = 0.0
     nll_den = 0.0
     default_series_ids = torch.arange(len(ids), dtype=torch.long, device=device)
@@ -531,7 +532,7 @@ def _eval_metrics(
                 xb = xb.to(memory_format=torch.channels_last)
             _assert_min_len(xb, _model_input_len(model))
             if mode == "direct":
-                mu, sigma = _call_model_optional(
+                rate, dispersion = _call_model_optional(
                     model,
                     xb,
                     x_mark,
@@ -539,7 +540,7 @@ def _eval_metrics(
                     series_idx,
                 )
             else:
-                mu, sigma = forecast_recursive_batch(
+                rate, dispersion = forecast_recursive_batch(
                     model,
                     xb,
                     pred_len,
@@ -548,23 +549,31 @@ def _eval_metrics(
                     series_static=static,
                     series_ids=series_idx,
                 )
-                mu = mu[:, : yb.shape[1], :]
-                sigma = sigma[:, : yb.shape[1], :]
+                rate = rate[:, : yb.shape[1], :]
+                dispersion = dispersion[:, : yb.shape[1], :]
             if loss_mask is not None:
                 mask_for_loss = loss_mask.to(yb.dtype)
                 yb_eval = yb * mask_for_loss
-                mu_eval = mu * mask_for_loss
+                rate_eval = rate * mask_for_loss
             else:
                 mask_for_loss = torch.ones_like(yb, dtype=yb.dtype, device=yb.device)
                 yb_eval = yb
-                mu_eval = mu
-            loss_tensor = gaussian_nll_loss(mu, sigma, yb, min_sigma=min_sigma)
-            nll_num += float((loss_tensor * mask_for_loss).sum().item())
-            nll_den += float(mask_for_loss.sum().item())
+                rate_eval = rate
+            nb_loss = negative_binomial_nll(
+                y=yb,
+                rate=rate,
+                dispersion=dispersion,
+                mask=mask_for_loss,
+            )
+            mask_total = float(mask_for_loss.sum().item())
+            if mask_total <= 0.0:
+                mask_total = float(yb.numel()) if yb.numel() > 0 else 1.0
+            nll_num += float(nb_loss.item()) * mask_total
+            nll_den += mask_total
             ys.append(yb_eval.detach().float().cpu().numpy())
-            ps.append(mu_eval.detach().float().cpu().numpy())
+            preds.append(rate_eval.detach().float().cpu().numpy())
     Y = np.concatenate(ys, axis=0).reshape(-1, len(ids))
-    P = np.concatenate(ps, axis=0).reshape(-1, len(ids))
+    P = np.concatenate(preds, axis=0).reshape(-1, len(ids))
     smape = smape_mean(Y, P)
     denom = nll_den if nll_den > 0 else 1.0
     return {"nll": nll_num / denom, "smape": smape}
@@ -1031,16 +1040,21 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 xb_w = xb_w.to(memory_format=torch.channels_last)
             _assert_min_len(xb_w, _model_input_len(model))
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
-                mu_w, sigma_w = model(
+                rate_w, dispersion_w = model(
                     xb_w,
                     x_mark=x_mark_w,
                     series_static=static_w,
                     series_ids=series_ids_w,
                 )
-                loss_tensor = gaussian_nll_loss(
-                    mu_w, sigma_w, yb_w, min_sigma=min_sigma
+                loss_w = (
+                    negative_binomial_nll(
+                        y=yb_w,
+                        rate=rate_w,
+                        dispersion=dispersion_w,
+                        mask=mb_w,
+                    )
+                    / accum_steps
                 )
-                loss_w = _masked_mean(loss_tensor, mb_w) / accum_steps
             grad_scaler.scale(loss_w).backward()
             if (w + 1) % accum_steps == 0:
                 if grad_clip and grad_clip > 0:
@@ -1102,16 +1116,18 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
             graph.capture_begin()
             with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                 _assert_min_len(static_x, _model_input_len(model))
-                static_mu, static_sigma = model(
+                static_rate, static_dispersion = model(
                     static_x,
                     x_mark=static_mark_buf,
                     series_static=static_series_buf,
                     series_ids=static_ids_buf,
                 )
-                static_loss_tensor = gaussian_nll_loss(
-                    static_mu, static_sigma, static_y, min_sigma=min_sigma
+                static_loss = negative_binomial_nll(
+                    y=static_y,
+                    rate=static_rate,
+                    dispersion=static_dispersion,
+                    mask=static_m,
                 )
-                static_loss = _masked_mean(static_loss_tensor, static_m)
                 static_scaled = static_loss / accum_steps
             grad_scaler.scale(static_scaled).backward()
             graph.capture_end()
@@ -1196,19 +1212,21 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 loss_val = graph_step(xb, yb, mb, x_mark, static_feat, series_idx)
             else:
                 with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
-                    mu, sigma = model(
+                    rate, dispersion = model(
                         xb,
                         x_mark=x_mark,
                         series_static=static_feat,
                         series_ids=series_idx,
                     )
-                    loss_tensor = gaussian_nll_loss(
-                        mu, sigma, yb, min_sigma=min_sigma
+                    loss_value = negative_binomial_nll(
+                        y=yb,
+                        rate=rate,
+                        dispersion=dispersion,
+                        mask=mb,
                     )
-                    masked_loss = _masked_mean(loss_tensor, mb)
-                    loss = masked_loss / accum_steps
+                    loss = loss_value / accum_steps
                 grad_scaler.scale(loss).backward()
-                loss_val = float(masked_loss.item())
+                loss_val = float(loss_value.item())
             iter_end = time.perf_counter()
             copy_time_total += after_copy - iter_start
             iter_time_total += max(iter_end - iter_start, 1e-12)

@@ -8,7 +8,7 @@ import torch.nn as nn
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 from timesnet_forecast.models.timesnet import TimesNet
-from timesnet_forecast.train import gaussian_nll_loss
+from timesnet_forecast.losses import negative_binomial_nll
 
 
 def test_forward_shape_and_head_processing():
@@ -32,18 +32,19 @@ def test_forward_shape_and_head_processing():
 
     x = torch.randn(B, L, N)
     model.train()
-    mu_train, sigma_train = model(x)
+    rate_train, dispersion_train = model(x)
     model.eval()
-    mu_eval, sigma_eval = model(x)
-    assert mu_train.shape == mu_eval.shape == (B, H, N)
-    assert sigma_train.shape == sigma_eval.shape == (B, H, N)
-    assert torch.all(sigma_eval > 0)
+    rate_eval, dispersion_eval = model(x)
+    assert rate_train.shape == rate_eval.shape == (B, H, N)
+    assert dispersion_train.shape == dispersion_eval.shape == (B, H, N)
+    assert torch.all(rate_eval > 0)
+    assert torch.all(dispersion_eval > 0)
 
     long_x = torch.randn(B, L + 5, N)
-    mu_long, sigma_long = model(long_x)
-    mu_head, sigma_head = model(long_x[:, :L, :])
-    assert mu_long.shape == mu_head.shape == (B, H, N)
-    assert sigma_long.shape == sigma_head.shape == (B, H, N)
+    rate_long, dispersion_long = model(long_x)
+    rate_head, dispersion_head = model(long_x[:, :L, :])
+    assert rate_long.shape == rate_head.shape == (B, H, N)
+    assert dispersion_long.shape == dispersion_head.shape == (B, H, N)
 
 
 def test_timesnet_pre_embedding_norm_adapts_to_feature_count():
@@ -97,9 +98,9 @@ def test_timesnet_applies_per_series_floor():
         model(torch.zeros(1, L, N))
 
     x = torch.randn(B, L, N)
-    _, sigma = model(x)
+    _, dispersion = model(x)
     expected_floor = floor.view(1, 1, N)
-    assert torch.all(sigma >= expected_floor)
+    assert torch.all(dispersion >= expected_floor)
 
 
 def test_timesnet_sigma_head_produces_finite_loss():
@@ -127,17 +128,18 @@ def test_timesnet_sigma_head_produces_finite_loss():
     y = torch.randn(B, H, N)
 
     optimizer.zero_grad()
-    mu, sigma = model(x)
-    loss = gaussian_nll_loss(mu, sigma, y).mean()
+    rate, dispersion = model(x)
+    loss = negative_binomial_nll(y, rate, dispersion)
     assert torch.isfinite(loss)
     loss.backward()
     optimizer.step()
 
     with torch.no_grad():
-        mu_eval, sigma_eval = model(x)
-        post_update_loss = gaussian_nll_loss(mu_eval, sigma_eval, y).mean()
+        rate_eval, dispersion_eval = model(x)
+        post_update_loss = negative_binomial_nll(y, rate_eval, dispersion_eval)
         assert torch.isfinite(post_update_loss)
-        assert torch.all(sigma_eval > 0)
+        assert torch.all(rate_eval > 0)
+        assert torch.all(dispersion_eval > 0)
 
 
 def test_timesnet_static_and_id_features_pipeline():
@@ -170,19 +172,20 @@ def test_timesnet_static_and_id_features_pipeline():
     assert model.static_proj.out_features == 10
 
     xb = torch.randn(B, L, N)
-    mu, sigma = model(xb, series_static=static_ref, series_ids=ids_ref)
-    assert mu.shape == (B, H, N)
-    assert sigma.shape == (B, H, N)
-    assert torch.all(sigma > 0)
+    rate, dispersion = model(xb, series_static=static_ref, series_ids=ids_ref)
+    assert rate.shape == (B, H, N)
+    assert dispersion.shape == (B, H, N)
+    assert torch.all(rate > 0)
+    assert torch.all(dispersion > 0)
 
     # Batched static/id tensors should also be accepted
     static_batched = static_ref.unsqueeze(0)
     ids_batched = ids_ref.unsqueeze(0)
-    mu_batched, sigma_batched = model(
+    rate_batched, dispersion_batched = model(
         xb[:1], series_static=static_batched, series_ids=ids_batched
     )
-    assert mu_batched.shape == (1, H, N)
-    assert sigma_batched.shape == (1, H, N)
+    assert rate_batched.shape == (1, H, N)
+    assert dispersion_batched.shape == (1, H, N)
 
 
 def test_timesnet_static_id_normalization_preserves_scale():
@@ -211,25 +214,28 @@ def test_timesnet_static_id_normalization_preserves_scale():
 
     model.eval()
     xb = torch.randn(B, L, N)
-    mu_ref, sigma_ref = model(xb, series_static=static_ref, series_ids=ids_ref)
+    rate_ref, dispersion_ref = model(xb, series_static=static_ref, series_ids=ids_ref)
 
     scaled_static = static_ref * 250.0
-    mu_scaled, sigma_scaled = model(
+    rate_scaled, dispersion_scaled = model(
         xb, series_static=scaled_static, series_ids=ids_ref
     )
 
-    assert torch.all(torch.isfinite(mu_scaled))
-    assert torch.all(torch.isfinite(sigma_scaled))
+    assert torch.all(torch.isfinite(rate_scaled))
+    assert torch.all(torch.isfinite(dispersion_scaled))
 
-    mu_ref_mean = mu_ref.abs().mean()
-    mu_scaled_mean = mu_scaled.abs().mean()
-    sigma_ref_mean = sigma_ref.abs().mean()
-    sigma_scaled_mean = sigma_scaled.abs().mean()
+    rate_ref_mean = rate_ref.abs().mean()
+    rate_scaled_mean = rate_scaled.abs().mean()
+    dispersion_ref_mean = dispersion_ref.abs().mean()
+    dispersion_scaled_mean = dispersion_scaled.abs().mean()
 
-    mu_rel_change = (mu_ref_mean - mu_scaled_mean).abs() / mu_ref_mean.clamp(min=1e-6)
-    sigma_rel_change = (sigma_ref_mean - sigma_scaled_mean).abs() / sigma_ref_mean.clamp(
+    rate_rel_change = (rate_ref_mean - rate_scaled_mean).abs() / rate_ref_mean.clamp(
         min=1e-6
     )
+    dispersion_rel_change = (
+        (dispersion_ref_mean - dispersion_scaled_mean).abs()
+        / dispersion_ref_mean.clamp(min=1e-6)
+    )
 
-    assert mu_rel_change < 0.2
-    assert sigma_rel_change < 0.2
+    assert rate_rel_change < 0.2
+    assert dispersion_rel_change < 0.2
