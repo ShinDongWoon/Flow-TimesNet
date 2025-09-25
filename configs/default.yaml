@@ -31,7 +31,7 @@ train:
   early_stopping_patience: 10
   batch_size: 256
   accumulation_steps: 1
-  lr_warmup_steps: 400       # conservative warmup for unnormalized SMAPE training
+  lr_warmup_steps: 50       # conservative warmup for unnormalized SMAPE training
   lr: 1.0e-3
   weight_decay: 1.0e-6
   grad_clip_norm: 1.0
