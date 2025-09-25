@@ -1159,13 +1159,16 @@ class TimesNet(nn.Module):
         else:
             mark_slice = None
         enc_x_value = x[:, -self.input_len :, :].clone()
-        if torch.any(~torch.isfinite(enc_x_value)):
-            if not enc_x_value.is_floating_point():
+        if enc_x_value.is_floating_point():
+            invalid_mask = ~torch.isfinite(enc_x_value)
+            if torch.any(invalid_mask):
+                enc_x_value = enc_x_value.masked_fill(invalid_mask, 0.0)
+        else:
+            invalid_mask = ~torch.isfinite(enc_x_value.to(dtype=torch.float32))
+            if torch.any(invalid_mask):
                 raise RuntimeError(
                     "TimesNet input contains non-finite values in non-floating tensor"
                 )
-            invalid_mask = ~torch.isfinite(enc_x_value)
-            enc_x_value = enc_x_value.masked_fill(invalid_mask, 0.0)
         enc_x_features = enc_x_value.clone()
         self._ensure_embedding(enc_x_features, mark_slice, series_static, series_ids)
         target_steps = self.pred_len if self.mode == "direct" else self._out_steps
