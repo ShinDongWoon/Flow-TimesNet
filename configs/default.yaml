@@ -19,7 +19,7 @@ data:
     normalize: true
 
 preprocess:
-  to_wide: true
+  to_wide: false
   normalize: "none"           # zscore|minmax|none
   normalize_per_series: true
   eps: 1.0e-8
