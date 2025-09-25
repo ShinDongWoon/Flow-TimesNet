@@ -695,14 +695,13 @@ class TimesNet(nn.Module):
             object.__setattr__(block, "period_selector", self.period_selector)
         self.residual_dropout = nn.Dropout(self.dropout)
         self.layer_norm: nn.LayerNorm | None = None
-        self.predict_linear = nn.Linear(self.input_len, self.input_len + self.pred_len)
+        self.forecast_time_proj = nn.Linear(self.input_len, self.pred_len)
         with torch.no_grad():
-            self.predict_linear.weight.zero_()
-            identity = torch.eye(self.input_len)
-            self.predict_linear.weight[: self.input_len, :] = identity
+            self.forecast_time_proj.weight.zero_()
             if self.pred_len > 0:
-                self.predict_linear.weight[self.input_len :, -1] = 1.0
-            self.predict_linear.bias.zero_()
+                self.forecast_time_proj.weight[:, -1] = 1.0
+            if self.forecast_time_proj.bias is not None:
+                self.forecast_time_proj.bias.zero_()
         self.embedding: DataEmbedding | None = None
         self.embedding_time_features: int | None = None
         self.output_proj: nn.Conv1d | None = None
@@ -1041,8 +1040,8 @@ class TimesNet(nn.Module):
             self.embedding = _module_to_reference(self.embedding, x)
         self.embedding_time_features = time_dim
 
-        self.predict_linear = self.predict_linear.to(
-            device=x.device, dtype=_module_dtype_from_tensor(x)
+        self.forecast_time_proj = _module_to_reference(
+            self.forecast_time_proj, x
         )
 
         if self.layer_norm is None or (
@@ -1258,13 +1257,7 @@ class TimesNet(nn.Module):
             raise RuntimeError(
                 "Embedding output dimension mismatch with configured d_model"
             )
-        feat_bn = features.permute(0, 2, 1).contiguous()
-        feat_flat = feat_bn.reshape(B * self.d_model, self.input_len)
-        extended = self.predict_linear(feat_flat)
-        extended = extended.view(B, self.d_model, self.input_len + self.pred_len)
-        features = extended.permute(0, 2, 1).contiguous()
-        total_len = features.size(1)
-        baseline = features[:, -target_steps:, :].contiguous()
+        seq_features = features
         hist_steps = min(target_steps, time_len)
         history_tail = enc_x_value[:, -hist_steps:, :]
         if hist_steps < target_steps:
@@ -1273,19 +1266,17 @@ class TimesNet(nn.Module):
 
         history_tail = history_tail.to(enc_x_value.dtype)
 
-        if self.debug_memory and features.is_cuda and torch.cuda.is_available():
-            mem_bytes = torch.cuda.memory_allocated(features.device)
+        if self.debug_memory and seq_features.is_cuda and torch.cuda.is_available():
+            mem_bytes = torch.cuda.memory_allocated(seq_features.device)
             print(
-                f"[TimesNet] CUDA memory allocated after predict_linear: {mem_bytes / (1024 ** 2):.2f} MiB"
+                f"[TimesNet] CUDA memory allocated after embedding: {mem_bytes / (1024 ** 2):.2f} MiB"
             )
 
         self.period_selector = self.period_selector.to(
-            device=features.device, dtype=features.dtype
+            device=seq_features.device, dtype=seq_features.dtype
         )
         for block in self.blocks:
             object.__setattr__(block, "period_selector", self.period_selector)
-
-        seq_features = features
 
         def _apply_late_bias(mu_tensor: torch.Tensor) -> torch.Tensor:
             if (
@@ -1312,41 +1303,48 @@ class TimesNet(nn.Module):
         preview_periods, _ = self.period_selector(seq_features)
         if preview_periods.numel() > 0 and torch.any(preview_periods <= 0):
             raise RuntimeError("Selected periods must be positive")
-        if preview_periods.numel() == 0:
-            mu_hidden = baseline
-            mu = self.mu_head(mu_hidden) + history_tail
-            mu = _apply_late_bias(mu)
-            sigma_hidden = self.sigma_head(baseline)
-            floor = self._sigma_from_ref(mu)
-            sigma = F.softplus(sigma_hidden) + floor
-            return mu, sigma
+        if preview_periods.numel() > 0:
+            for block in self.blocks:
+                if seq_features.shape[-1] != self.d_model:
+                    raise RuntimeError(
+                        "Residual input to TimesBlock must maintain d_model channels"
+                    )
+                if self.use_checkpoint:
+                    updated = checkpoint(block, seq_features, use_reentrant=False)
+                else:
+                    updated = block(seq_features)
+                delta = updated - seq_features
+                seq_features = seq_features + self.residual_dropout(delta)
+                seq_features = self.layer_norm(seq_features)
 
-        for block in self.blocks:
-            if seq_features.shape[-1] != self.d_model:
-                raise RuntimeError(
-                    "Residual input to TimesBlock must maintain d_model channels"
-                )
-            if self.use_checkpoint:
-                updated = checkpoint(block, seq_features, use_reentrant=False)
-            else:
-                updated = block(seq_features)
-            delta = updated - seq_features
-            seq_features = seq_features + self.residual_dropout(delta)
-            seq_features = self.layer_norm(seq_features)
-        features = seq_features
-        target_features = features[:, -target_steps:, :].contiguous()
-        target_bn = target_features.permute(0, 2, 1).contiguous()
-        mu_delta_bn = self.output_proj(target_bn)
-        mu_delta = mu_delta_bn.permute(0, 2, 1).contiguous()
-        mu_hidden = baseline + mu_delta
+        features_final = seq_features
+        features_bn = features_final.permute(0, 2, 1).contiguous()
+        assert (
+            self.forecast_time_proj.in_features == self.input_len
+        ), "forecast_time_proj input size mismatch"
+        assert (
+            self.forecast_time_proj.out_features == self.pred_len
+        ), "forecast_time_proj output size mismatch"
+        baseline_bn_full = self.forecast_time_proj(features_bn)
+        if target_steps != self.pred_len:
+            baseline_bn = baseline_bn_full[:, :, -target_steps:].contiguous()
+        else:
+            baseline_bn = baseline_bn_full.contiguous()
+        assert self.output_proj is not None  # for type checkers
+        mu_delta_bn = self.output_proj(baseline_bn)
+        mu_hidden = (baseline_bn + mu_delta_bn).permute(0, 2, 1).contiguous()
         mu = self.mu_head(mu_hidden) + history_tail
         mu = _apply_late_bias(mu)
         assert self.sigma_proj is not None  # for type checkers
-        sigma_bn = self.sigma_proj(target_bn)
+        sigma_bn = self.sigma_proj(baseline_bn)
         sigma_hidden = sigma_bn.permute(0, 2, 1).contiguous()
         sigma_head = self.sigma_head(sigma_hidden)
         floor = self._sigma_from_ref(mu)
         sigma = F.softplus(sigma_head) + floor
         if torch.any(sigma <= 0):
             raise RuntimeError("Predicted sigma must be strictly positive")
+        if mu.shape != (B, target_steps, N):
+            raise RuntimeError("Predicted mu has incorrect shape")
+        if sigma.shape != (B, target_steps, N):
+            raise RuntimeError("Predicted sigma has incorrect shape")
         return mu, sigma
