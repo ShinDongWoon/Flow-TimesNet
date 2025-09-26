@@ -451,6 +451,10 @@ class TimesBlock(nn.Module):
     ) -> torch.Tensor | None:
         B, L, C = x.shape
         x_perm = x.permute(0, 2, 1).contiguous()
+        if x_perm.dtype in (torch.float16, torch.bfloat16):
+            x_perm_fp32 = x_perm.to(torch.float32)
+        else:
+            x_perm_fp32 = x_perm
         residuals: list[torch.Tensor] = []
         valid_indices: list[int] = []
 
@@ -460,23 +464,25 @@ class TimesBlock(nn.Module):
                 continue
             pad_len = (-L) % period
             if pad_len > 0:
-                x_pad = F.pad(x_perm, (0, pad_len))
+                grid_source = F.pad(x_perm_fp32, (0, pad_len))
             else:
-                x_pad = x_perm
-            total_len = x_pad.size(-1)
+                grid_source = x_perm_fp32
+            total_len = grid_source.size(-1)
             cycles = total_len // period
             if cycles < 2:
                 continue
-            grid = x_pad.view(B, C, cycles, period)
-            grid_dtype = grid.dtype
+            grid_fp32 = grid_source.view(B, C, cycles, period)
             with torch.amp.autocast(device_type="cuda", enabled=False):
-                conv_out32 = self.inception(grid.to(torch.float32))
-            conv_out = conv_out32.to(grid_dtype)
-            delta = conv_out - grid
-            delta = delta.view(B, C, total_len)
-            delta = delta.permute(0, 2, 1)
+                conv_out32 = self.inception(grid_fp32)
+            delta_fp32 = conv_out32 - grid_fp32
+            delta_fp32 = delta_fp32.view(B, C, total_len)
+            delta_fp32 = delta_fp32.permute(0, 2, 1)
             if pad_len > 0:
-                delta = delta[:, :-pad_len, :]
+                delta_fp32 = delta_fp32[:, :-pad_len, :]
+            if delta_fp32.dtype != x.dtype:
+                delta = delta_fp32.to(dtype=x.dtype)
+            else:
+                delta = delta_fp32
             residuals.append(delta)
             valid_indices.append(idx)
 
@@ -496,6 +502,10 @@ class TimesBlock(nn.Module):
             return self._period_conv_loop(x, periods, amplitudes)
 
         x_perm = x.permute(0, 2, 1).contiguous()
+        if x_perm.dtype in (torch.float16, torch.bfloat16):
+            x_perm_fp32 = x_perm.to(torch.float32)
+        else:
+            x_perm_fp32 = x_perm
         uniq, inv = torch.unique(periods_flat, sorted=True, return_inverse=True)
         if uniq.numel() == 0:
             return None
@@ -552,9 +562,9 @@ class TimesBlock(nn.Module):
 
         max_pad = int(pad_valid.max().item()) if pad_valid.numel() > 0 else 0
         if max_pad > 0:
-            x_padded = F.pad(x_perm, (0, max_pad))
+            x_padded_fp32 = F.pad(x_perm_fp32, (0, max_pad))
         else:
-            x_padded = x_perm
+            x_padded_fp32 = x_perm_fp32
 
         desired_format = self._desired_memory_format()
         bucket_limit_env = os.getenv("TIMESBLOCK_BUCKET_MAX")
@@ -576,21 +586,24 @@ class TimesBlock(nn.Module):
                 pad_len = int(pad_valid[idx].item())
                 cycles = int(cycles_valid[idx].item())
                 total_len = L + pad_len
-                x_slice = x_padded.narrow(-1, 0, total_len)
-                grid = x_slice.reshape(B, C, cycles, period_val)
+                x_slice_fp32 = x_padded_fp32.narrow(-1, 0, total_len)
+                grid_fp32 = x_slice_fp32.reshape(B, C, cycles, period_val)
                 if desired_format == torch.channels_last:
-                    grid_2d = grid.contiguous(memory_format=torch.channels_last)
+                    grid_fp32 = grid_fp32.contiguous(
+                        memory_format=torch.channels_last
+                    )
                 else:
-                    grid_2d = grid.contiguous()
-                grid_dtype = grid_2d.dtype
+                    grid_fp32 = grid_fp32.contiguous()
                 with torch.amp.autocast(device_type="cuda", enabled=False):
-                    conv_out32 = self.inception(grid_2d.to(torch.float32))
-                conv_out = conv_out32.to(grid_dtype)
-                delta = conv_out - grid_2d
-                delta = delta.contiguous()
-                delta = delta.view(B, C, cycles * period_val)[..., :L]
-                delta = delta.reshape(B, C, L)
-                residuals[idx] = delta.permute(0, 2, 1).contiguous()
+                    conv_out32 = self.inception(grid_fp32)
+                delta_fp32 = conv_out32 - grid_fp32
+                delta_fp32 = delta_fp32.contiguous()
+                delta_fp32 = delta_fp32.view(B, C, cycles * period_val)[..., :L]
+                delta_fp32 = delta_fp32.reshape(B, C, L)
+                delta_perm = delta_fp32.permute(0, 2, 1).contiguous()
+                if delta_perm.dtype != x.dtype:
+                    delta_perm = delta_perm.to(dtype=x.dtype)
+                residuals[idx] = delta_perm
 
         if any(r is None for r in residuals):
             return None
