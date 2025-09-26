@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 from contextlib import nullcontext
-from typing import Optional, Sequence, Tuple
+from typing import Sequence, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -726,29 +726,30 @@ class RMSNorm(nn.Module):
 
 
 def _apply_layer_norm(norm: nn.LayerNorm, x: torch.Tensor) -> torch.Tensor:
-    """Apply ``LayerNorm`` using FP32 reductions when needed."""
+    """Apply ``LayerNorm`` using functional FP32 reductions when needed."""
 
     orig_dtype = x.dtype
-    if orig_dtype in (torch.float16, torch.bfloat16):
-        module_dtype: Optional[torch.dtype] = None
-        if norm.weight is not None:
-            module_dtype = norm.weight.dtype
-        elif norm.bias is not None:
-            module_dtype = norm.bias.dtype
-        if module_dtype is None or module_dtype in (torch.float16, torch.bfloat16):
-            return norm(x)
-        normed = norm(x.to(dtype=module_dtype))
-        return normed.to(dtype=orig_dtype)
-    return norm(x)
+    calc_dtype = torch.float32 if orig_dtype in (torch.float16, torch.bfloat16) else orig_dtype
+    x_calc = x if x.dtype == calc_dtype else x.to(calc_dtype)
+    weight = norm.weight
+    bias = norm.bias
+    weight_calc = weight if weight is None or weight.dtype == calc_dtype else weight.to(calc_dtype)
+    bias_calc = bias if bias is None or bias.dtype == calc_dtype else bias.to(calc_dtype)
+    normed = F.layer_norm(
+        x_calc,
+        norm.normalized_shape,
+        weight=weight_calc,
+        bias=bias_calc,
+        eps=norm.eps,
+    )
+    if normed.dtype != orig_dtype:
+        normed = normed.to(orig_dtype)
+    return normed
 
 
 def _apply_rms_norm(norm: RMSNorm, x: torch.Tensor) -> torch.Tensor:
-    """Apply ``RMSNorm`` using FP32 reductions when needed."""
+    """Apply ``RMSNorm`` deferring to the module implementation."""
 
-    orig_dtype = x.dtype
-    if orig_dtype in (torch.float16, torch.bfloat16):
-        normed = norm(x.to(torch.float32))
-        return normed.to(dtype=orig_dtype)
     return norm(x)
 
 
