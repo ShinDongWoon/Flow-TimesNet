@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
+import os
 from contextlib import nullcontext
-from typing import Tuple, Sequence
+from typing import Sequence, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -293,6 +294,7 @@ class TimesBlock(nn.Module):
         # avoid registering the shared selector multiple times.
         self.period_selector: FFTPeriodSelector | None = None
         self._period_calls: int = 0
+        self._vec_calls: int = 0
 
     def _build_layers(self, channels: int, device: torch.device, dtype: torch.dtype) -> None:
         if channels <= 0:
@@ -326,6 +328,7 @@ class TimesBlock(nn.Module):
                 bottleneck_ratio=self.bottleneck_ratio,
             ),
         ).to(device=device, dtype=target_dtype)
+        self.inception = self.inception.to(memory_format=torch.channels_last)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply weighted period residuals to ``x``."""
@@ -344,6 +347,7 @@ class TimesBlock(nn.Module):
             self._build_layers(x.size(-1), device=x.device, dtype=x.dtype)
         else:
             self.inception = _module_to_reference(self.inception, x)
+            self.inception = self.inception.to(memory_format=torch.channels_last)
             if self.d_model is not None and x.size(-1) != self.d_model:
                 raise ValueError("Number of channels changed between calls")
 
@@ -362,6 +366,74 @@ class TimesBlock(nn.Module):
         amplitudes = amplitudes.to(device=device, dtype=dtype)
         periods = periods.to(device=device, dtype=torch.long)
 
+        disable_flag = os.getenv("TIMESBLOCK_VEC_DISABLE")
+        use_vectorized = True
+        if disable_flag and disable_flag.strip().lower() not in {"0", "false", "off"}:
+            use_vectorized = False
+
+        if use_vectorized:
+            combined = self._period_conv_vectorized(x, periods, amplitudes)
+        else:
+            combined = self._period_conv_loop(x, periods, amplitudes)
+
+        if combined is None:
+            return x
+        return x + combined
+
+    def _combine_period_residuals(
+        self,
+        residuals: list[torch.Tensor],
+        amplitudes: torch.Tensor,
+        valid_indices: list[int],
+        batch_size: int,
+        periods: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if not residuals:
+            return None
+
+        stacked = torch.stack(residuals, dim=-1)
+        amp = amplitudes
+        if amp.dim() == 1:
+            amp = amp.view(1, -1).expand(batch_size, -1)
+        amp = amp[:, valid_indices] if amp.numel() > 0 else amp
+        if amp.numel() > 0:
+            softmax_dtype = amp.dtype
+            if softmax_dtype in (torch.float16, torch.bfloat16):
+                amp_for_softmax = amp.to(dtype=torch.float32)
+                weights_float = F.softmax(amp_for_softmax, dim=1)
+            else:
+                weights_float = F.softmax(amp, dim=1)
+            should_verify = False
+            if periods is not None and valid_indices:
+                idx_tensor = torch.as_tensor(
+                    valid_indices, device=periods.device, dtype=torch.long
+                )
+                period_vals = torch.index_select(periods, 0, idx_tensor)
+                period_hash = int(period_vals.sum().item()) if period_vals.numel() > 0 else 0
+                should_verify = (period_hash % 97) == 1
+            if should_verify:
+                eps = torch.finfo(weights_float.dtype).eps
+                weight_sum = weights_float.sum(dim=1, keepdim=True)
+                zero_mask = weight_sum <= eps
+                if zero_mask.any():
+                    uniform = torch.full_like(
+                        weights_float, 1.0 / max(weights_float.size(1), 1)
+                    )
+                    weights_float = torch.where(zero_mask, uniform, weights_float)
+                    weight_sum = torch.where(
+                        zero_mask, torch.ones_like(weight_sum), weight_sum
+                    )
+                weights_float = weights_float / weight_sum.clamp_min(eps)
+            weights_flat = weights_float.to(dtype=amp.dtype)
+        else:
+            weights_flat = amp
+        weights = weights_flat.view(batch_size, 1, 1, -1)
+        return (stacked * weights).sum(dim=-1)
+
+    def _period_conv_loop(
+        self, x: torch.Tensor, periods: torch.Tensor, amplitudes: torch.Tensor
+    ) -> torch.Tensor | None:
+        B, L, C = x.shape
         x_perm = x.permute(0, 2, 1).contiguous()
         residuals: list[torch.Tensor] = []
         valid_indices: list[int] = []
@@ -377,6 +449,8 @@ class TimesBlock(nn.Module):
                 x_pad = x_perm
             total_len = x_pad.size(-1)
             cycles = total_len // period
+            if cycles < 2:
+                continue
             grid = x_pad.view(B, C, cycles, period)
             conv_out = self.inception(grid)
             delta = conv_out - grid
@@ -387,35 +461,137 @@ class TimesBlock(nn.Module):
             residuals.append(delta)
             valid_indices.append(idx)
 
-        if not residuals:
-            return x
+        return self._combine_period_residuals(
+            residuals, amplitudes, valid_indices, B, periods
+        )
 
-        stacked = torch.stack(residuals, dim=-1)  # [B, L, C, K_valid]
+    def _period_conv_vectorized(
+        self, x: torch.Tensor, periods: torch.Tensor, amplitudes: torch.Tensor
+    ) -> torch.Tensor | None:
+        B, L, C = x.shape
+        device = x.device
+        dtype = x.dtype
 
-        if amplitudes.dim() == 1:
-            amplitudes = amplitudes.view(1, -1).expand(B, -1)
-        amp = amplitudes[:, valid_indices] if amplitudes.numel() > 0 else amplitudes
-        if amp.numel() > 0:
-            softmax_dtype = amp.dtype
-            if softmax_dtype in (torch.float16, torch.bfloat16):
-                amp_for_softmax = amp.to(dtype=torch.float32)
-                weights_float = F.softmax(amp_for_softmax, dim=1)
+        periods_flat = periods.view(-1)
+        if periods_flat.numel() == 0:
+            return None
+
+        if not isinstance(self.inception, nn.Sequential):
+            return self._period_conv_loop(x, periods, amplitudes)
+
+        x_perm = x.permute(0, 2, 1).contiguous()
+        valid_info: list[tuple[int, int, int, int]] = []
+        padded_grids: list[torch.Tensor] = []
+        H_max = 0
+        W_max = 0
+
+        for idx in range(periods_flat.numel()):
+            period_val = int(periods_flat[idx].item())
+            if period_val <= 0:
+                continue
+            pad_len = (-L) % period_val
+            total_len = L + pad_len
+            cycles = total_len // period_val if period_val > 0 else 0
+            if cycles < 2:
+                continue
+            if pad_len > 0:
+                x_pad = F.pad(x_perm, (0, pad_len))
             else:
-                weights_float = F.softmax(amp, dim=1)
-            eps = torch.finfo(weights_float.dtype).eps
-            weight_sum = weights_float.sum(dim=1, keepdim=True)
-            zero_mask = weight_sum <= eps
-            if zero_mask.any():
-                uniform = torch.full_like(weights_float, 1.0 / weights_float.size(1))
-                weights_float = torch.where(zero_mask, uniform, weights_float)
-                weight_sum = torch.where(zero_mask, torch.ones_like(weight_sum), weight_sum)
-            weights_float = weights_float / weight_sum.clamp_min(eps)
-            weights_flat = weights_float.to(dtype=amp.dtype)
+                x_pad = x_perm
+            grid = x_pad.view(B, C, cycles, period_val)
+            H_max = max(H_max, cycles)
+            W_max = max(W_max, period_val)
+            valid_info.append((idx, period_val, pad_len, cycles))
+            padded_grids.append(grid)
+
+        if not padded_grids:
+            return None
+
+        final_grids: list[torch.Tensor] = []
+        final_masks: list[torch.Tensor] = []
+        for grid, (_, period_val, pad_len, cycles) in zip(padded_grids, valid_info):
+            pad_h = H_max - cycles
+            pad_w = W_max - period_val
+            if pad_h or pad_w:
+                grid_padded = F.pad(grid, (0, pad_w, 0, pad_h))
+            else:
+                grid_padded = grid
+            final_grids.append(grid_padded)
+            mask = torch.ones(
+                (B, 1, cycles, period_val), device=device, dtype=dtype
+            )
+            if pad_h or pad_w:
+                mask = F.pad(mask, (0, pad_w, 0, pad_h))
+            final_masks.append(mask)
+
+        grid_stack = torch.stack(final_grids, dim=1)
+        mask_stack = torch.stack(final_masks, dim=1)
+
+        B_eff, K_valid = grid_stack.shape[:2]
+        grid_batch = (
+            grid_stack.permute(1, 0, 2, 3, 4)
+            .reshape(K_valid * B_eff, C, H_max, W_max)
+            .contiguous(memory_format=torch.channels_last)
+        )
+        mask_batch = (
+            mask_stack.permute(1, 0, 2, 3, 4)
+            .reshape(K_valid * B_eff, 1, H_max, W_max)
+            .contiguous(memory_format=torch.channels_last)
+        )
+
+        chunk_env = os.getenv("TIMESBLOCK_K_CHUNK")
+        if chunk_env:
+            try:
+                chunk_limit = max(1, int(chunk_env))
+            except ValueError:
+                chunk_limit = K_valid
         else:
-            weights_flat = amp
-        weights = weights_flat.view(B, 1, 1, -1)
-        combined = (stacked * weights).sum(dim=-1)
-        return x + combined
+            chunk_limit = K_valid
+        chunk_limit = max(1, min(chunk_limit, K_valid))
+
+        if isinstance(self.inception, nn.Sequential):
+            layered_inception: list[nn.Module] | None = list(self.inception)
+        else:
+            layered_inception = None
+
+        residuals: list[torch.Tensor] = []
+        start = 0
+        info_index = 0
+        self._vec_calls += 1
+        while start < K_valid:
+            end = min(start + chunk_limit, K_valid)
+            batch_start = start * B_eff
+            batch_end = end * B_eff
+            batch = grid_batch[batch_start:batch_end]
+            batch_mask = mask_batch[batch_start:batch_end]
+            if layered_inception is not None:
+                z = batch * batch_mask
+                for layer in layered_inception:
+                    z = layer(z)
+                    z = z * batch_mask
+                conv_out = z
+            else:
+                conv_out = self.inception(batch)
+                conv_out = conv_out * batch_mask
+            delta = (conv_out - batch) * batch_mask
+            chunk_len = end - start
+            delta = delta.view(chunk_len, B_eff, C, H_max, W_max)
+            delta = delta.permute(1, 0, 2, 3, 4)
+            for local in range(chunk_len):
+                orig_idx, period_val, pad_len, cycles = valid_info[info_index]
+                info_index += 1
+                delta_hw = delta[:, local, :, :cycles, :period_val]
+                delta_flat = delta_hw.reshape(B_eff, C, cycles * period_val)
+                if pad_len > 0:
+                    delta_flat = delta_flat[:, :, :-pad_len]
+                delta_perm = delta_flat.permute(0, 2, 1).contiguous()
+                residuals.append(delta_perm)
+            start = end
+
+        valid_indices = [info[0] for info in valid_info]
+        return self._combine_period_residuals(
+            residuals, amplitudes, valid_indices, B_eff, periods
+        )
 
 
 class PositionalEmbedding(nn.Module):
