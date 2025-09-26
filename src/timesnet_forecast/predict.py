@@ -288,39 +288,45 @@ def predict_once(cfg: Dict) -> str:
         static_layernorm=static_layernorm,
     ).to(device)
     # Lazily construct layers by mirroring the training warm-up.
-    with torch.no_grad():
-        dummy = torch.zeros(
+    warmup_kwargs: Dict[str, torch.Tensor] = {}
+    warmup_series_static_single: torch.Tensor | None = None
+    if static_tensor_full is not None and static_tensor_full.numel() > 0:
+        warmup_series_static_single = static_tensor_full[:1, :]
+        warmup_kwargs["series_static"] = warmup_series_static_single
+    warmup_ids_single: torch.Tensor | None = None
+    if full_series_ids_tensor.numel() > 0:
+        warmup_ids_single = full_series_ids_tensor[:1]
+        warmup_kwargs["series_ids"] = warmup_ids_single
+    if time_features_enabled and meta_dim > 0:
+        warmup_kwargs["x_mark"] = torch.zeros(
             1,
             input_len,
-            len(ids),
+            meta_dim,
             device=device,
+            dtype=torch.float32,
         )
+    original_min_sigma_buffer: torch.Tensor | None = None
+    if (
+        isinstance(model.min_sigma_vector, torch.Tensor)
+        and model.min_sigma_vector.numel() > 0
+    ):
+        original_min_sigma_buffer = model.min_sigma_vector
+        model.min_sigma_vector = model.min_sigma_vector[..., :1]
+
+    with torch.no_grad():
+        dummy = torch.zeros(1, input_len, 1, device=device)
+        model(dummy, **warmup_kwargs)
         if cfg_used["train"]["channels_last"]:
-            dummy = dummy.unsqueeze(-1).to(memory_format=torch.channels_last).squeeze(-1)
-        warmup_kwargs = {}
-        if time_features_enabled and meta_dim > 0:
-            warmup_kwargs["x_mark"] = torch.zeros(
-                1,
-                input_len,
-                meta_dim,
-                device=device,
-                dtype=torch.float32,
+            model.to(memory_format=torch.channels_last)
+            dummy_cl = (
+                dummy.to(memory_format=torch.channels_last)
+                if dummy.dim() == 4
+                else dummy
             )
-        if static_tensor_full is not None:
-            warmup_kwargs["series_static"] = static_tensor_full
-        if full_series_ids_tensor is not None:
-            warmup_kwargs["series_ids"] = full_series_ids_tensor
-        if warmup_kwargs:
-            try:
-                model(dummy, **warmup_kwargs)
-            except TypeError as err:
-                err_str = str(err)
-                if "series_static" in err_str or "series_ids" in err_str:
-                    model(dummy)
-                else:
-                    raise
-        else:
-            model(dummy)
+            model(dummy_cl, **warmup_kwargs)
+
+    if original_min_sigma_buffer is not None:
+        model.min_sigma_vector = original_min_sigma_buffer
     state = torch.load(model_file, map_location="cpu")
     # Checkpoints saved with torch.compile or DataParallel may prefix parameter names.
     clean_state = {
@@ -336,10 +342,53 @@ def predict_once(cfg: Dict) -> str:
         clean_state["min_sigma_vector"] = buffer_cpu
     else:
         clean_state.pop("min_sigma_vector", None)
+    saved_series_embed = clean_state.get("series_embedding.weight")
+    if isinstance(saved_series_embed, torch.Tensor) and saved_series_embed.numel() > 0:
+        saved_vocab = int(saved_series_embed.size(0))
+        saved_dim = int(saved_series_embed.size(1))
+        current_embed = getattr(model, "series_embedding", None)
+        needs_new = not isinstance(current_embed, torch.nn.Embedding)
+        if not needs_new:
+            assert isinstance(current_embed, torch.nn.Embedding)
+            needs_new = (
+                int(current_embed.num_embeddings) != saved_vocab
+                or int(current_embed.embedding_dim) != saved_dim
+            )
+        if needs_new:
+            model.series_embedding = torch.nn.Embedding(
+                saved_vocab,
+                saved_dim,
+                device=device,
+                dtype=saved_series_embed.dtype,
+            )
+
     model.load_state_dict(clean_state, strict=True)
     if cfg_used["train"]["channels_last"]:
         model.to(memory_format=torch.channels_last)
     model.eval()
+    min_sigma_reference: torch.Tensor | None = None
+    loaded_sigma = getattr(model, "min_sigma_vector", None)
+    if isinstance(loaded_sigma, torch.Tensor) and loaded_sigma.numel() > 0:
+        min_sigma_reference = loaded_sigma.detach().clone()
+    series_embed = getattr(model, "series_embedding", None)
+    if isinstance(series_embed, torch.nn.Embedding):
+        required_vocab = max(int(series_embed.num_embeddings), len(ids))
+        if required_vocab > int(series_embed.num_embeddings):
+            new_embed = torch.nn.Embedding(
+                required_vocab,
+                series_embed.embedding_dim,
+                device=series_embed.weight.device,
+                dtype=series_embed.weight.dtype,
+            )
+            with torch.no_grad():
+                new_embed.weight.zero_()
+                new_embed.weight[: series_embed.num_embeddings] = series_embed.weight
+            model.series_embedding = new_embed
+            series_embed = new_embed
+        model._series_id_vocab = required_vocab
+        model._series_id_reference = torch.arange(
+            required_vocab, device=series_embed.weight.device, dtype=torch.long
+        )
 
     # Iterate test parts
     test_dir = cfg_used["data"]["test_dir"]
@@ -351,49 +400,27 @@ def predict_once(cfg: Dict) -> str:
     test_files = sorted(glob(os.path.join(test_dir, "TEST_*.csv")))
     for fp in test_files:
         df = pd.read_csv(fp)
-        wide = io_utils.pivot_long_to_wide(
-            df, date_col=schema["date"], id_col=schema["id"], target_col=schema["target"],
-            fill_missing_dates=cfg_used["data"]["fill_missing_dates"], fillna0=True
+        wide_raw = io_utils.pivot_long_to_wide(
+            df,
+            date_col=schema["date"],
+            id_col=schema["id"],
+            target_col=schema["target"],
+            fill_missing_dates=cfg_used["data"]["fill_missing_dates"],
+            fillna0=True,
         )
         if cfg_used.get("preprocess", {}).get("clip_negative", False):
-            wide = wide.clip(lower=0.0)
-        # align columns to training ids
-        wide = wide.reindex(columns=ids).fillna(0.0)
-        columns = list(wide.columns)
-        if columns == ids:
-            series_ids_tensor = full_series_ids_tensor
-            static_tensor = static_tensor_full
-        else:
-            gather_positions: List[int] = []
-            unknown_cols: List[str] = []
-            for col in columns:
-                idx = id_position_map.get(col)
-                if idx is None:
-                    unknown_cols.append(col)
-                else:
-                    gather_positions.append(idx)
-            if unknown_cols:
-                raise ValueError(
-                    f"Test series '{fp}' contains unknown ids not seen during training: {unknown_cols}"
-                )
-            if gather_positions:
-                index_tensor = torch.tensor(
-                    gather_positions, dtype=torch.long, device=device
-                )
-            else:
-                index_tensor = torch.empty(0, dtype=torch.long, device=device)
-            series_ids_tensor = index_tensor
-            if static_tensor_full is not None:
-                if index_tensor.numel() == 0:
-                    static_tensor = static_tensor_full.new_zeros(
-                        (0, static_tensor_full.size(1))
-                    )
-                else:
-                    static_tensor = torch.index_select(
-                        static_tensor_full, 0, index_tensor
-                    )
-            else:
-                static_tensor = None
+            wide_raw = wide_raw.clip(lower=0.0)
+        present_columns = list(wide_raw.columns)
+        unknown_cols = [c for c in present_columns if c not in id_position_map]
+        if unknown_cols:
+            raise ValueError(
+                f"Test series '{fp}' contains unknown ids not seen during training: {unknown_cols}"
+            )
+        if not present_columns:
+            raise ValueError(
+                f"Test series '{fp}' does not contain any known ids"
+            )
+        wide = wide_raw.reindex(columns=ids).fillna(0.0)
         X = wide.values.astype(np.float32)
         # transform by scaler
         if method == "none" or scaler is None:
@@ -415,8 +442,20 @@ def predict_once(cfg: Dict) -> str:
             raise ValueError(
                 f"Test series '{fp}' shorter than required input_len={input_len}"
             )
-        last_seq = Xn[-input_len:, :]
-        xb = torch.from_numpy(last_seq).unsqueeze(0)
+        gather_positions = [id_position_map[c] for c in present_columns]
+        gather_idx_np = np.asarray(gather_positions, dtype=np.int64)
+        last_seq_full = Xn[-input_len:, :]
+        last_seq_selected = last_seq_full[:, gather_idx_np]
+        xb_np = np.transpose(last_seq_selected, (1, 0))[:, :, None]
+        num_series = xb_np.shape[0]
+        if num_series == 0:
+            raise ValueError(
+                f"Test series '{fp}' does not contain any matching ids"
+            )
+        xb = torch.from_numpy(xb_np)
+        index_tensor = torch.as_tensor(
+            gather_positions, dtype=torch.long, device=device
+        )
         x_mark_tensor: torch.Tensor | None = None
         y_mark_tensor: torch.Tensor | None = None
         if time_features_enabled:
@@ -464,13 +503,37 @@ def predict_once(cfg: Dict) -> str:
         if x_mark_tensor is not None:
             x_mark_tensor = x_mark_tensor.to(
                 device=device, dtype=xb.dtype, non_blocking=True
-            )
+            ).expand(num_series, -1, -1)
         if y_mark_tensor is not None:
             y_mark_tensor = y_mark_tensor.to(
                 device=device, dtype=xb.dtype, non_blocking=True
-            )
+            ).expand(num_series, -1, -1)
 
-        with torch.inference_mode(), amp_autocast(cfg_used["train"]["amp"] and device.type == "cuda"):
+        static_tensor: torch.Tensor | None = None
+        if static_tensor_full is not None:
+            if index_tensor.numel() == 0:
+                static_tensor = static_tensor_full.new_zeros(
+                    (0, 1, static_tensor_full.size(1))
+                )
+            else:
+                static_tensor = torch.index_select(
+                    static_tensor_full, 0, index_tensor
+                ).unsqueeze(1)
+            static_tensor = static_tensor.to(device=device, non_blocking=True)
+        series_ids_tensor = index_tensor.view(-1, 1)
+        if series_ids_tensor.numel() > 0:
+            series_ids_tensor = series_ids_tensor.to(
+                device=device, dtype=torch.long, non_blocking=True
+            )
+        else:
+            series_ids_tensor = series_ids_tensor.reshape(0, 1)
+
+        if min_sigma_reference is not None:
+            model.min_sigma_vector = min_sigma_reference
+
+        with torch.inference_mode(), amp_autocast(
+            cfg_used["train"]["amp"] and device.type == "cuda"
+        ):
             if cfg_used["model"]["mode"] == "direct":
                 rate_pred, _ = forecast_direct_batch(
                     model,
@@ -490,7 +553,11 @@ def predict_once(cfg: Dict) -> str:
                     series_ids=series_ids_tensor,
                 )
 
-        Pn = rate_pred.squeeze(0).float().cpu().numpy()  # [H, N]
+        rate_np = rate_pred.squeeze(-1).float().cpu().numpy()  # [num_series, H]
+        if rate_np.ndim == 1:
+            rate_np = rate_np.reshape(1, -1)
+        Pn = np.zeros((pred_len, len(ids)), dtype=np.float32)
+        Pn[:, gather_idx_np] = rate_np.transpose(1, 0)
         # inverse transform & clip
         P = io_utils.inverse_transform(Pn, ids, scaler, method=method)
         P = np.clip(P, 0.0, None)
