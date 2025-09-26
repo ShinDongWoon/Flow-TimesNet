@@ -285,6 +285,7 @@ class TimesBlock(nn.Module):
         self._kernel_spec = kernel_spec
         self._dropout = float(dropout)
         self.inception: nn.Sequential | None = None
+        self._inception_memory_format: torch.memory_format | None = None
         if self._configured_d_model is not None:
             self._build_layers(
                 self._configured_d_model,
@@ -338,7 +339,9 @@ class TimesBlock(nn.Module):
                 bottleneck_ratio=self.bottleneck_ratio,
             ),
         ).to(device=device, dtype=target_dtype)
-        self.inception = self.inception.to(memory_format=self._desired_memory_format())
+        desired = self._desired_memory_format()
+        self.inception = self.inception.to(memory_format=desired)
+        self._inception_memory_format = desired
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply weighted period residuals to ``x``."""
@@ -357,7 +360,10 @@ class TimesBlock(nn.Module):
             self._build_layers(x.size(-1), device=x.device, dtype=x.dtype)
         else:
             self.inception = _module_to_reference(self.inception, x)
-            self.inception = self.inception.to(memory_format=self._desired_memory_format())
+            desired_format = self._desired_memory_format()
+            if self._inception_memory_format != desired_format:
+                self.inception = self.inception.to(memory_format=desired_format)
+                self._inception_memory_format = desired_format
             if self.d_model is not None and x.size(-1) != self.d_model:
                 raise ValueError("Number of channels changed between calls")
 
@@ -487,60 +493,88 @@ class TimesBlock(nn.Module):
             return self._period_conv_loop(x, periods, amplitudes)
 
         x_perm = x.permute(0, 2, 1).contiguous()
-        bucket_meta: dict[tuple[int, int], dict[str, object]] = {}
-        valid_count = 0
-        for idx in range(periods_flat.numel()):
-            period_val = int(periods_flat[idx].item())
-            if period_val <= 0:
-                continue
-            pad_len = (-L) % period_val
-            total = L + pad_len
-            cycles = total // period_val if period_val > 0 else 0
-            if cycles < 2:
-                continue
-            key = (cycles, period_val)
-            entry = bucket_meta.get(key)
-            if entry is None:
-                entry = {"indices": [], "pad_len": pad_len}
-                bucket_meta[key] = entry
-            indices_list = entry["indices"]
-            indices_list.append(idx)
-            valid_count += 1
-
-        if valid_count == 0:
+        uniq, inv = torch.unique(periods_flat, sorted=True, return_inverse=True)
+        if uniq.numel() == 0:
             return None
 
-        bucket_items: list[tuple[list[int], int, int, int]] = []
-        for (cycles, period_val), info in bucket_meta.items():
-            indices_list = list(info["indices"])
-            indices_list.sort()
-            pad_len = int(info["pad_len"])
-            bucket_items.append((indices_list, period_val, pad_len, cycles))
-
-        if not bucket_items:
+        positive_mask = uniq > 0
+        if not torch.any(positive_mask):
             return None
 
+        uniq_positive = uniq[positive_mask]
+        L_tensor = torch.tensor(L, device=periods_flat.device, dtype=periods_flat.dtype)
+        pad_lengths_positive = torch.remainder(-L_tensor, uniq_positive)
+        total_lengths_positive = L_tensor + pad_lengths_positive
+        cycles_positive = total_lengths_positive // uniq_positive
+        valid_positive_mask = cycles_positive >= 2
+        if not torch.any(valid_positive_mask):
+            return None
+
+        valid_mask = torch.zeros_like(positive_mask)
+        valid_mask[positive_mask] = valid_positive_mask
+
+        uniq_valid = uniq[valid_mask]
+        pad_valid = pad_lengths_positive[valid_positive_mask]
+        cycles_valid = cycles_positive[valid_positive_mask]
+
+        remap = torch.full((uniq.numel(),), -1, dtype=inv.dtype, device=inv.device)
+        remap[valid_mask] = torch.arange(
+            uniq_valid.numel(), device=inv.device, dtype=inv.dtype
+        )
+        inv_mapped = remap[inv]
+        valid_k_mask = inv_mapped >= 0
+        if not torch.any(valid_k_mask):
+            return None
+
+        amp = amplitudes
+        if amp.dim() == 1:
+            amp = amp.view(1, -1).expand(B, -1)
+        amp_valid = amp[:, valid_k_mask]
+        if amp_valid.dtype in (torch.float16, torch.bfloat16):
+            softmax_vals = F.softmax(amp_valid.to(torch.float32), dim=1).to(
+                amp_valid.dtype
+            )
+        else:
+            softmax_vals = F.softmax(amp_valid, dim=1)
+
+        inv_valid = inv_mapped[valid_k_mask]
+        agg_weights = torch.zeros(
+            amp_valid.size(0),
+            uniq_valid.numel(),
+            device=softmax_vals.device,
+            dtype=softmax_vals.dtype,
+        )
+        scatter_index = inv_valid.view(1, -1).expand(amp_valid.size(0), -1)
+        agg_weights.scatter_add_(1, scatter_index, softmax_vals)
+
+        max_pad = int(pad_valid.max().item()) if pad_valid.numel() > 0 else 0
+        if max_pad > 0:
+            x_padded = F.pad(x_perm, (0, max_pad))
+        else:
+            x_padded = x_perm
+
+        desired_format = self._desired_memory_format()
         bucket_limit_env = os.getenv("TIMESBLOCK_BUCKET_MAX")
         if bucket_limit_env:
             try:
                 bucket_limit = max(1, int(bucket_limit_env))
             except ValueError:
-                bucket_limit = len(bucket_items)
+                bucket_limit = uniq_valid.numel()
         else:
-            bucket_limit = len(bucket_items)
-        bucket_limit = max(1, min(bucket_limit, len(bucket_items)))
+            bucket_limit = uniq_valid.numel()
+        bucket_limit = max(1, min(bucket_limit, uniq_valid.numel()))
 
-        desired_format = self._desired_memory_format()
-        residual_map: dict[int, torch.Tensor] = {}
+        residuals: list[torch.Tensor] = [None] * uniq_valid.numel()
         self._vec_calls += 1
-        for start in range(0, len(bucket_items), bucket_limit):
-            chunk = bucket_items[start : start + bucket_limit]
-            for indices_list, period_val, pad_len, cycles in chunk:
-                if pad_len > 0:
-                    x_pad = F.pad(x_perm, (0, pad_len))
-                else:
-                    x_pad = x_perm
-                grid = x_pad.reshape(B, C, cycles, period_val)
+        for start in range(0, uniq_valid.numel(), bucket_limit):
+            end = min(start + bucket_limit, uniq_valid.numel())
+            for idx in range(start, end):
+                period_val = int(uniq_valid[idx].item())
+                pad_len = int(pad_valid[idx].item())
+                cycles = int(cycles_valid[idx].item())
+                total_len = L + pad_len
+                x_slice = x_padded.narrow(-1, 0, total_len)
+                grid = x_slice.reshape(B, C, cycles, period_val)
                 if desired_format == torch.channels_last:
                     grid_2d = grid.contiguous(memory_format=torch.channels_last)
                 else:
@@ -550,27 +584,15 @@ class TimesBlock(nn.Module):
                 delta = delta.contiguous()
                 delta = delta.view(B, C, cycles * period_val)[..., :L]
                 delta = delta.reshape(B, C, L)
-                delta = delta.permute(0, 2, 1).contiguous()
-                for idx in indices_list:
-                    residual_map[idx] = delta
+                residuals[idx] = delta.permute(0, 2, 1).contiguous()
 
-        if not residual_map:
+        if any(r is None for r in residuals):
             return None
 
-        ordered_indices = sorted(residual_map.keys())
-        residuals = [residual_map[idx] for idx in ordered_indices]
-
-        amp = amplitudes
-        if amp.dim() == 1:
-            amp = amp.view(1, -1).expand(B, -1)
-        amp_valid = amp[:, ordered_indices]
-        if amp_valid.dtype in (torch.float16, torch.bfloat16):
-            weights = F.softmax(amp_valid.to(torch.float32), dim=1).to(amp_valid.dtype)
-        else:
-            weights = F.softmax(amp_valid, dim=1)
-        weights = weights.view(B, 1, 1, -1)
-
         stacked = torch.stack(residuals, dim=-1)
+        weights = agg_weights.to(device=stacked.device, dtype=stacked.dtype).view(
+            B, 1, 1, -1
+        )
 
         chunk_env = os.getenv("TIMESBLOCK_K_CHUNK")
         k_chunk: int | None

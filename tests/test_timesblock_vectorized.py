@@ -106,3 +106,24 @@ def test_cycles_ge_2(monkeypatch):
     monkeypatch.delenv("TIMESBLOCK_VEC_DISABLE", raising=False)
 
     assert torch.allclose(out, loop_out, atol=1e-5, rtol=1e-5)
+
+
+def test_duplicate_periods_aggregate_once(monkeypatch):
+    torch.manual_seed(3)
+    block = _build_block(d_model=3)
+    selector = FixedSelector(
+        periods=[4, 4, 8, 4], amplitudes=[[0.5, -1.2, 0.3, 0.7]]
+    )
+    object.__setattr__(block, "period_selector", selector)
+
+    x = torch.randn(2, 25, 3)
+
+    monkeypatch.setenv("TIMESBLOCK_VEC_DISABLE", "1")
+    loop_out = block(x)
+    monkeypatch.delenv("TIMESBLOCK_VEC_DISABLE", raising=False)
+
+    block._vec_calls = 0
+    vec_out = block(x)
+
+    assert block._vec_calls >= 1
+    assert torch.allclose(loop_out, vec_out, atol=1e-5, rtol=1e-5)
