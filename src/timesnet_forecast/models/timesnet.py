@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import dataclass
 from contextlib import nullcontext
 from typing import Sequence, Tuple
 import torch
@@ -80,10 +81,13 @@ class FFTPeriodSelector(nn.Module):
         device = x.device
         dtype = x.dtype
 
+        empty_idx = torch.zeros(0, dtype=torch.long, device=device)
+        empty_amp_template = torch.zeros(B, 0, dtype=dtype, device=device)
+        self.last_frequency_indices = empty_idx
+        self.last_selected_periods = empty_idx
+
         if self.k <= 0 or L <= 1 or C <= 0 or B <= 0:
-            empty_idx = torch.zeros(0, dtype=torch.long, device=device)
-            empty_amp = torch.zeros(B, 0, dtype=dtype, device=device)
-            return empty_idx, empty_amp
+            return empty_idx, empty_amp_template
 
         fft_dtype = x.dtype
         if fft_dtype in (torch.float16, torch.bfloat16):
@@ -109,7 +113,6 @@ class FFTPeriodSelector(nn.Module):
         amp_samples = amp_channel_median
 
         if amp_mean.numel() <= 1:
-            empty_idx = torch.zeros(0, dtype=torch.long, device=device)
             empty_amp = torch.zeros(B, 0, dtype=amp_samples.dtype, device=device)
             return empty_idx, empty_amp.to(dtype)
 
@@ -119,7 +122,6 @@ class FFTPeriodSelector(nn.Module):
         available = amp_mean.numel() - 1
         k = min(self.k, available)
         if k <= 0:
-            empty_idx = torch.zeros(0, dtype=torch.long, device=device)
             empty_amp = torch.zeros(B, 0, dtype=amp_samples.dtype, device=device)
             return empty_idx, empty_amp.to(dtype)
 
@@ -136,7 +138,6 @@ class FFTPeriodSelector(nn.Module):
         upper_bound = min(self.pmax, max(1, L - 1))
         lower_bound = self.min_period_threshold
         if upper_bound < lower_bound:
-            empty_idx = torch.zeros(0, dtype=torch.long, device=device)
             empty_amp = torch.zeros(B, 0, dtype=amp_samples.dtype, device=device)
             return empty_idx, empty_amp.to(dtype)
 
@@ -146,14 +147,414 @@ class FFTPeriodSelector(nn.Module):
         cycles = (L_t + periods - 1) // periods
         valid_mask = cycles >= 2
         if not torch.any(valid_mask):
-            empty_idx = torch.zeros(0, dtype=torch.long, device=device)
             empty_amp = torch.zeros(B, 0, dtype=amp_samples.dtype, device=device)
             return empty_idx, empty_amp.to(dtype)
 
         periods = periods[valid_mask]
         sample_values = sample_values[:, valid_mask]
 
+        self.last_frequency_indices = safe_indices[valid_mask]
+        self.last_selected_periods = periods
+
         return periods, sample_values.to(dtype)
+
+
+def _resolve_scheduled_value(raw: str | None, depth: int | None) -> str | None:
+    """Return the scheduled string ``raw`` for ``depth`` if provided."""
+
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+
+    tokens = [tok.strip() for tok in value.split(",") if tok.strip()]
+    if not tokens:
+        return None
+
+    direct: list[str] = []
+    defaults: list[str] = []
+    explicit: dict[int, str] = {}
+
+    for token in tokens:
+        if ":" in token:
+            key, val = token.split(":", 1)
+        elif "=" in token:
+            key, val = token.split("=", 1)
+        else:
+            direct.append(token)
+            continue
+        key = key.strip().lower()
+        val = val.strip()
+        if not val:
+            continue
+        if key in {"default", "*"}:
+            defaults.append(val)
+        else:
+            try:
+                explicit[int(key)] = val
+            except ValueError:
+                continue
+
+    chosen: str | None = None
+    if depth is not None:
+        if depth in explicit:
+            chosen = explicit[depth]
+        elif explicit:
+            lower_keys = [k for k in explicit if k <= depth]
+            if lower_keys:
+                chosen = explicit[max(lower_keys)]
+    if chosen is None and defaults:
+        chosen = defaults[-1]
+    if chosen is None and direct:
+        chosen = direct[-1]
+    if chosen is None and explicit:
+        smallest_key = min(explicit)
+        chosen = explicit[smallest_key]
+    if chosen is None:
+        chosen = tokens[-1]
+    return chosen
+
+
+def _resolve_scheduled_int(raw: str | None, depth: int | None) -> int | None:
+    """Resolve a depth-scheduled integer environment value."""
+
+    resolved = _resolve_scheduled_value(raw, depth)
+    if resolved is None:
+        return None
+    try:
+        parsed = int(float(resolved))
+    except ValueError:
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
+def _resolve_log_binning_base(raw: str | None, depth: int | None) -> float | None:
+    """Resolve logarithmic binning base from ``raw`` for ``depth``."""
+
+    resolved = _resolve_scheduled_value(raw, depth)
+    if resolved is None:
+        return None
+    text = resolved.strip().lower()
+    if not text or text in {"off", "false", "0", "none"}:
+        return None
+
+    base_val = None
+    if ":" in text:
+        prefix, suffix = text.split(":", 1)
+        prefix = prefix.strip()
+        suffix = suffix.strip()
+        if prefix in {"log", "logscale", "logarithmic"}:
+            try:
+                base_val = float(suffix)
+            except ValueError:
+                base_val = None
+        else:
+            try:
+                base_val = float(prefix)
+            except ValueError:
+                base_val = None
+    else:
+        if text in {"log", "logscale", "logarithmic"}:
+            base_val = 2.0
+        else:
+            try:
+                base_val = float(text)
+            except ValueError:
+                base_val = None
+
+    if base_val is None:
+        base_val = 2.0
+    if base_val <= 1.0:
+        return None
+    return float(base_val)
+
+
+@dataclass
+class PeriodGroupResult:
+    periods: torch.Tensor
+    pad_lengths: torch.Tensor
+    cycles: torch.Tensor
+    logits: torch.Tensor
+    mapping: torch.Tensor
+    valid_mask: torch.Tensor
+    canonical_indices: torch.Tensor
+
+
+class PeriodGrouper:
+    """Group candidate periods using duplicate/binning-aware semantics."""
+
+    def __init__(
+        self,
+        periods: torch.Tensor,
+        amplitudes: torch.Tensor,
+        seq_len: int,
+        *,
+        min_period: int | None = None,
+        max_period: int | None = None,
+        block_index: int | None = None,
+        freq_indices: torch.Tensor | None = None,
+    ) -> None:
+        self.periods = periods.view(-1)
+        amp = amplitudes
+        if amp.dim() == 1:
+            amp = amp.unsqueeze(0)
+        if amp.dim() != 2:
+            raise ValueError("amplitudes must have shape [B, K] or [K]")
+        if amp.size(1) != self.periods.numel():
+            raise ValueError(
+                "amplitudes second dimension must match number of period candidates"
+            )
+        self.amplitudes = amp
+        self.seq_len = int(seq_len)
+        self.device = self.periods.device
+        self.batch = self.amplitudes.size(0)
+        self.amp_dtype = self.amplitudes.dtype
+        self.period_dtype = self.periods.dtype
+        self.min_period = int(min_period) if min_period is not None else None
+        self.max_period = int(max_period) if max_period is not None else None
+        self.block_index = int(block_index) if block_index is not None else None
+        self.freq_indices = freq_indices
+        self.max_unique = _resolve_scheduled_int(
+            os.getenv("TIMES_PERIOD_MAX_UNIQ"), self.block_index
+        )
+        self.log_base = _resolve_log_binning_base(
+            os.getenv("TIMES_PERIOD_BINNING"), self.block_index
+        )
+
+    def _empty_result(self) -> PeriodGroupResult:
+        zero_long = torch.zeros(0, dtype=self.period_dtype, device=self.device)
+        zero_logits = torch.zeros(
+            self.batch, 0, dtype=self.amp_dtype, device=self.amplitudes.device
+        )
+        mapping = torch.full(
+            (self.periods.numel(),), -1, dtype=torch.long, device=self.device
+        )
+        valid_mask = torch.zeros(
+            self.periods.numel(), dtype=torch.bool, device=self.device
+        )
+        return PeriodGroupResult(
+            periods=zero_long,
+            pad_lengths=zero_long,
+            cycles=zero_long,
+            logits=zero_logits,
+            mapping=mapping,
+            valid_mask=valid_mask,
+            canonical_indices=torch.zeros(
+                0, dtype=torch.long, device=self.device
+            ),
+        )
+
+    def _compute_log_bucket(self, values: torch.Tensor) -> torch.Tensor:
+        assert self.log_base is not None
+        log_vals = torch.log(values.to(torch.float32)) / math.log(self.log_base)
+        buckets = torch.floor(log_vals + 1e-6)
+        return buckets.to(torch.long)
+
+    def _collect_group_metadata(
+        self,
+        assignments: torch.Tensor,
+        final_indices: torch.Tensor,
+        periods_final: torch.Tensor,
+        pad_final: torch.Tensor,
+        cycles_final: torch.Tensor,
+        amp_selected: torch.Tensor,
+    ) -> list[dict[str, torch.Tensor | float]]:
+        unique_ids = torch.unique(assignments, sorted=True)
+        info: list[dict[str, torch.Tensor | float]] = []
+        for group_id in unique_ids:
+            mask = assignments == group_id
+            if not torch.any(mask):
+                continue
+            member_positions = torch.nonzero(mask, as_tuple=False).view(-1)
+            member_logits = torch.index_select(amp_selected, 1, member_positions)
+            aggregated = torch.logsumexp(member_logits, dim=1)
+            if member_logits.size(1) == 1:
+                best_idx = 0
+            else:
+                best_idx = int(torch.argmax(member_logits.mean(dim=0)).item())
+            canonical_member = member_positions[best_idx]
+            info.append(
+                {
+                    "id": group_id,
+                    "members": member_positions,
+                    "canonical_member": canonical_member,
+                    "period": periods_final[canonical_member],
+                    "pad": pad_final[canonical_member],
+                    "cycles": cycles_final[canonical_member],
+                    "logits": aggregated,
+                    "score": float(aggregated.mean().item()),
+                    "canonical_index": final_indices[canonical_member],
+                }
+            )
+        return info
+
+    def _limit_unique_groups(
+        self,
+        assignments: torch.Tensor,
+        final_indices: torch.Tensor,
+        periods_final: torch.Tensor,
+        pad_final: torch.Tensor,
+        cycles_final: torch.Tensor,
+        amp_selected: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.max_unique is None:
+            return assignments
+        unique_ids = torch.unique(assignments, sorted=True)
+        if unique_ids.numel() <= self.max_unique:
+            return assignments
+
+        info = self._collect_group_metadata(
+            assignments, final_indices, periods_final, pad_final, cycles_final, amp_selected
+        )
+        if len(info) <= self.max_unique:
+            return assignments
+        score_tensor = torch.tensor(
+            [item["score"] for item in info],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        keep = torch.topk(score_tensor, k=self.max_unique, largest=True).indices
+        keep_set = {int(keep_idx.item()) for keep_idx in keep}
+        keep_periods = torch.stack(
+            [info[int(idx.item())]["period"].to(torch.float32) for idx in keep]
+        )
+        keep_periods = keep_periods.to(device=self.device)
+        result = assignments.clone()
+        for idx, meta in enumerate(info):
+            if idx in keep_set:
+                continue
+            period_val = meta["period"].to(torch.float32)
+            distances = torch.abs(keep_periods - period_val)
+            target_rel = int(torch.argmin(distances).item())
+            target_meta = info[int(keep[target_rel].item())]
+            target_id = target_meta["id"]
+            mask = assignments == meta["id"]
+            if torch.any(mask):
+                result[mask] = target_id
+        return result
+
+    def _build_result(
+        self,
+        assignments: torch.Tensor,
+        final_indices: torch.Tensor,
+        periods_final: torch.Tensor,
+        pad_final: torch.Tensor,
+        cycles_final: torch.Tensor,
+        amp_selected: torch.Tensor,
+    ) -> PeriodGroupResult:
+        info = self._collect_group_metadata(
+            assignments, final_indices, periods_final, pad_final, cycles_final, amp_selected
+        )
+        if not info:
+            return self._empty_result()
+        info.sort(
+            key=lambda item: (
+                int(item["period"].item()),
+                int(item["canonical_index"].item()),
+            )
+        )
+
+        mapping = torch.full(
+            (self.periods.numel(),), -1, dtype=torch.long, device=self.device
+        )
+        valid_mask = torch.zeros(
+            self.periods.numel(), dtype=torch.bool, device=self.device
+        )
+        valid_mask[final_indices] = True
+
+        periods_list = []
+        pad_list = []
+        cycle_list = []
+        logits_list = []
+        canonical_indices = []
+
+        for new_idx, meta in enumerate(info):
+            members = meta["members"]
+            original_indices = torch.index_select(final_indices, 0, members)
+            mapping[original_indices] = new_idx
+            periods_list.append(meta["period"])
+            pad_list.append(meta["pad"])
+            cycle_list.append(meta["cycles"])
+            logits_list.append(meta["logits"])
+            canonical_indices.append(meta["canonical_index"])
+
+        periods_tensor = torch.stack(periods_list) if periods_list else torch.zeros(
+            0, dtype=self.period_dtype, device=self.device
+        )
+        pad_tensor = torch.stack(pad_list) if pad_list else torch.zeros(
+            0, dtype=self.period_dtype, device=self.device
+        )
+        cycles_tensor = torch.stack(cycle_list) if cycle_list else torch.zeros(
+            0, dtype=self.period_dtype, device=self.device
+        )
+        logits_tensor = (
+            torch.stack(logits_list, dim=1)
+            if logits_list
+            else torch.zeros(self.batch, 0, dtype=self.amp_dtype, device=self.device)
+        )
+        canonical_tensor = (
+            torch.stack(canonical_indices)
+            if canonical_indices
+            else torch.zeros(0, dtype=torch.long, device=self.device)
+        )
+        return PeriodGroupResult(
+            periods=periods_tensor,
+            pad_lengths=pad_tensor,
+            cycles=cycles_tensor,
+            logits=logits_tensor,
+            mapping=mapping,
+            valid_mask=valid_mask,
+            canonical_indices=canonical_tensor,
+        )
+
+    def group(self) -> PeriodGroupResult:
+        if self.periods.numel() == 0:
+            return self._empty_result()
+
+        positive_mask = self.periods > 0
+        if not torch.any(positive_mask):
+            return self._empty_result()
+        candidate_mask = positive_mask
+        if self.min_period is not None:
+            candidate_mask = candidate_mask & (self.periods >= self.min_period)
+        if self.max_period is not None:
+            candidate_mask = candidate_mask & (self.periods <= self.max_period)
+        candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).view(-1)
+        if candidate_indices.numel() == 0:
+            return self._empty_result()
+
+        L_tensor = torch.tensor(self.seq_len, dtype=self.period_dtype, device=self.device)
+        candidate_periods = torch.index_select(self.periods, 0, candidate_indices)
+        pad_lengths = torch.remainder(-L_tensor, candidate_periods)
+        total_lengths = L_tensor + pad_lengths
+        cycles = total_lengths // candidate_periods
+        cycle_mask = cycles >= 2
+        if not torch.any(cycle_mask):
+            return self._empty_result()
+        valid_rel = torch.nonzero(cycle_mask, as_tuple=False).view(-1)
+        final_indices = torch.index_select(candidate_indices, 0, valid_rel)
+        periods_final = torch.index_select(candidate_periods, 0, valid_rel)
+        pad_final = torch.index_select(pad_lengths, 0, valid_rel)
+        cycles_final = torch.index_select(cycles, 0, valid_rel)
+        if final_indices.numel() == 0:
+            return self._empty_result()
+
+        amp_selected = torch.index_select(self.amplitudes, 1, final_indices)
+
+        if self.log_base is None:
+            group_keys = periods_final
+        else:
+            group_keys = self._compute_log_bucket(periods_final)
+        _, assignments = torch.unique(group_keys, sorted=True, return_inverse=True)
+        assignments = self._limit_unique_groups(
+            assignments, final_indices, periods_final, pad_final, cycles_final, amp_selected
+        )
+        return self._build_result(
+            assignments, final_indices, periods_final, pad_final, cycles_final, amp_selected
+        )
 
 
 class InceptionBranch(nn.Module):
@@ -312,6 +713,11 @@ class TimesBlock(nn.Module):
         self.period_selector: FFTPeriodSelector | None = None
         self._period_calls: int = 0
         self._vec_calls: int = 0
+        self.block_index: int | None = None
+        self._last_raw_period_count: int = 0
+        self._last_valid_period_count: int = 0
+        self._last_group_count: int = 0
+        self._last_loop_iterations: int = 0
 
     def _desired_memory_format(self) -> torch.memory_format:
         fmt = os.getenv("TIMESBLOCK_MEMORY_FORMAT", "NHWC")
@@ -468,20 +874,47 @@ class TimesBlock(nn.Module):
             torch.bfloat16 if use_autocast and x.dtype == torch.bfloat16 else torch.float16
         )
 
+        selector = self.period_selector
+        min_period = getattr(selector, "min_period_threshold", None)
+        max_period = getattr(selector, "pmax", None)
+        freq_indices = getattr(selector, "last_frequency_indices", None)
+        grouper = PeriodGrouper(
+            periods,
+            amplitudes,
+            seq_len=L,
+            min_period=min_period,
+            max_period=max_period,
+            block_index=self.block_index,
+            freq_indices=freq_indices,
+        )
+        group_result = grouper.group()
+        self._last_raw_period_count = int(periods.numel())
+        self._last_valid_period_count = int(group_result.valid_mask.sum().item())
+        self._last_group_count = int(group_result.periods.numel())
+        if group_result.periods.numel() == 0:
+            self._last_loop_iterations = 0
+            return None
+
         residuals: list[torch.Tensor] = []
         valid_indices: list[int] = []
 
-        for idx in range(periods.numel()):
-            period = int(periods[idx].item())
+        conv_iterations = 0
+
+        grouped_periods = group_result.periods
+        grouped_pad = group_result.pad_lengths
+        grouped_cycles = group_result.cycles
+
+        for idx in range(grouped_periods.numel()):
+            period = int(grouped_periods[idx].item())
             if period <= 0:
                 continue
-            pad_len = (-L) % period
+            pad_len = int(grouped_pad[idx].item()) if grouped_pad.numel() > idx else (-L) % period
             if pad_len > 0:
                 grid_source = F.pad(x_perm, (0, pad_len))
             else:
                 grid_source = x_perm
             total_len = grid_source.size(-1)
-            cycles = total_len // period
+            cycles = int(grouped_cycles[idx].item()) if grouped_cycles.numel() > idx else total_len // period
             if cycles < 2:
                 continue
             grid = grid_source.view(B, C, cycles, period)
@@ -508,9 +941,15 @@ class TimesBlock(nn.Module):
             delta = delta_fp32.to(dtype=dtype) if delta_fp32.dtype != dtype else delta_fp32
             residuals.append(delta)
             valid_indices.append(idx)
+            conv_iterations += 1
 
+        self._last_loop_iterations = conv_iterations
         return self._combine_period_residuals(
-            residuals, amplitudes, valid_indices, B, periods
+            residuals,
+            group_result.logits,
+            valid_indices,
+            B,
+            group_result.periods,
         )
 
     def _period_conv_bucketed_slicing(
@@ -529,54 +968,49 @@ class TimesBlock(nn.Module):
         autocast_dtype = (
             torch.bfloat16 if use_autocast and x.dtype == torch.bfloat16 else torch.float16
         )
-        uniq, inv = torch.unique(periods_flat, sorted=True, return_inverse=True)
-        if uniq.numel() == 0:
-            return None
-
-        positive_mask = uniq > 0
-        if not torch.any(positive_mask):
-            return None
-
-        uniq_positive = uniq[positive_mask]
-        L_tensor = torch.tensor(L, device=periods_flat.device, dtype=periods_flat.dtype)
-        pad_lengths_positive = torch.remainder(-L_tensor, uniq_positive)
-        total_lengths_positive = L_tensor + pad_lengths_positive
-        cycles_positive = total_lengths_positive // uniq_positive
-        valid_positive_mask = cycles_positive >= 2
-        if not torch.any(valid_positive_mask):
-            return None
-
-        valid_mask = torch.zeros_like(positive_mask)
-        valid_mask[positive_mask] = valid_positive_mask
-
-        uniq_valid = uniq[valid_mask]
-        pad_valid = pad_lengths_positive[valid_positive_mask]
-        cycles_valid = cycles_positive[valid_positive_mask]
-
-        remap = torch.full((uniq.numel(),), -1, dtype=inv.dtype, device=inv.device)
-        remap[valid_mask] = torch.arange(
-            uniq_valid.numel(), device=inv.device, dtype=inv.dtype
+        selector = self.period_selector
+        min_period = getattr(selector, "min_period_threshold", None)
+        max_period = getattr(selector, "pmax", None)
+        freq_indices = getattr(selector, "last_frequency_indices", None)
+        grouper = PeriodGrouper(
+            periods_flat,
+            amplitudes,
+            seq_len=L,
+            min_period=min_period,
+            max_period=max_period,
+            block_index=self.block_index,
+            freq_indices=freq_indices,
         )
-        inv_mapped = remap[inv]
-        valid_k_mask = inv_mapped >= 0
-        if not torch.any(valid_k_mask):
+        group_result = grouper.group()
+        self._last_raw_period_count = int(periods_flat.numel())
+        self._last_valid_period_count = int(group_result.valid_mask.sum().item())
+        self._last_group_count = int(group_result.periods.numel())
+        self._last_loop_iterations = 0
+        if group_result.periods.numel() == 0:
             return None
 
         amp = amplitudes
         if amp.dim() == 1:
             amp = amp.view(1, -1).expand(B, -1)
-        amp_valid = amp[:, valid_k_mask]
+        mapping = group_result.mapping
+        valid_mask = mapping >= 0
+        if not torch.any(valid_mask):
+            return None
+        amp_valid = amp[:, valid_mask]
         softmax_vals = F.softmax(amp_valid.to(torch.float32), dim=1).to(amp_valid.dtype)
 
-        inv_valid = inv_mapped[valid_k_mask]
         agg_weights = torch.zeros(
-            amp_valid.size(0),
-            uniq_valid.numel(),
+            softmax_vals.size(0),
+            group_result.periods.numel(),
             device=softmax_vals.device,
             dtype=softmax_vals.dtype,
         )
-        scatter_index = inv_valid.view(1, -1).expand(amp_valid.size(0), -1)
+        scatter_index = mapping[valid_mask].view(1, -1).expand(softmax_vals.size(0), -1)
         agg_weights.scatter_add_(1, scatter_index, softmax_vals)
+
+        pad_valid = group_result.pad_lengths
+        cycles_valid = group_result.cycles
+        periods_grouped = group_result.periods
 
         max_pad = int(pad_valid.max().item()) if pad_valid.numel() > 0 else 0
         if max_pad > 0:
@@ -590,17 +1024,17 @@ class TimesBlock(nn.Module):
             try:
                 bucket_limit = max(1, int(bucket_limit_env))
             except ValueError:
-                bucket_limit = uniq_valid.numel()
+                bucket_limit = periods_grouped.numel()
         else:
-            bucket_limit = uniq_valid.numel()
-        bucket_limit = max(1, min(bucket_limit, uniq_valid.numel()))
+            bucket_limit = periods_grouped.numel()
+        bucket_limit = max(1, min(bucket_limit, periods_grouped.numel()))
 
-        residuals: list[torch.Tensor] = [None] * uniq_valid.numel()
+        residuals: list[torch.Tensor] = [None] * periods_grouped.numel()
         self._vec_calls += 1
-        for start in range(0, uniq_valid.numel(), bucket_limit):
-            end = min(start + bucket_limit, uniq_valid.numel())
+        for start in range(0, periods_grouped.numel(), bucket_limit):
+            end = min(start + bucket_limit, periods_grouped.numel())
             for idx in range(start, end):
-                period_val = int(uniq_valid[idx].item())
+                period_val = int(periods_grouped[idx].item())
                 pad_len = int(pad_valid[idx].item())
                 cycles = int(cycles_valid[idx].item())
                 total_len = L + pad_len
@@ -1018,7 +1452,8 @@ class TimesNet(nn.Module):
                 for _ in range(self.n_layers)
             ]
         )
-        for block in self.blocks:
+        for idx, block in enumerate(self.blocks):
+            block.block_index = idx
             object.__setattr__(block, "period_selector", self.period_selector)
         self.residual_dropout = nn.Dropout(self.dropout)
         self.layer_norm: nn.LayerNorm | None = None
