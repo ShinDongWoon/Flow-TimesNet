@@ -152,3 +152,61 @@ def test_times_block_matches_reference_impl():
     expected = _reference_times_block(x, block, periods, amplitudes)
     out = block(x)
     assert torch.allclose(out, expected, atol=1e-6)
+
+
+def test_times_block_identity_when_flags_disabled(monkeypatch):
+    torch.manual_seed(4)
+    monkeypatch.delenv("TIMES_PERIOD_BINNING", raising=False)
+    monkeypatch.delenv("TIMES_PERIOD_MAX_UNIQ", raising=False)
+    block = TimesBlock(
+        d_model=3,
+        kernel_set=[(3, 3)],
+        dropout=0.0,
+        activation="gelu",
+    )
+    selector = StaticSelector(periods=[4, 4, 4, 8], amplitudes=[[1.2, -0.7, 0.3, 0.1]])
+    object.__setattr__(block, "period_selector", selector)
+
+    x = torch.randn(2, 24, 3)
+    block._build_layers(x.size(-1), device=x.device, dtype=x.dtype)
+    periods, amps = selector(x)
+
+    monkeypatch.setenv("TIMESBLOCK_VEC_DISABLE", "1")
+    expected = _reference_times_block(x, block, periods, amps)
+    out = block(x)
+    monkeypatch.delenv("TIMESBLOCK_VEC_DISABLE", raising=False)
+
+    assert torch.allclose(out, expected, atol=1e-6, rtol=1e-6)
+    assert block._last_group_count == 2
+
+
+def test_times_block_convolution_iterations_drop(monkeypatch):
+    torch.manual_seed(5)
+    block = TimesBlock(
+        d_model=2,
+        kernel_set=[(3, 3)],
+        dropout=0.0,
+        activation="gelu",
+    )
+    selector = StaticSelector(
+        periods=[3, 4, 6, 12], amplitudes=[[0.5, -0.2, 1.0, -1.5]]
+    )
+    object.__setattr__(block, "period_selector", selector)
+
+    x = torch.randn(1, 48, 2)
+
+    monkeypatch.setenv("TIMESBLOCK_VEC_DISABLE", "1")
+    block(x)
+    baseline = block._last_loop_iterations
+    monkeypatch.delenv("TIMESBLOCK_VEC_DISABLE", raising=False)
+
+    monkeypatch.setenv("TIMESBLOCK_VEC_DISABLE", "1")
+    monkeypatch.setenv("TIMES_PERIOD_MAX_UNIQ", "2")
+    block(x)
+    reduced = block._last_loop_iterations
+    monkeypatch.delenv("TIMESBLOCK_VEC_DISABLE", raising=False)
+    monkeypatch.delenv("TIMES_PERIOD_MAX_UNIQ", raising=False)
+
+    assert baseline > 0
+    assert reduced <= 2
+    assert reduced < baseline

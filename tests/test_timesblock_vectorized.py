@@ -7,7 +7,7 @@ from torch import nn
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
-from timesnet_forecast.models.timesnet import TimesBlock
+from timesnet_forecast.models.timesnet import PeriodGrouper, TimesBlock
 
 
 class FixedSelector(nn.Module):
@@ -127,3 +127,43 @@ def test_duplicate_periods_aggregate_once(monkeypatch):
 
     assert block._vec_calls >= 1
     assert torch.allclose(loop_out, vec_out, atol=1e-5, rtol=1e-5)
+
+
+def test_period_grouper_preserves_weight_mass(monkeypatch):
+    torch.manual_seed(6)
+    monkeypatch.setenv("TIMES_PERIOD_MAX_UNIQ", "2")
+    monkeypatch.setenv("TIMES_PERIOD_BINNING", "log:2")
+    periods = torch.tensor([3, 4, 6, 12], dtype=torch.long)
+    amplitudes = torch.tensor(
+        [[0.5, -0.2, 1.0, -1.5], [1.3, 0.1, -0.4, -2.0]], dtype=torch.float32
+    )
+    grouper = PeriodGrouper(
+        periods,
+        amplitudes,
+        seq_len=48,
+        min_period=1,
+        max_period=48,
+    )
+    result = grouper.group()
+    mapping = result.mapping
+    valid_mask = mapping >= 0
+    assert result.periods.numel() <= 2
+    assert torch.any(valid_mask)
+
+    amp_valid = amplitudes[:, valid_mask]
+    weights = torch.softmax(amp_valid, dim=1)
+    grouped_weights = torch.zeros(
+        amplitudes.size(0),
+        result.periods.numel(),
+        dtype=weights.dtype,
+    )
+    scatter_index = mapping[valid_mask].view(1, -1).expand(weights.size(0), -1)
+    grouped_weights.scatter_add_(1, scatter_index, weights)
+
+    logits_weights = torch.softmax(result.logits, dim=1)
+    assert torch.allclose(grouped_weights, logits_weights, atol=1e-6, rtol=1e-6)
+    weight_sums = grouped_weights.sum(dim=1)
+    assert torch.allclose(weight_sums, torch.ones_like(weight_sums))
+
+    monkeypatch.delenv("TIMES_PERIOD_MAX_UNIQ", raising=False)
+    monkeypatch.delenv("TIMES_PERIOD_BINNING", raising=False)
