@@ -68,14 +68,14 @@ model:
   d_ff: 1024
   n_layers: 3
   dropout: 0.1
-  k_periods: 2
+  k_periods: 3
   min_period_threshold: 7  # 최소 주기 하한선
   kernel_set:
     - [3, 3]
     - [5, 5]
     - [7, 7]
   activation: "gelu"
-  bottleneck_ratio: 3.0      # Bottleneck width ≈ min(in,out)/ratio (>1 contracts, <1 expands)
+  bottleneck_ratio: 4.0      # Bottleneck width ≈ min(in,out)/ratio (>1 contracts, <1 expands)
   use_embedding_norm: true
   id_embed_dim: 0           # Per-series identifier embedding dimension (set to 0 to disable)
   static_proj_dim: 32        # Projection size for static covariates (set to null to keep input dim)
