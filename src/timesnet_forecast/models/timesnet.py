@@ -33,6 +33,21 @@ def _module_to_reference(module: nn.Module, reference: torch.Tensor) -> nn.Modul
     return module.to(device=reference.device, dtype=target_dtype)
 
 
+def _should_autocast_convs(reference: torch.Tensor | None) -> bool:
+    """Return ``True`` when CUDA autocast should be used for convolutions."""
+
+    flag = os.getenv("TIMES_MP_CONV")
+    if not flag or flag.strip().lower() in {"0", "false", "off"}:
+        return False
+    if reference is None or not reference.is_cuda:
+        return False
+    if reference.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if not torch.cuda.is_available():
+        return False
+    return True
+
+
 class FFTPeriodSelector(nn.Module):
     """Shared dominant period selector based on FFT magnitude spectra."""
 
@@ -413,12 +428,8 @@ class TimesBlock(nn.Module):
             amp = amp.view(1, -1).expand(batch_size, -1)
         amp = amp[:, valid_indices] if amp.numel() > 0 else amp
         if amp.numel() > 0:
-            softmax_dtype = amp.dtype
-            if softmax_dtype in (torch.float16, torch.bfloat16):
-                amp_for_softmax = amp.to(dtype=torch.float32)
-                weights_float = F.softmax(amp_for_softmax, dim=1)
-            else:
-                weights_float = F.softmax(amp, dim=1)
+            amp_for_softmax = amp.to(dtype=torch.float32)
+            weights_float = F.softmax(amp_for_softmax, dim=1)
             should_verify = False
             if periods is not None and valid_indices:
                 idx_tensor = torch.as_tensor(
@@ -450,11 +461,13 @@ class TimesBlock(nn.Module):
         self, x: torch.Tensor, periods: torch.Tensor, amplitudes: torch.Tensor
     ) -> torch.Tensor | None:
         B, L, C = x.shape
+        dtype = x.dtype
         x_perm = x.permute(0, 2, 1).contiguous()
-        if x_perm.dtype in (torch.float16, torch.bfloat16):
-            x_perm_fp32 = x_perm.to(torch.float32)
-        else:
-            x_perm_fp32 = x_perm
+        use_autocast = _should_autocast_convs(x)
+        autocast_dtype = (
+            torch.bfloat16 if use_autocast and x.dtype == torch.bfloat16 else torch.float16
+        )
+
         residuals: list[torch.Tensor] = []
         valid_indices: list[int] = []
 
@@ -464,25 +477,35 @@ class TimesBlock(nn.Module):
                 continue
             pad_len = (-L) % period
             if pad_len > 0:
-                grid_source = F.pad(x_perm_fp32, (0, pad_len))
+                grid_source = F.pad(x_perm, (0, pad_len))
             else:
-                grid_source = x_perm_fp32
+                grid_source = x_perm
             total_len = grid_source.size(-1)
             cycles = total_len // period
             if cycles < 2:
                 continue
-            grid_fp32 = grid_source.view(B, C, cycles, period)
-            with torch.amp.autocast(device_type="cuda", enabled=False):
-                conv_out32 = self.inception(grid_fp32)
-            delta_fp32 = conv_out32 - grid_fp32
+            grid = grid_source.view(B, C, cycles, period)
+            if use_autocast:
+                conv_input = grid
+            else:
+                conv_input = grid.to(torch.float32) if grid.dtype != torch.float32 else grid
+            with torch.amp.autocast(
+                device_type="cuda", enabled=use_autocast, dtype=autocast_dtype
+            ):
+                conv_out = self.inception(conv_input)
+            conv_out_fp32 = (
+                conv_out.to(torch.float32) if conv_out.dtype != torch.float32 else conv_out
+            )
+            if use_autocast:
+                grid_fp32 = grid.to(torch.float32)
+            else:
+                grid_fp32 = conv_input
+            delta_fp32 = conv_out_fp32 - grid_fp32
             delta_fp32 = delta_fp32.view(B, C, total_len)
             delta_fp32 = delta_fp32.permute(0, 2, 1)
             if pad_len > 0:
                 delta_fp32 = delta_fp32[:, :-pad_len, :]
-            if delta_fp32.dtype != x.dtype:
-                delta = delta_fp32.to(dtype=x.dtype)
-            else:
-                delta = delta_fp32
+            delta = delta_fp32.to(dtype=dtype) if delta_fp32.dtype != dtype else delta_fp32
             residuals.append(delta)
             valid_indices.append(idx)
 
@@ -502,10 +525,10 @@ class TimesBlock(nn.Module):
             return self._period_conv_loop(x, periods, amplitudes)
 
         x_perm = x.permute(0, 2, 1).contiguous()
-        if x_perm.dtype in (torch.float16, torch.bfloat16):
-            x_perm_fp32 = x_perm.to(torch.float32)
-        else:
-            x_perm_fp32 = x_perm
+        use_autocast = _should_autocast_convs(x)
+        autocast_dtype = (
+            torch.bfloat16 if use_autocast and x.dtype == torch.bfloat16 else torch.float16
+        )
         uniq, inv = torch.unique(periods_flat, sorted=True, return_inverse=True)
         if uniq.numel() == 0:
             return None
@@ -543,12 +566,7 @@ class TimesBlock(nn.Module):
         if amp.dim() == 1:
             amp = amp.view(1, -1).expand(B, -1)
         amp_valid = amp[:, valid_k_mask]
-        if amp_valid.dtype in (torch.float16, torch.bfloat16):
-            softmax_vals = F.softmax(amp_valid.to(torch.float32), dim=1).to(
-                amp_valid.dtype
-            )
-        else:
-            softmax_vals = F.softmax(amp_valid, dim=1)
+        softmax_vals = F.softmax(amp_valid.to(torch.float32), dim=1).to(amp_valid.dtype)
 
         inv_valid = inv_mapped[valid_k_mask]
         agg_weights = torch.zeros(
@@ -562,9 +580,9 @@ class TimesBlock(nn.Module):
 
         max_pad = int(pad_valid.max().item()) if pad_valid.numel() > 0 else 0
         if max_pad > 0:
-            x_padded_fp32 = F.pad(x_perm_fp32, (0, max_pad))
+            x_padded = F.pad(x_perm, (0, max_pad))
         else:
-            x_padded_fp32 = x_perm_fp32
+            x_padded = x_perm
 
         desired_format = self._desired_memory_format()
         bucket_limit_env = os.getenv("TIMESBLOCK_BUCKET_MAX")
@@ -586,17 +604,29 @@ class TimesBlock(nn.Module):
                 pad_len = int(pad_valid[idx].item())
                 cycles = int(cycles_valid[idx].item())
                 total_len = L + pad_len
-                x_slice_fp32 = x_padded_fp32.narrow(-1, 0, total_len)
-                grid_fp32 = x_slice_fp32.reshape(B, C, cycles, period_val)
+                x_slice = x_padded.narrow(-1, 0, total_len)
+                grid = x_slice.reshape(B, C, cycles, period_val)
                 if desired_format == torch.channels_last:
-                    grid_fp32 = grid_fp32.contiguous(
-                        memory_format=torch.channels_last
-                    )
+                    grid = grid.contiguous(memory_format=torch.channels_last)
                 else:
-                    grid_fp32 = grid_fp32.contiguous()
-                with torch.amp.autocast(device_type="cuda", enabled=False):
-                    conv_out32 = self.inception(grid_fp32)
-                delta_fp32 = conv_out32 - grid_fp32
+                    grid = grid.contiguous()
+                if use_autocast:
+                    conv_input = grid
+                else:
+                    conv_input = (
+                        grid.to(torch.float32) if grid.dtype != torch.float32 else grid
+                    )
+                with torch.amp.autocast(
+                    device_type="cuda", enabled=use_autocast, dtype=autocast_dtype
+                ):
+                    conv_out = self.inception(conv_input)
+                conv_out_fp32 = (
+                    conv_out.to(torch.float32)
+                    if conv_out.dtype != torch.float32
+                    else conv_out
+                )
+                grid_fp32 = grid.to(torch.float32) if use_autocast else conv_input
+                delta_fp32 = conv_out_fp32 - grid_fp32
                 delta_fp32 = delta_fp32.contiguous()
                 delta_fp32 = delta_fp32.view(B, C, cycles * period_val)[..., :L]
                 delta_fp32 = delta_fp32.reshape(B, C, L)
@@ -680,10 +710,57 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.size(-1) != self.weight.numel():
             raise ValueError("RMSNorm dimension mismatch")
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        orig_dtype = x.dtype
+        if orig_dtype in (torch.float16, torch.bfloat16):
+            calc_dtype = torch.float32
+        else:
+            calc_dtype = orig_dtype
+        x_calc = x.to(calc_dtype)
+        variance = x_calc.pow(2).mean(dim=-1, keepdim=True)
         scale = torch.rsqrt(variance + self.eps)
-        normed = x * scale
-        return normed * self.weight + self.bias
+        normed = x_calc * scale
+        weight = self.weight.to(calc_dtype)
+        bias = self.bias.to(calc_dtype)
+        output = normed * weight + bias
+        return output.to(dtype=orig_dtype)
+
+
+def _apply_layer_norm(norm: nn.LayerNorm, x: torch.Tensor) -> torch.Tensor:
+    """Apply ``LayerNorm`` using functional FP32 reductions when needed."""
+
+    orig_dtype = x.dtype
+    calc_dtype = torch.float32 if orig_dtype in (torch.float16, torch.bfloat16) else orig_dtype
+    x_calc = x if x.dtype == calc_dtype else x.to(calc_dtype)
+    weight = norm.weight
+    bias = norm.bias
+    weight_calc = weight if weight is None or weight.dtype == calc_dtype else weight.to(calc_dtype)
+    bias_calc = bias if bias is None or bias.dtype == calc_dtype else bias.to(calc_dtype)
+    normed = F.layer_norm(
+        x_calc,
+        norm.normalized_shape,
+        weight=weight_calc,
+        bias=bias_calc,
+        eps=norm.eps,
+    )
+    if normed.dtype != orig_dtype:
+        normed = normed.to(orig_dtype)
+    return normed
+
+
+def _apply_rms_norm(norm: RMSNorm, x: torch.Tensor) -> torch.Tensor:
+    """Apply ``RMSNorm`` deferring to the module implementation."""
+
+    return norm(x)
+
+
+def _apply_norm_module(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Apply ``module`` with FP32-aware helpers when possible."""
+
+    if isinstance(module, nn.LayerNorm):
+        return _apply_layer_norm(module, x)
+    if isinstance(module, RMSNorm):
+        return _apply_rms_norm(module, x)
+    return module(x)
 
 
 class DataEmbedding(nn.Module):
@@ -794,7 +871,7 @@ class DataEmbedding(nn.Module):
 
         if self.embed_norm_mode == "decoupled":
             assert self.aux_norm is not None and isinstance(self.gate, torch.Tensor)
-            aux_normed = self.aux_norm(aux)
+            aux_normed = _apply_layer_norm(self.aux_norm, aux)
             gate = self.gate
             if gate.dtype != value.dtype:
                 gate = gate.to(value.dtype)
@@ -803,10 +880,10 @@ class DataEmbedding(nn.Module):
             out = value + aux
             if self.embed_norm_mode == "layer":
                 assert self.norm is not None
-                out = self.norm(out)
+                out = _apply_layer_norm(self.norm, out)
             elif self.embed_norm_mode == "rms":
                 assert self.norm is not None
-                out = self.norm(out)
+                out = _apply_rms_norm(self.norm, out)
         out = self.dropout(out)
 
         if x.ndim == 4:
@@ -1407,7 +1484,7 @@ class TimesNet(nn.Module):
                 )
             )
             if self.static_norm is not None:
-                static_proj = self.static_norm(static_proj)
+                static_proj = _apply_norm_module(self.static_norm, static_proj)
             context_components.append(static_proj)
 
         if self.series_embedding is not None and self.id_embed_dim > 0:
@@ -1457,7 +1534,7 @@ class TimesNet(nn.Module):
         if context_components:
             context_concat = torch.cat(context_components, dim=-1)
             if self.context_norm is not None:
-                context_concat = self.context_norm(context_concat)
+                context_concat = _apply_norm_module(self.context_norm, context_concat)
             if (
                 self.use_zero_mean_context
                 and self.context_coeff is not None
@@ -1539,7 +1616,7 @@ class TimesNet(nn.Module):
                     dtype=self.late_bias_head.weight.dtype,
                     device=self.late_bias_head.weight.device,
                 )
-                c = self.late_bias_norm(c)
+                c = _apply_norm_module(self.late_bias_norm, c)
                 bias = self.late_bias_head(c)
                 bias = bias.permute(0, 2, 1).contiguous()
                 gate = self.late_bias_gate.to(
@@ -1561,7 +1638,7 @@ class TimesNet(nn.Module):
                 updated = block(seq_features)
             delta = updated - seq_features
             seq_features = seq_features + self.residual_dropout(delta)
-            seq_features = self.layer_norm(seq_features)
+            seq_features = _apply_norm_module(self.layer_norm, seq_features)
 
         features_final = seq_features
         features_bn = features_final.permute(0, 2, 1).contiguous()
