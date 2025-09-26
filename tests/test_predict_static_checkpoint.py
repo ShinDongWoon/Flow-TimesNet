@@ -22,7 +22,7 @@ def test_predict_once_restores_static_checkpoint(tmp_path):
     torch.manual_seed(0)
     np.random.seed(0)
 
-    ids = ["A", "B"]
+    ids = ["B", "A"]
     input_len = 4
     pred_len = 2
 
@@ -49,11 +49,34 @@ def test_predict_once_restores_static_checkpoint(tmp_path):
         id_embed_dim=4,
         static_proj_dim=3,
         static_layernorm=True,
+        min_sigma_vector=[0.05, 0.1],
     )
 
-    train_warmup = torch.randn(1, input_len, len(ids))
+    warmup_series = torch.zeros(1, input_len, 1)
+    warmup_static = static_features[:1, :]
+    warmup_ids = series_ids[:1]
+    full_sigma = None
+    if isinstance(model.min_sigma_vector, torch.Tensor) and model.min_sigma_vector.numel() > 0:
+        full_sigma = model.min_sigma_vector.detach().clone()
+        model.min_sigma_vector = model.min_sigma_vector[..., :1]
     with torch.no_grad():
-        model(train_warmup, series_static=static_features, series_ids=series_ids)
+        model(warmup_series, series_static=warmup_static, series_ids=warmup_ids)
+    if full_sigma is not None:
+        model.min_sigma_vector = full_sigma.clone()
+    if isinstance(model.series_embedding, torch.nn.Embedding):
+        current_vocab = int(model.series_embedding.num_embeddings)
+        required_vocab = len(ids)
+        if required_vocab > current_vocab:
+            new_embed = torch.nn.Embedding(
+                required_vocab,
+                model.series_embedding.embedding_dim,
+            )
+            with torch.no_grad():
+                new_embed.weight.zero_()
+                new_embed.weight[:current_vocab] = model.series_embedding.weight
+            model.series_embedding = new_embed
+        model._series_id_vocab = required_vocab
+        model._series_id_reference = torch.arange(required_vocab, dtype=torch.long)
 
     art_dir = tmp_path / "artifacts"
     art_dir.mkdir()
@@ -79,16 +102,17 @@ def test_predict_once_restores_static_checkpoint(tmp_path):
     dates = pd.date_range("2024-01-01", periods=input_len, freq="D")
     series_a = np.linspace(0.1, 0.4, input_len, dtype=np.float32)
     series_b = np.linspace(1.0, 1.3, input_len, dtype=np.float32)
-    values = np.stack([series_a, series_b], axis=1)
+    values_by_id = {"A": series_a, "B": series_b}
+    data_order = ["A", "B"]
 
     rows = []
     for day_idx, ts in enumerate(dates):
-        for series_idx, series_name in enumerate(ids):
+        for series_name in data_order:
             rows.append(
                 {
                     "date": ts.strftime("%Y-%m-%d"),
                     "series_id": series_name,
-                    "value": float(values[day_idx, series_idx]),
+                    "value": float(values_by_id[series_name][day_idx]),
                 }
             )
     pd.DataFrame(rows).to_csv(test_dir / "TEST_00.csv", index=False)
@@ -158,13 +182,28 @@ def test_predict_once_restores_static_checkpoint(tmp_path):
         yaml.safe_dump(config_payload, f, allow_unicode=True)
 
     model.eval()
+    id_position_map = {sid: idx for idx, sid in enumerate(ids)}
+    gather_positions = [id_position_map[sid] for sid in data_order]
+    xb_expected_np = np.stack(
+        [values_by_id[sid] for sid in data_order], axis=0
+    ).astype(np.float32)
+    xb_expected = torch.from_numpy(xb_expected_np[:, :, None])
+    static_expected = static_features[gather_positions].unsqueeze(1)
+    ids_expected = torch.tensor(gather_positions, dtype=torch.long).view(-1, 1)
     with torch.no_grad():
         expected_mu, _ = model(
-            torch.from_numpy(values).unsqueeze(0),
-            series_static=static_features,
-            series_ids=series_ids,
+            xb_expected,
+            series_static=static_expected,
+            series_ids=ids_expected,
         )
-    expected = np.clip(expected_mu.squeeze(0).numpy(), 0.0, None)
+    expected_partial = expected_mu.squeeze(-1).numpy()
+    if expected_partial.ndim == 1:
+        expected_partial = expected_partial.reshape(1, -1)
+    expected = np.zeros((pred_len, len(ids)), dtype=np.float32)
+    expected[:, np.asarray(gather_positions, dtype=np.int64)] = expected_partial.T
+    expected = np.clip(expected, 0.0, None)
+    if full_sigma is not None:
+        model.min_sigma_vector = full_sigma.clone()
 
     out_path = predict_once(cfg)
 
