@@ -468,7 +468,10 @@ class TimesBlock(nn.Module):
             if cycles < 2:
                 continue
             grid = x_pad.view(B, C, cycles, period)
-            conv_out = self.inception(grid)
+            grid_dtype = grid.dtype
+            with torch.amp.autocast(device_type="cuda", enabled=False):
+                conv_out32 = self.inception(grid.to(torch.float32))
+            conv_out = conv_out32.to(grid_dtype)
             delta = conv_out - grid
             delta = delta.view(B, C, total_len)
             delta = delta.permute(0, 2, 1)
@@ -579,7 +582,10 @@ class TimesBlock(nn.Module):
                     grid_2d = grid.contiguous(memory_format=torch.channels_last)
                 else:
                     grid_2d = grid.contiguous()
-                conv_out = self.inception(grid_2d)
+                grid_dtype = grid_2d.dtype
+                with torch.amp.autocast(device_type="cuda", enabled=False):
+                    conv_out32 = self.inception(grid_2d.to(torch.float32))
+                conv_out = conv_out32.to(grid_dtype)
                 delta = conv_out - grid_2d
                 delta = delta.contiguous()
                 delta = delta.view(B, C, cycles * period_val)[..., :L]
@@ -1563,14 +1569,22 @@ class TimesNet(nn.Module):
         mu_hidden = (baseline_bn + mu_delta_bn).permute(0, 2, 1).contiguous()
         rate_preact = self.mu_head(mu_hidden) + history_tail
         rate_preact = _apply_late_bias(rate_preact)
-        rate = F.softplus(rate_preact) + 1e-6
+        rate = (
+            F.softplus(rate_preact.to(torch.float32), beta=1.0, threshold=20)
+            .to(rate_preact.dtype)
+            + 1e-6
+        )
         assert self.sigma_proj is not None  # for type checkers
         sigma_bn = self.sigma_proj(baseline_bn)
         sigma_hidden = sigma_bn.permute(0, 2, 1).contiguous()
         assert self.sigma_head is not None  # for type checkers
         sigma_head = self.sigma_head(sigma_hidden)
-        floor = self._dispersion_floor_from_ref(rate)
-        dispersion = F.softplus(sigma_head) + floor + 1e-6
+        sigma_sp = (
+            F.softplus(sigma_head.to(torch.float32), beta=1.0, threshold=20)
+            .to(sigma_head.dtype)
+        )
+        floor = self._dispersion_floor_from_ref(rate).to(sigma_sp.dtype)
+        dispersion = sigma_sp + floor + 1e-6
         if torch.any(~torch.isfinite(rate)) or torch.any(rate <= 0):
             raise RuntimeError("Predicted rate must be finite and strictly positive")
         if torch.any(~torch.isfinite(dispersion)) or torch.any(dispersion <= 0):
