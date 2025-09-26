@@ -497,17 +497,25 @@ class TimesBlock(nn.Module):
         if uniq.numel() == 0:
             return None
 
-        L_tensor = torch.tensor(L, device=periods_flat.device, dtype=periods_flat.dtype)
-        pad_lengths_all = torch.remainder(-L_tensor, uniq)
-        total_lengths_all = L_tensor + pad_lengths_all
-        cycles_all = total_lengths_all // uniq
-        valid_mask = (uniq > 0) & (cycles_all >= 2)
-        if not torch.any(valid_mask):
+        positive_mask = uniq > 0
+        if not torch.any(positive_mask):
             return None
 
+        uniq_positive = uniq[positive_mask]
+        L_tensor = torch.tensor(L, device=periods_flat.device, dtype=periods_flat.dtype)
+        pad_lengths_positive = torch.remainder(-L_tensor, uniq_positive)
+        total_lengths_positive = L_tensor + pad_lengths_positive
+        cycles_positive = total_lengths_positive // uniq_positive
+        valid_positive_mask = cycles_positive >= 2
+        if not torch.any(valid_positive_mask):
+            return None
+
+        valid_mask = torch.zeros_like(positive_mask)
+        valid_mask[positive_mask] = valid_positive_mask
+
         uniq_valid = uniq[valid_mask]
-        pad_valid = pad_lengths_all[valid_mask]
-        cycles_valid = cycles_all[valid_mask]
+        pad_valid = pad_lengths_positive[valid_positive_mask]
+        cycles_valid = cycles_positive[valid_positive_mask]
 
         remap = torch.full((uniq.numel(),), -1, dtype=inv.dtype, device=inv.device)
         remap[valid_mask] = torch.arange(
