@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 from contextlib import nullcontext
-from typing import Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -730,7 +730,14 @@ def _apply_layer_norm(norm: nn.LayerNorm, x: torch.Tensor) -> torch.Tensor:
 
     orig_dtype = x.dtype
     if orig_dtype in (torch.float16, torch.bfloat16):
-        normed = norm(x.to(torch.float32))
+        module_dtype: Optional[torch.dtype] = None
+        if norm.weight is not None:
+            module_dtype = norm.weight.dtype
+        elif norm.bias is not None:
+            module_dtype = norm.bias.dtype
+        if module_dtype is None or module_dtype in (torch.float16, torch.bfloat16):
+            return norm(x)
+        normed = norm(x.to(dtype=module_dtype))
         return normed.to(dtype=orig_dtype)
     return norm(x)
 
