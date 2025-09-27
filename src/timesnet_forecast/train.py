@@ -179,6 +179,72 @@ def _time_frequency_from_dataset(dataset) -> str | None:
     return None
 
 
+def _periods_to_day_counts(periods: List[int], freq: str | None) -> List[Optional[float]]:
+    if not freq:
+        return [None for _ in periods]
+    try:
+        offset = pd.tseries.frequencies.to_offset(freq)
+    except (TypeError, ValueError):
+        return [None for _ in periods]
+
+    nanos: Optional[int] = None
+    try:
+        nanos = int(getattr(offset, "nanos"))
+    except (TypeError, AttributeError, ValueError):
+        nanos = None
+
+    if not nanos:
+        delta = getattr(offset, "delta", None)
+        if delta is not None:
+            try:
+                nanos = int(pd.to_timedelta(delta).value)
+            except (ValueError, TypeError):
+                nanos = None
+
+    if not nanos or nanos == 0:
+        return [None for _ in periods]
+
+    day_scale = nanos / pd.Timedelta(days=1).value
+    return [period * day_scale for period in periods]
+
+
+def _log_selected_periods(
+    model: "TimesNet", freq: str | None, epoch: int, batch: int
+) -> None:
+    selector = getattr(model, "period_selector", None)
+    if selector is None:
+        return
+    periods_tensor = getattr(selector, "last_selected_periods", None)
+    if not isinstance(periods_tensor, torch.Tensor) or periods_tensor.numel() == 0:
+        return
+
+    periods_unique = (
+        torch.unique(periods_tensor.detach().to(device="cpu", dtype=torch.long))
+        .tolist()
+    )
+    if not periods_unique:
+        return
+
+    periods_unique.sort()
+    day_counts = _periods_to_day_counts(periods_unique, freq)
+
+    parts: List[str] = []
+    for period, days in zip(periods_unique, day_counts):
+        if days is None:
+            parts.append(f"{period}")
+        else:
+            if abs(days - round(days)) < 1e-6:
+                day_repr = f"{int(round(days))}"
+            else:
+                day_repr = f"{days:.2f}"
+            parts.append(f"{period} (~{day_repr}d)")
+
+    message = ", ".join(parts)
+    console().print(
+        f"[cyan]Epoch {epoch} batch {batch}: selected periods {message}[/cyan]"
+    )
+
+
 def _normalize_optional(value):
     if value is None:
         return None
@@ -798,6 +864,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         "config": dict(time_feature_cfg),
         "freq": inferred_freq,
     }
+    freq_for_logging = inferred_freq
     warmup_series_static = torch.from_numpy(series_static_np).to(
         device=device, dtype=torch.float32
     )
@@ -1107,6 +1174,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                     series_static=static_w,
                     series_ids=series_ids_w,
                 )
+                if w == 0:
+                    _log_selected_periods(model, freq_for_logging, 0, w + 1)
                 nb_mask_w = negative_binomial_mask(yb_w, rate_w, dispersion_w, base_mask_w)
                 loss_w = (
                     negative_binomial_nll(
@@ -1285,6 +1354,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                 )
                 mask_true_total += mask_true_inc
                 mask_total += mask_total_inc
+                if i == 0:
+                    _log_selected_periods(model, freq_for_logging, ep, i + 1)
             else:
                 with amp_autocast(cfg["train"]["amp"] and device.type == "cuda"):
                     rate, dispersion = model(
@@ -1293,6 +1364,8 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
                         series_static=static_feat,
                         series_ids=series_idx,
                     )
+                    if i == 0:
+                        _log_selected_periods(model, freq_for_logging, ep, i + 1)
                     nb_mask_batch = negative_binomial_mask(
                         yb, rate, dispersion, base_mask_batch
                     )
