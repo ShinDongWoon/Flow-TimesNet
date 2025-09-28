@@ -35,3 +35,12 @@
   - `model.static_layernorm` toggles a `LayerNorm` after the static projection. Leaving it enabled stabilises training when mixing features with very different scales.
 - Larger embedding dimensions increase both parameter count and activation memory. The ID embedding contributes approximately `num_series × id_embed_dim` parameters (for example, 1 000 series with a width of 64 adds 64 000 weights), while the static projection introduces roughly `static_input_dim × static_proj_dim + static_proj_dim` parameters. Plan GPU memory accordingly when increasing these knobs or when enabling Optuna sweeps over them.
 - Override the new hyper-parameters via the CLI, e.g. `timesnet-forecast train --override model.id_embed_dim=16 model.static_proj_dim=null`, or include them in Optuna search spaces (`model.id_embed_dim: {choices: [0, 16, 32], type: "categorical"}`) to tune their impact automatically.
+
+## Acknowledgements
+
+This project is built upon the foundational concepts and architecture introduced in the original TimesNet paper. The core implementation of the TimesNet model is inspired by the official source code provided by the authors.
+
+- **Original Paper**: Haixu Wu, et al. "TimesNet: Temporal 2D-Variation Modeling for General Time Series Analysis." *ICLR 2023*.
+- **Official Repository**: [https://github.com/thuml/TimesNet](https://github.com/thuml/TimesNet)
+
+The original TimesNet source code is licensed under the Apache License 2.0. A copy of the license can be found in the `NOTICE` file within this repository.
