@@ -956,7 +956,9 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     # Lazily build model parameters so that downstream utilities see them
     warmup_ids_single: torch.Tensor | None
     if series_ids_default.numel() > 0:
-        warmup_ids_single = series_ids_default[:1]
+        # Use the maximum identifier so the embedding initializes capacity for all IDs.
+        max_series_id = torch.max(series_ids_default)
+        warmup_ids_single = max_series_id.reshape(1)
     else:
         warmup_ids_single = None
     warmup_kwargs = {

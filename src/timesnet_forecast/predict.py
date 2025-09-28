@@ -295,7 +295,9 @@ def predict_once(cfg: Dict) -> str:
         warmup_kwargs["series_static"] = warmup_series_static_single
     warmup_ids_single: torch.Tensor | None = None
     if full_series_ids_tensor.numel() > 0:
-        warmup_ids_single = full_series_ids_tensor[:1]
+        # Mirror training: warm up with the maximum ID to preserve embedding capacity.
+        max_series_id = torch.max(full_series_ids_tensor)
+        warmup_ids_single = max_series_id.reshape(1)
         warmup_kwargs["series_ids"] = warmup_ids_single
     if time_features_enabled and meta_dim > 0:
         warmup_kwargs["x_mark"] = torch.zeros(
