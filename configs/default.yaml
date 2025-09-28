@@ -29,7 +29,7 @@ train:
   device: "cuda"              # "cuda"|"cpu" 자동 선택 코드에서 처리
   epochs: 70
   early_stopping_patience: 10
-  batch_size: 256
+  batch_size: 128
   accumulation_steps: 1
   lr_warmup_steps: 50       # conservative warmup for unnormalized SMAPE training
   lr: 3.0e-4
@@ -64,11 +64,11 @@ model:
   mode: "direct"              # "direct"|"recursive"
   input_len: 28
   pred_len: 7
-  d_model: 256
-  d_ff: 1024
-  n_layers: 3
+  d_model: 128
+  d_ff: 512
+  n_layers: 2
   dropout: 0.1
-  k_periods: 3
+  k_periods: 2
   min_period_threshold: 7  # 최소 주기 하한선
   kernel_set:
     - [3, 3]
