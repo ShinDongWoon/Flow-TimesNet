@@ -10,8 +10,8 @@ data:
   fill_missing_dates: true
   encoding: "utf-8-sig"
   augment:
-    add_noise_std: 0.0       # 표준편차; 0이면 사용 안 함
-    time_shift: 0            # 입력 시퀀스 시작 위치 랜덤 시프트 범위
+    add_noise_std: 0.005       # 표준편차; 0이면 사용 안 함
+    time_shift: 2            # 입력 시퀀스 시작 위치 랜덤 시프트 범위
   time_features:
     enabled: true
     features: [day_of_week, day_of_month, month, day_of_year]
