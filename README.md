@@ -85,6 +85,13 @@ pip install -r requirements.txt
 ## Quickstart (CLI)
 
 ```bash
+Initiate(Colab)
+
+!git clone https://github.com/ShinDongWoon/Recursive-TimesNet.git
+%cd Recursive-TimesNet
+!pip install -r requirements.txt
+!pip install -e .
+
 # Train
 python -m timesnet_forecast.cli train \
   --config configs/default.yaml \
