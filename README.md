@@ -100,7 +100,7 @@ Minimal, fast, and expressive enough to map “who you are” → “how your co
 
 ---
 
-## 5) Batched synthesis in PyTorch (shape‑safe)
+## 5) Batched synthesis in PyTorch 
 
 Let $\texttt{basis}\in\mathbb R^{L\times R}$ (shared), $\texttt{coeff}\in\mathbb R^{B\times N\times R}$ (from embeddings), and output $\texttt{context}\in\mathbb R^{B\times L\times N}$. We compute
 
@@ -150,14 +150,14 @@ flowchart LR
 
 ---
 
-## 8) Math summary (GitHub‑safe LaTeX)
+## 8) Math summary 
 
 $$
 \begin{aligned}
-&\textbf{Goal:}\quad X'*{t,n} = X*{t,n} + S_{t,n},\quad S_{t,n} \approx \sum_{r=1}^{R} w_{n,r}, b_r(t).[4pt]
-&\textbf{Cosine basis:}\quad b_r(t) = \cos\Big(\tfrac{\pi}{L}(t+\tfrac{1}{2})r\Big).[4pt]
+&\textbf{Goal:}\quad X'*{t,n} = X*{t,n} + S_{t,n},\quad S_{t,n} \approx \sum_{r=1}^{R} w_{n,r}, b_r(t).
+&\textbf{Cosine basis:}\quad b_r(t) = \cos\Big(\tfrac{\pi}{L}(t+\tfrac{1}{2})r\Big).
 &\textbf{Zero‑mean:}\quad \tilde{\mathbf B} = \mathbf B - \mathrm{mean}*{t}(\mathbf B),  \Rightarrow  \mathrm{mean}*{t}(\tilde{\mathbf B},\mathbf W) \approx \mathbf 0.[4pt]
-&\textbf{Embedding→mixture:}\quad \mathbf w_n = \mathrm{Linear}(\mathbf e_n) \in \mathbb R^{R}.[4pt]
+&\textbf{Embedding→mixture:}\quad \mathbf w_n = \mathrm{Linear}(\mathbf e_n) \in \mathbb R^{R}.
 &\textbf{Matrix summary:}\quad \mathbf S \approx \tilde{\mathbf B},\mathbf W  \Longleftrightarrow  S_{t,n} \approx \sum_{r=1}^{R} w_{n,r}, \tilde b_r(t).
 \end{aligned}
 $$
@@ -209,7 +209,7 @@ class LowRankTemporalContext(nn.Module):
 
 ---
 
-## 11) Empirical playbook (repro‑friendly)
+## 11) Empirical playbook 
 
 1. **Baseline:** model w/o context.
 2. **+ Low‑rank context:** $R=8$, zero‑mean on, fixed DCT basis.
