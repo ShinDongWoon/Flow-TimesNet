@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from glob import glob
-from typing import Any, Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import torch
@@ -14,6 +15,193 @@ from .utils.torch_opt import amp_autocast
 from .utils import io as io_utils
 from .models.timesnet import TimesNet
 from .utils.time_features import build_time_features
+from .utils.submission import (
+    SubmissionRowMeta,
+    build_submission_context,
+    get_submission_writer,
+)
+
+
+@dataclass
+class TestBatch:
+    path: str
+    name: str
+    wide: pd.DataFrame
+    present_columns: List[str]
+    gather_positions: List[int]
+    history_index: pd.DatetimeIndex
+    future_dates: pd.DatetimeIndex
+    all_row_keys: List[str]
+    pred_row_keys: List[str]
+    missing_ids: List[str]
+
+
+def _resolve_test_paths(data_cfg: Mapping[str, Any]) -> List[str]:
+    patterns: List[str] = []
+    if "test_glob" in data_cfg and data_cfg["test_glob"]:
+        glob_cfg = data_cfg["test_glob"]
+        if isinstance(glob_cfg, str):
+            patterns = [glob_cfg]
+        elif isinstance(glob_cfg, Sequence):
+            patterns = [str(p) for p in glob_cfg]
+    elif "test_files" in data_cfg and data_cfg["test_files"]:
+        files_cfg = data_cfg["test_files"]
+        if isinstance(files_cfg, str):
+            patterns = [files_cfg]
+        else:
+            patterns = [str(p) for p in files_cfg]
+    elif "test_path" in data_cfg and data_cfg["test_path"]:
+        patterns = [str(data_cfg["test_path"])]
+    else:
+        test_dir = data_cfg.get("test_dir")
+        if test_dir:
+            base_pattern = data_cfg.get("test_pattern", "TEST_*.csv")
+            patterns = [os.path.join(test_dir, base_pattern)]
+
+    resolved: List[str] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        expanded = glob(pattern)
+        if not expanded and os.path.isdir(pattern):
+            inner_pattern = os.path.join(pattern, data_cfg.get("test_pattern", "TEST_*.csv"))
+            expanded = glob(inner_pattern)
+        if not expanded:
+            expanded = [pattern]
+        for path in expanded:
+            full = os.path.abspath(path)
+            if full not in seen:
+                resolved.append(full)
+                seen.add(full)
+    return sorted(resolved)
+
+
+def _prepare_test_batches(
+    *,
+    data_cfg: Mapping[str, Any],
+    preprocess_cfg: Mapping[str, Any],
+    schema_obj,
+    ids: Sequence[str],
+    id_position_map: Mapping[str, int],
+    pred_len: int,
+) -> Tuple[
+    List[TestBatch],
+    Dict[str, SubmissionRowMeta],
+    List[str],
+    Dict[str, List[str]],
+    List[str],
+    List[str],
+    Dict[str, List[str]],
+]:
+    encoding = data_cfg.get("encoding", "utf-8")
+    fill_missing_dates = bool(data_cfg.get("fill_missing_dates", True))
+    horizon = int(data_cfg.get("horizon", pred_len))
+    horizon_freq = data_cfg.get("horizon_freq")
+    clip_negative = bool(preprocess_cfg.get("clip_negative", False))
+
+    test_paths = _resolve_test_paths(data_cfg)
+    if not test_paths:
+        raise FileNotFoundError("No test files found; check data.test_dir, test_glob, or test_files configuration")
+
+    batches: List[TestBatch] = []
+    row_meta: Dict[str, SubmissionRowMeta] = {}
+    row_order: List[str] = []
+    test_parts: Dict[str, List[str]] = {}
+    missing_by_part: Dict[str, List[str]] = {}
+    new_ids: List[str] = []
+    test_ids_union: set[str] = set()
+
+    for path in test_paths:
+        df = pd.read_csv(path, encoding=encoding)
+        schema_obj.require_columns(df.columns, context=path)
+        wide_raw = io_utils.pivot_long_to_wide(
+            df,
+            date_col=schema_obj["date"],
+            id_col=schema_obj["id"],
+            target_col=schema_obj["target"],
+            fill_missing_dates=fill_missing_dates,
+            fillna0=True,
+        )
+        if clip_negative:
+            wide_raw = wide_raw.clip(lower=0.0)
+
+        test_name = os.path.splitext(os.path.basename(path))[0]
+        present_columns = list(wide_raw.columns)
+        test_ids_union.update(present_columns)
+        unknown_cols = [c for c in present_columns if c not in id_position_map]
+        if unknown_cols:
+            console().print(
+                f"[yellow]{test_name} contains {len(unknown_cols)} series unseen during training; values will be zero-filled.[/yellow]"
+            )
+            new_ids.extend([c for c in unknown_cols if c not in new_ids])
+            wide_raw = wide_raw.drop(columns=unknown_cols)
+            present_columns = [c for c in present_columns if c in id_position_map]
+
+        if not present_columns:
+            raise ValueError(f"Test series '{path}' does not contain any known ids")
+
+        missing_ids = [c for c in ids if c not in present_columns]
+        if missing_ids:
+            console().print(
+                f"[yellow]{test_name} missing {len(missing_ids)} trained series; outputs will use default fill values for those ids.[/yellow]"
+            )
+
+        wide = wide_raw.reindex(columns=ids).fillna(0.0)
+        gather_positions = [id_position_map[c] for c in present_columns]
+        history_index = pd.DatetimeIndex(wide.index)
+        if history_index.empty:
+            raise ValueError(f"Test series '{path}' does not contain any historical rows")
+
+        freq_str = horizon_freq
+        if not freq_str:
+            try:
+                freq_str = pd.infer_freq(history_index)
+            except ValueError:
+                freq_str = None
+        if not freq_str:
+            freq_str = "D"
+            console().print(
+                f"[yellow]Failed to infer frequency for {test_name}; defaulting to daily horizon increments.[/yellow]"
+            )
+        try:
+            offset = to_offset(freq_str)
+        except (ValueError, TypeError) as err:
+            console().print(
+                f"[yellow]Invalid horizon frequency '{freq_str}' for {test_name} ({err}); falling back to daily steps.[/yellow]"
+            )
+            offset = to_offset("D")
+
+        start_date = history_index[-1] + offset
+        future_index = pd.date_range(start_date, periods=horizon, freq=offset)
+        row_keys_all = [f"{test_name}+D{i}" for i in range(1, horizon + 1)]
+        row_order.extend(row_keys_all)
+        test_parts[test_name] = row_keys_all
+        missing_by_part[test_name] = missing_ids
+
+        for step, (row_key, date_val) in enumerate(zip(row_keys_all, future_index), start=1):
+            row_meta[row_key] = SubmissionRowMeta(
+                test_part=test_name,
+                step=step,
+                date=date_val,
+                source=path,
+            )
+
+        pred_row_keys = row_keys_all[:pred_len]
+        batches.append(
+            TestBatch(
+                path=path,
+                name=test_name,
+                wide=wide,
+                present_columns=present_columns,
+                gather_positions=gather_positions,
+                history_index=history_index,
+                future_dates=future_index,
+                all_row_keys=row_keys_all,
+                pred_row_keys=pred_row_keys,
+                missing_ids=missing_ids,
+            )
+        )
+
+    return batches, row_meta, row_order, test_parts, new_ids, list(test_ids_union), missing_by_part
 
 
 def _select_device(req: str) -> torch.device:
@@ -523,38 +711,55 @@ def predict_once(cfg: PipelineConfig | Dict[str, Any]) -> str:
             required_vocab, device=series_embed.weight.device, dtype=torch.long
         )
 
-    # Iterate test parts
-    test_dir = cfg_used["data"]["test_dir"]
-    sample = pd.read_csv(
-        cfg_used["data"]["sample_submission"], encoding="utf-8-sig"
+    data_cfg = cfg_used.setdefault("data", {})
+    (
+        test_batches,
+        row_meta,
+        row_order,
+        test_parts,
+        new_ids,
+        test_ids_union,
+        missing_by_part,
+    ) = _prepare_test_batches(
+        data_cfg=data_cfg,
+        preprocess_cfg=preprocess_cfg,
+        schema_obj=schema_obj,
+        ids=ids,
+        id_position_map=id_position_map,
+        pred_len=pred_len,
     )
-    pred_list: List[pd.DataFrame] = []
 
-    test_files = sorted(glob(os.path.join(test_dir, "TEST_*.csv")))
-    for fp in test_files:
-        df = pd.read_csv(fp)
-        schema_obj.require_columns(df.columns, context=fp)
-        wide_raw = io_utils.pivot_long_to_wide(
-            df,
-            date_col=schema_obj["date"],
-            id_col=schema_obj["id"],
-            target_col=schema_obj["target"],
-            fill_missing_dates=cfg_used["data"]["fill_missing_dates"],
-            fillna0=True,
+    encoding = data_cfg.get("encoding", "utf-8")
+    sample_df: pd.DataFrame | None = None
+    sample_path = data_cfg.get("sample_submission")
+    if sample_path:
+        try:
+            sample_df = pd.read_csv(sample_path, encoding=encoding)
+        except FileNotFoundError:
+            console().print(
+                f"[yellow]Sample submission not found at {sample_path}; a template will be synthesized from test inputs.[/yellow]"
+            )
+        except OSError as err:
+            console().print(
+                f"[yellow]Failed to read sample submission {sample_path}: {err}; synthesizing template from test inputs.[/yellow]"
+            )
+
+    pred_list: List[pd.DataFrame] = []
+    test_ids_union_set = set(test_ids_union)
+    known_ids_set = set(ids)
+    missing_global = sorted([c for c in known_ids_set if c not in test_ids_union_set])
+    new_ids_sorted = sorted(set(new_ids))
+    if missing_global:
+        console().print(
+            f"[yellow]{len(missing_global)} trained series never appear in test inputs; default fill values will be used.[/yellow]"
         )
-        if cfg_used.get("preprocess", {}).get("clip_negative", False):
-            wide_raw = wide_raw.clip(lower=0.0)
-        present_columns = list(wide_raw.columns)
-        unknown_cols = [c for c in present_columns if c not in id_position_map]
-        if unknown_cols:
-            raise ValueError(
-                f"Test series '{fp}' contains unknown ids not seen during training: {unknown_cols}"
-            )
-        if not present_columns:
-            raise ValueError(
-                f"Test series '{fp}' does not contain any known ids"
-            )
-        wide = wide_raw.reindex(columns=ids).fillna(0.0)
+    if new_ids_sorted:
+        console().print(
+            f"[yellow]Detected {len(new_ids_sorted)} unseen series in test inputs; they will be populated with default fill values.[/yellow]"
+        )
+
+    for batch in test_batches:
+        wide = batch.wide
         X = wide.values.astype(np.float32)
         # transform by scaler
         if method == "none" or scaler is None:
@@ -582,20 +787,20 @@ def predict_once(cfg: PipelineConfig | Dict[str, Any]) -> str:
                 Xn = np.concatenate([pad_block, Xn], axis=0)
                 disable_marks_for_batch = True
                 console().print(
-                    f"[yellow]{fp} shorter than input_len={input_len}; repeating earliest observations to fill the window.[/yellow]"
+                    f"[yellow]{batch.name} shorter than input_len={input_len}; repeating earliest observations to fill the window.[/yellow]"
                 )
             elif strategy == "pad":
                 pad_block = np.full((missing, Xn.shape[1]), window_cfg.pad_value, dtype=np.float32)
                 Xn = np.concatenate([pad_block, Xn], axis=0)
                 disable_marks_for_batch = True
                 console().print(
-                    f"[yellow]{fp} shorter than input_len={input_len}; padding leading values with {window_cfg.pad_value}.[/yellow]"
+                    f"[yellow]{batch.name} shorter than input_len={input_len}; padding leading values with {window_cfg.pad_value}.[/yellow]"
                 )
             else:
                 raise ValueError(
-                    f"Test series '{fp}' shorter than required input_len={input_len} and window.short_series_strategy='error'"
+                    f"Test series '{batch.path}' shorter than required input_len={input_len} and window.short_series_strategy='error'"
                 )
-        gather_positions = [id_position_map[c] for c in present_columns]
+        gather_positions = batch.gather_positions
         gather_idx_np = np.asarray(gather_positions, dtype=np.int64)
         last_seq_full = Xn[-input_len:, :]
         last_seq_selected = last_seq_full[:, gather_idx_np]
@@ -603,7 +808,7 @@ def predict_once(cfg: PipelineConfig | Dict[str, Any]) -> str:
         num_series = xb_np.shape[0]
         if num_series == 0:
             raise ValueError(
-                f"Test series '{fp}' does not contain any matching ids"
+                f"Test series '{batch.path}' does not contain any matching ids"
             )
         xb = torch.from_numpy(xb_np)
         index_tensor = torch.as_tensor(
@@ -612,7 +817,7 @@ def predict_once(cfg: PipelineConfig | Dict[str, Any]) -> str:
         x_mark_tensor: torch.Tensor | None = None
         y_mark_tensor: torch.Tensor | None = None
         if time_features_enabled and not disable_marks_for_batch:
-            history_index = pd.DatetimeIndex(wide.index)
+            history_index = batch.history_index
             recent_index = history_index[-input_len:]
             active_cfg = dict(meta_config)
             active_cfg["enabled"] = True
@@ -631,9 +836,7 @@ def predict_once(cfg: PipelineConfig | Dict[str, Any]) -> str:
                         f"[yellow]Invalid frequency '{freq_str}' for time features ({err}); disabling temporal marks for this batch.[/yellow]"
                     )
                 else:
-                    future_index = pd.date_range(
-                        recent_index[-1] + offset, periods=pred_len, freq=offset
-                    )
+                    future_index = batch.future_dates[:pred_len]
                     combined_index = recent_index.append(future_index)
                     marks_np = build_time_features(combined_index, active_cfg)
                     if marks_np.shape[1] != meta_dim:
@@ -647,7 +850,7 @@ def predict_once(cfg: PipelineConfig | Dict[str, Any]) -> str:
                         y_mark_tensor = torch.from_numpy(y_mark_np).unsqueeze(0)
         elif time_features_enabled and disable_marks_for_batch:
             console().print(
-                f"[yellow]Temporal marks disabled for {fp} because padded windows may not align with calendar frequencies.[/yellow]"
+                f"[yellow]Temporal marks disabled for {batch.name} because padded windows may not align with calendar frequencies.[/yellow]"
             )
         if cfg_used["train"]["channels_last"]:
             xb = xb.unsqueeze(-1).to(
@@ -713,26 +916,49 @@ def predict_once(cfg: PipelineConfig | Dict[str, Any]) -> str:
         rate_np = rate_pred.squeeze(-1).float().cpu().numpy()  # [num_series, H]
         if rate_np.ndim == 1:
             rate_np = rate_np.reshape(1, -1)
-        Pn = np.zeros((pred_len, len(ids)), dtype=np.float32)
-        Pn[:, gather_idx_np] = rate_np.transpose(1, 0)
+        effective_steps = len(batch.pred_row_keys)
+        Pn = np.zeros((effective_steps, len(ids)), dtype=np.float32)
+        step_slice = rate_np[:, :effective_steps]
+        Pn[:, gather_idx_np] = step_slice.transpose(1, 0)
         # inverse transform & clip
         P = io_utils.inverse_transform(Pn, ids, scaler, method=method)
         P = np.clip(P, 0.0, None)
 
         pred_df = pd.DataFrame(P, columns=ids)
-        test_name = os.path.splitext(os.path.basename(fp))[0]
-        # Attach row keys for later concatenation
-        pred_df["row_key"] = [f"{test_name}+D{i+1}" for i in range(len(pred_df))]
+        pred_df["row_key"] = batch.pred_row_keys[:effective_steps]
         pred_df = pred_df.set_index("row_key")
         pred_list.append(pred_df)
 
-    # Format submission
     preds = io_utils.merge_forecasts(pred_list)
-    sub = io_utils.format_submission(sample, preds)
-    os.makedirs(os.path.dirname(cfg_used["submission"]["out_path"]), exist_ok=True)
-    sub.to_csv(cfg_used["submission"]["out_path"], index=False, encoding="utf-8-sig")
-    console().print(f"[bold green]Saved submission:[/bold green] {cfg_used['submission']['out_path']}")
-    return cfg_used["submission"]["out_path"]
+    submission_cfg = cfg_used.setdefault("submission", {})
+    context = build_submission_context(
+        predictions=preds,
+        sample_df=sample_df,
+        row_meta=row_meta,
+        row_order=row_order,
+        test_parts=test_parts,
+        ids=ids,
+        new_ids=new_ids_sorted,
+        missing_ids=missing_global,
+        missing_by_part=missing_by_part,
+        submission_cfg=submission_cfg,
+    )
+    writer_cls = get_submission_writer(submission_cfg.get("format", "date_menu"))
+    writer = writer_cls(
+        default_fill_value=context.default_fill_value,
+        missing_policy=submission_cfg.get("missing_policy"),
+    )
+    submission_df = writer.render(preds, context)
+
+    output_path = submission_cfg.get("output_path") or submission_cfg.get("out_path")
+    if not output_path:
+        raise ValueError("submission.output_path (or out_path) must be specified in the configuration")
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    submission_df.to_csv(output_path, index=False, encoding="utf-8-sig")
+    console().print(f"[bold green]Saved submission:[/bold green] {output_path}")
+    return output_path
 
 
 def main() -> None:
