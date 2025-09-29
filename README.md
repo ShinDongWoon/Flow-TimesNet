@@ -154,11 +154,11 @@ flowchart LR
 
 $$
 \begin{aligned}
-&\textbf{Goal:}\quad X'*{t,n} = X*{t,n} + S_{t,n},\quad S_{t,n} \approx \sum_{r=1}^{R} w_{n,r}, b_r(t).
-&\textbf{Cosine basis:}\quad b_r(t) = \cos\Big(\tfrac{\pi}{L}(t+\tfrac{1}{2})r\Big).
-&\textbf{Zero‑mean:}\quad \tilde{\mathbf B} = \mathbf B - \mathrm{mean}*{t}(\mathbf B),  \Rightarrow  \mathrm{mean}*{t}(\tilde{\mathbf B},\mathbf W) \approx \mathbf 0.[4pt]
-&\textbf{Embedding→mixture:}\quad \mathbf w_n = \mathrm{Linear}(\mathbf e_n) \in \mathbb R^{R}.
-&\textbf{Matrix summary:}\quad \mathbf S \approx \tilde{\mathbf B},\mathbf W  \Longleftrightarrow  S_{t,n} \approx \sum_{r=1}^{R} w_{n,r}, \tilde b_r(t).
+&\textbf{Goal:}\quad X'*{t,n} = X*{t,n} + S_{t,n},\quad S_{t,n} \approx \sum_{r=1}^{R} w_{n,r}, b_r(t). \\
+&\textbf{Cosine basis:}\quad b_r(t) = \cos\Big(\tfrac{\pi}{L}(t+\tfrac{1}{2})r\Big). \\
+&\textbf{Zero‑mean:}\quad \tilde{\mathbf B} = \mathbf B - \mathrm{mean}*{t}(\mathbf B),  \Rightarrow  \mathrm{mean}*{t}(\tilde{\mathbf B},\mathbf W) \approx \mathbf 0. \\
+&\textbf{Embedding→mixture:}\quad \mathbf w_n = \mathrm{Linear}(\mathbf e_n) \in \mathbb R^{R}. \\
+&\textbf{Matrix summary:}\quad \mathbf S \approx \tilde{\mathbf B},\mathbf W  \Longleftrightarrow  S_{t,n} \approx \sum_{r=1}^{R} w_{n,r}, \tilde b_r(t). \\
 \end{aligned}
 $$
 
