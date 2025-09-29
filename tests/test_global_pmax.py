@@ -97,8 +97,8 @@ def test_train_once_runs_without_pmax(tmp_path):
     ]
     cfg = Config.from_files("configs/default.yaml", overrides=overrides).to_dict()
 
-    schema = io_utils.resolve_schema(cfg)
     df_loaded = pd.read_csv(csv_path)
+    schema = io_utils.DataSchema.from_config(cfg["data"], sample_df=df_loaded)
     wide = io_utils.pivot_long_to_wide(
         df_loaded,
         date_col=schema["date"],

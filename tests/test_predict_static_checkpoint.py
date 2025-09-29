@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import pickle
 from pathlib import Path
 import sys
@@ -16,6 +15,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 from timesnet_forecast.models.timesnet import TimesNet
 from timesnet_forecast.predict import predict_once
+from timesnet_forecast.utils import io as io_utils
 
 
 def test_predict_once_restores_static_checkpoint(tmp_path):
@@ -93,8 +93,14 @@ def test_predict_once_restores_static_checkpoint(tmp_path):
     with open(art_dir / "scaler.pkl", "wb") as f:
         pickle.dump(scaler_meta, f)
 
-    with open(art_dir / "schema.json", "w", encoding="utf-8") as f:
-        json.dump({"date": "date", "id": "series_id", "target": "value"}, f)
+    io_utils.save_schema_artifact(
+        str(art_dir / "schema.json"),
+        io_utils.DataSchema.from_fields(
+            {"date": "date", "id": "series_id", "target": "value"},
+            sources={"date": "override", "id": "override", "target": "override"},
+        ),
+        normalization={"method": "none", "per_series": True, "eps": 1e-8},
+    )
 
     test_dir = tmp_path / "test_data"
     test_dir.mkdir()
@@ -140,7 +146,12 @@ def test_predict_once_restores_static_checkpoint(tmp_path):
             "sample_submission": str(sample_path),
             "fill_missing_dates": False,
         },
-        "preprocess": {"clip_negative": False},
+        "preprocess": {
+            "clip_negative": False,
+            "normalize": "none",
+            "normalize_per_series": True,
+            "eps": 1e-8,
+        },
         "train": {
             "device": "cpu",
             "matmul_precision": "medium",
