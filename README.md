@@ -1,6 +1,10 @@
 # Recursive-TimesNet
 
 - Validation holdout period must be at least `input_len + pred_len` days.
+- Training now emits a `metadata.json` artifact (starting at `meta_version=1`) capturing the
+  window configuration, detected schema, time feature settings, and static feature names. The
+  prediction CLI validates this metadata to surface clear errors when configurations drift from
+  the training setup.
 - Submission files now output actual business dates in the first column instead of row keys.
 - Optional early stopping: set `train.early_stopping_patience` to an integer to stop training
   when the validation Gaussian NLL does not improve for that many consecutive epochs. Leave it unset or

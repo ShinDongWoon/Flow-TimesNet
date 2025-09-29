@@ -13,6 +13,7 @@ from .config import PipelineConfig
 from .utils.logging import console
 from .utils.torch_opt import amp_autocast
 from .utils import io as io_utils
+from .utils import metadata as metadata_utils
 from .models.timesnet import TimesNet
 from .utils.time_features import build_time_features
 from .utils.submission import (
@@ -352,6 +353,7 @@ def predict_once(cfg: PipelineConfig | Dict[str, Any]) -> str:
     runtime_dict = runtime_cfg.to_dict()
     runtime_artifacts = runtime_dict.setdefault("artifacts", {})
     runtime_artifacts.setdefault("signature_file", "model_signature.json")
+    runtime_artifacts.setdefault("metadata_file", "metadata.json")
     art_dir = runtime_artifacts["dir"]
 
     trained_raw = io_utils.load_yaml(
@@ -371,6 +373,20 @@ def predict_once(cfg: PipelineConfig | Dict[str, Any]) -> str:
 
     active_cfg = PipelineConfig.from_mapping(merged_dict)
     cfg_used = active_cfg.to_dict()
+
+    metadata_file = cfg_used["artifacts"].get("metadata_file", "metadata.json")
+    metadata_path = os.path.join(art_dir, metadata_file)
+    try:
+        metadata_artifact = metadata_utils.load_metadata_artifact(metadata_path)
+    except FileNotFoundError as err:
+        raise FileNotFoundError(
+            f"Metadata artifact '{metadata_path}' not found; run training to generate it."
+        ) from err
+    except ValueError as err:
+        raise ValueError(
+            f"Failed to load metadata artifact '{metadata_path}': {err}"
+        ) from err
+    metadata_artifact.validate_config(active_cfg)
 
     signature_file = cfg_used["artifacts"].get("signature_file", "model_signature.json")
     signature_path = os.path.join(art_dir, signature_file)
@@ -409,6 +425,11 @@ def predict_once(cfg: PipelineConfig | Dict[str, Any]) -> str:
     )
 
     ids: List[str] = list(scaler_meta["ids"])
+    metadata_artifact.validate_artifacts(
+        schema=schema_obj,
+        scaler_meta=scaler_meta,
+        num_series=len(ids),
+    )
     method = scaler_meta["method"]
     scaler = scaler_meta["scaler"]
     data_time_cfg = dict(cfg_used.get("data", {}).get("time_features") or {})
@@ -963,9 +984,21 @@ def predict_once(cfg: PipelineConfig | Dict[str, Any]) -> str:
 
 def main() -> None:
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/default.yaml")
-    parser.add_argument("--override", nargs="*", default=[])
+    parser = argparse.ArgumentParser(
+        description="Run inference using stored artifacts with metadata compatibility validation."
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="configs/default.yaml",
+        help="Path to the pipeline configuration YAML file.",
+    )
+    parser.add_argument(
+        "--override",
+        nargs="*",
+        default=[],
+        help="Override configuration entries using key=value pairs.",
+    )
     args = parser.parse_args()
     cfg = PipelineConfig.from_files(args.config, overrides=args.override)
     predict_once(cfg)

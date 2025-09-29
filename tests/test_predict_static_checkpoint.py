@@ -6,6 +6,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 import yaml
 
@@ -13,12 +14,15 @@ import yaml
 # Ensure the project src is on the path for imports
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
+from timesnet_forecast.config import TimeFeatureConfig, WindowConfig
 from timesnet_forecast.models.timesnet import TimesNet
 from timesnet_forecast.predict import predict_once
 from timesnet_forecast.utils import io as io_utils
+from timesnet_forecast.utils import metadata as metadata_utils
 
 
-def test_predict_once_restores_static_checkpoint(tmp_path):
+@pytest.mark.parametrize("submission_format", ["date_menu", "row_key"])
+def test_predict_once_restores_static_checkpoint(tmp_path, submission_format):
     torch.manual_seed(0)
     np.random.seed(0)
 
@@ -84,11 +88,26 @@ def test_predict_once_restores_static_checkpoint(tmp_path):
     model_path = art_dir / "timesnet.pth"
     torch.save(model.state_dict(), model_path)
 
+    static_feature_names = [
+        "mean",
+        "std",
+        "diff_std",
+        "seasonal_strength",
+        "dominant_period",
+    ]
+    tf_cfg = TimeFeatureConfig(enabled=False)
+    tf_dict = tf_cfg.to_dict()
     scaler_meta = {
         "ids": ids,
         "method": "none",
         "scaler": None,
         "static_features": static_features.numpy(),
+        "feature_names": static_feature_names,
+        "time_features": {
+            "enabled": False,
+            "feature_dim": 0,
+            "config": tf_dict,
+        },
     }
     with open(art_dir / "scaler.pkl", "wb") as f:
         pickle.dump(scaler_meta, f)
@@ -140,11 +159,17 @@ def test_predict_once_restores_static_checkpoint(tmp_path):
             "scaler_file": "scaler.pkl",
             "schema_file": "schema.json",
             "config_file": "config_used.yaml",
+            "signature_file": "model_signature.json",
+            "metadata_file": "metadata.json",
         },
         "data": {
             "test_dir": str(test_dir),
             "sample_submission": str(sample_path),
             "fill_missing_dates": False,
+            "date_col": "date",
+            "id_col": "series_id",
+            "target_col": "value",
+            "time_features": tf_dict,
         },
         "preprocess": {
             "clip_negative": False,
@@ -179,7 +204,18 @@ def test_predict_once_restores_static_checkpoint(tmp_path):
             "static_layernorm": True,
             "min_period_threshold": 1,
         },
-        "submission": {"out_path": str(tmp_path / "outputs" / "submission.csv")},
+        "window": {
+            "input_len": input_len,
+            "pred_len": pred_len,
+            "stride": 1,
+            "short_series_strategy": "error",
+            "pad_value": 0.0,
+        },
+        "submission": {
+            "out_path": str(tmp_path / "outputs" / "submission.csv"),
+            "format": submission_format,
+            "date_col": "영업일자",
+        },
     }
 
     config_payload = {
@@ -192,6 +228,33 @@ def test_predict_once_restores_static_checkpoint(tmp_path):
     }
     with open(art_dir / "config_used.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(config_payload, f, allow_unicode=True)
+
+    metadata_artifact = metadata_utils.MetadataArtifact.from_training(
+        window=WindowConfig(
+            input_len=input_len,
+            pred_len=pred_len,
+            stride=1,
+            short_series_strategy="error",
+            pad_value=0.0,
+        ),
+        schema=io_utils.DataSchema.from_fields(
+            {"date": "date", "id": "series_id", "target": "value"},
+            sources={"date": "override", "id": "override", "target": "override"},
+        ),
+        time_features={
+            "config": tf_dict,
+            "enabled": False,
+            "feature_dim": 0,
+            "freq": None,
+        },
+        static_features={
+            "feature_names": static_feature_names,
+            "feature_dim": static_features.shape[1],
+        },
+    )
+    metadata_utils.save_metadata_artifact(
+        metadata_artifact, str(art_dir / "metadata.json")
+    )
 
     model.eval()
     id_position_map = {sid: idx for idx, sid in enumerate(ids)}
@@ -222,12 +285,17 @@ def test_predict_once_restores_static_checkpoint(tmp_path):
     assert out_path == cfg["submission"]["out_path"]
     submission_df = pd.read_csv(out_path)
     row_col = submission_df.columns[0]
+    if submission_format == "date_menu":
+        assert row_col == cfg["submission"].get("date_col", "영업일자")
+    else:
+        assert row_col == "row_key"
     for day_idx in range(pred_len):
-        row_key = f"TEST_00+Day {day_idx + 1}"
-        row = submission_df.loc[submission_df[row_col] == row_key, ids]
-        assert not row.empty
+        if submission_format == "row_key":
+            expected_label = f"TEST_00+Day {day_idx + 1}"
+            assert submission_df.iloc[day_idx][row_col] == expected_label
+        values = submission_df.iloc[day_idx][ids].to_numpy(dtype=np.float32)
         np.testing.assert_allclose(
-            row.to_numpy(dtype=np.float32)[0],
+            values,
             expected[day_idx],
             rtol=1e-5,
             atol=1e-5,
