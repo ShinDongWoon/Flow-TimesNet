@@ -316,7 +316,7 @@ python -m timesnet_forecast.cli tune \
 - For analysis, you can read a single test file and sort it by the required store-menu combination and date to preprocess it in the same manner as the training data.
  
 ### 3. Submission Format (`data/sample_submission.csv`)
-- Composed of **194 columns in total**. The first column is `영업일자` (e.g., `TEST_00+1day`), and the following 193 columns correspond to each store-menu combination.
+- Composed of **194 columns in total**. The first column is `영업일자` (e.g., `TEST_00+1일`), and the following 193 columns correspond to each store-menu combination.
 - It consists of **70 rows**, where you must fill in 7 days of predictions (`+1day` to `+7day`) for each test set from `TEST_00` to `TEST_09`.
 - The sample submission file is also saved in **UTF-8 with BOM**. You should overwrite the `매출수량` prediction values while maintaining the same encoding for submission.
 - The model's output must be non-negative sales quantity predictions, and the column order and headers must **exactly match** the sample submission file.
@@ -326,7 +326,7 @@ python -m timesnet_forecast.cli tune \
 ### Pluggable components
 - **Schema**: map your `date`, `target`, `series_id` columns via config (auto-infer candidates if unspecified).
 - **Loaders**: swap **train CSV**, **test directory** (e.g., `TEST_00.csv … TEST_09.csv`), and **sample submission** without code changes.
-- **Features**: enable/disable **calendar**, **holiday**, **Fourier**, **lag/rolling**, and **intermittency** features.
+- **Features**: enable/disable **calendar** time covariates (day-of-week/day-of-month/month/day-of-year) with configurable cyclical/one-hot/numeric encodings.
 - **Evaluation**: choose **holdout** or **rolling CV**, horizon **H**, and **sMAPE/NLL** aggregation rules.
 - **Augmentation**: add **Gaussian noise** and/or **time shifts** to input windows via `data.augment`.
 
@@ -555,7 +555,7 @@ Training and validation call `negative_binomial_nll(rate, dispersion, y, mask)` 
 - **Score**: ≈ **0.14**  
 - **Notes**: Negative Binomial head (rate/dispersion) with dispersion floors; embeddings + LRTC on; PeriodGrouper enabled; AMP on GPU.
 
-_Reproduce by fixing `seed`, `window.pred_len=7`, keeping the NB head active with `train.min_sigma`, and using the provided rolling CV profile in `configs/benchmarks/walmart.yaml`._
+_Reproduce by fixing `seed`, `window.pred_len=7`, keeping the NB head active with `train.min_sigma`, and mirroring the rolling CV profile described in your configuration (this repo does not ship a `configs/benchmarks/walmart.yaml`)._
 
 
 ---
