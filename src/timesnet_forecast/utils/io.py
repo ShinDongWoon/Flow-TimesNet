@@ -60,25 +60,77 @@ def _looks_numeric(series: pd.Series) -> bool:
     return pd.api.types.is_numeric_dtype(series)
 
 
-def _find_first(df: pd.DataFrame, candidates: Iterable[str], predicate) -> Tuple[Optional[str], Optional[str]]:
-    for name in candidates:
+def _coerce_detection_policy(value: Any | None) -> str:
+    if _is_missing(value):
+        return "infer"
+    if value is None:
+        return "infer"
+    policy = str(value).strip().lower()
+    if policy not in {"strict", "infer", "manual"}:
+        raise ValueError(
+            "schema_detection_policy must be one of {'strict', 'infer', 'manual'}"
+        )
+    return policy
+
+
+def _coerce_evolution_policy(value: Any | None) -> str:
+    if _is_missing(value):
+        return "warn"
+    if value is None:
+        return "warn"
+    policy = str(value).strip().lower()
+    if policy not in {"ignore", "warn", "error"}:
+        raise ValueError(
+            "schema_evolution_policy must be one of {'ignore', 'warn', 'error'}"
+        )
+    return policy
+
+
+def _collect_candidates(
+    df: pd.DataFrame,
+    candidate_names: Iterable[str],
+    predicate,
+    *,
+    fallback_reason: str,
+) -> List[Dict[str, str]]:
+    matches: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for name in candidate_names:
         if name in df.columns and predicate(df[name]):
-            return name, "name_match"
-    return None, None
+            matches.append({"column": name, "reason": "name_match"})
+            seen.add(name)
+    for column in df.columns:
+        if column in seen:
+            continue
+        if predicate(df[column]):
+            matches.append({"column": column, "reason": fallback_reason})
+            seen.add(column)
+    return matches
 
 
-def _detect_schema(df: pd.DataFrame, preferred: Mapping[str, str] | None = None) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
+def _detect_schema(
+    df: pd.DataFrame, preferred: Mapping[str, str] | None = None
+) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
     preferred = preferred or {}
     result: Dict[str, str] = {}
     details: Dict[str, Dict[str, Any]] = {}
     used: set[str] = set()
 
-    def assign(role: str, column: str, reason: str, extra: Optional[Dict[str, Any]] = None) -> None:
+    def assign(
+        role: str,
+        column: str,
+        reason: str,
+        *,
+        candidates: Optional[List[Dict[str, str]]] = None,
+        available: Optional[List[Dict[str, str]]] = None,
+    ) -> None:
         result[role] = column
         used.add(column)
-        payload = {"reason": reason}
-        if extra:
-            payload.update(extra)
+        payload: Dict[str, Any] = {"reason": reason}
+        if candidates is not None:
+            payload["candidates"] = candidates
+        if available is not None:
+            payload["available_candidates"] = available
         details[role] = payload
 
     for role in ("date", "id", "target"):
@@ -116,48 +168,55 @@ def _detect_schema(df: pd.DataFrame, preferred: Mapping[str, str] | None = None)
     ]
 
     if "date" not in result:
-        name, reason = _find_first(
-            df, [c for c in date_candidates if c not in used], _looks_datetime
+        candidates = _collect_candidates(
+            df, date_candidates, _looks_datetime, fallback_reason="datetime_like"
         )
-        if name:
-            assign("date", name, reason or "name_match")
-    if "date" not in result:
-        for column in df.columns:
-            if column in used:
-                continue
-            if _looks_datetime(df[column]):
-                assign("date", column, "datetime_dtype")
-                break
+        available = [c for c in candidates if c["column"] not in used]
+        if available:
+            choice = available[0]
+            assign(
+                "date",
+                choice["column"],
+                choice["reason"],
+                candidates=candidates,
+                available=available,
+            )
 
     if "id" not in result:
-        name, reason = _find_first(
-            df, [c for c in id_candidates if c not in used], _looks_identifier
+        candidates = _collect_candidates(
+            df, id_candidates, _looks_identifier, fallback_reason="identifier_like"
         )
-        if name:
-            assign("id", name, reason or "name_match")
-    if "id" not in result:
-        for column in df.columns:
-            if column in used or column == result.get("date"):
-                continue
-            if _looks_identifier(df[column]):
-                assign("id", column, "identifier_like")
-                break
+        available = [c for c in candidates if c["column"] not in used]
+        if available:
+            choice = available[0]
+            assign(
+                "id",
+                choice["column"],
+                choice["reason"],
+                candidates=candidates,
+                available=available,
+            )
 
     if "target" not in result:
-        name, reason = _find_first(
-            df, [c for c in target_candidates if c not in used], _looks_numeric
+        candidates = _collect_candidates(
+            df, target_candidates, _looks_numeric, fallback_reason="numeric_like"
         )
-        if name:
-            assign("target", name, reason or "name_match")
-    if "target" not in result:
-        for column in df.columns:
-            if column in used:
-                continue
-            if column == result.get("date") or column == result.get("id"):
-                continue
-            if _looks_numeric(df[column]):
-                assign("target", column, "numeric_like")
-                break
+        available = [
+            c
+            for c in candidates
+            if c["column"] not in used
+            and c["column"] != result.get("date")
+            and c["column"] != result.get("id")
+        ]
+        if available:
+            choice = available[0]
+            assign(
+                "target",
+                choice["column"],
+                choice["reason"],
+                candidates=candidates,
+                available=available,
+            )
 
     return result, details
 
@@ -190,18 +249,56 @@ class DataSchema:
         *,
         allow_auto: bool = True,
     ) -> "DataSchema":
+        schema_cfg = (
+            data_cfg.get("schema") if isinstance(data_cfg, Mapping) else None
+        )
+        schema_cfg = schema_cfg if isinstance(schema_cfg, Mapping) else {}
+
+        detection_policy = _coerce_detection_policy(
+            schema_cfg.get(
+                "detection_policy",
+                data_cfg.get("schema_detection_policy") if isinstance(data_cfg, Mapping) else None,
+            )
+        )
+        evolution_policy = _coerce_evolution_policy(
+            schema_cfg.get(
+                "evolution_policy",
+                data_cfg.get("schema_evolution_policy") if isinstance(data_cfg, Mapping) else None,
+            )
+        )
+
         overrides = _extract_schema_overrides(data_cfg)
         preferred = dict(overrides)
 
-        if sample_df is None and (allow_auto and len(preferred) < 3):
+        effective_allow_auto = allow_auto and detection_policy != "manual"
+
+        if detection_policy == "manual" and len(preferred) < 3:
+            raise ValueError(
+                "schema_detection_policy='manual' requires explicit date/id/target overrides"
+            )
+
+        if sample_df is None and (effective_allow_auto and len(preferred) < 3):
             raise ValueError(
                 "DataSchema requires a sample dataframe to infer missing fields"
             )
 
         detected: Dict[str, str] = {}
         details: Dict[str, Dict[str, Any]] = {}
-        if sample_df is not None and allow_auto:
+        if sample_df is not None and effective_allow_auto:
             detected, details = _detect_schema(sample_df, preferred)
+
+            if detection_policy == "strict":
+                for role in ("date", "id", "target"):
+                    if role in overrides:
+                        continue
+                    meta = details.get(role, {})
+                    available = meta.get("available_candidates")
+                    if isinstance(available, list) and len(available) > 1:
+                        cols = ", ".join(sorted({c.get("column", "?") for c in available}))
+                        raise ValueError(
+                            f"Ambiguous auto-detection for '{role}' column; candidates: {cols}. "
+                            "Provide an explicit override or switch detection policy to 'infer'."
+                        )
 
         fields: Dict[str, str] = {}
         sources: Dict[str, str] = {}
@@ -222,6 +319,11 @@ class DataSchema:
                     f"Unable to determine column for '{key}'. Provide an override via data.{key}_col"
                 )
 
+        details["policies"] = {
+            "detection": detection_policy,
+            "evolution": evolution_policy,
+        }
+
         schema = cls(
             date_col=str(fields["date"]),
             id_col=str(fields["id"]),
@@ -231,6 +333,9 @@ class DataSchema:
         )
         if sample_df is not None:
             schema.require_columns(sample_df.columns)
+            schema.analyze_temporal_coverage(
+                sample_df, policy=evolution_policy
+            )
         schema._log_resolution(overrides)
         return schema
 
@@ -292,6 +397,82 @@ class DataSchema:
                 "Configured schema columns do not match stored artifact: "
                 + "; ".join(msgs)
             )
+
+    def analyze_temporal_coverage(
+        self, df: pd.DataFrame, *, policy: str = "warn"
+    ) -> None:
+        if policy == "ignore":
+            return
+
+        try:
+            timestamps = pd.to_datetime(df[self.date_col], errors="coerce")
+        except KeyError:
+            return
+
+        valid_time = timestamps.notna()
+        if not valid_time.any():
+            return
+
+        timeline_start = timestamps[valid_time].min()
+        timeline_end = timestamps[valid_time].max()
+
+        total_rows = int(valid_time.sum())
+        coverage: Dict[str, Dict[str, Any]] = {}
+        warnings: List[str] = []
+
+        feature_columns = [
+            c
+            for c in df.columns
+            if c not in {self.date_col, self.id_col, self.target_col}
+        ]
+
+        for column in feature_columns:
+            series = df[column]
+            non_null_mask = series.notna() & valid_time
+            non_null_count = int(non_null_mask.sum())
+            entry: Dict[str, Any] = {
+                "non_null_rows": non_null_count,
+                "total_rows": total_rows,
+            }
+
+            if non_null_count == 0:
+                entry["status"] = "all_null"
+                coverage[column] = entry
+                continue
+
+            first_ts = timestamps[non_null_mask].min()
+            last_ts = timestamps[non_null_mask].max()
+            entry["first_timestamp"] = first_ts.isoformat()
+            entry["last_timestamp"] = last_ts.isoformat()
+            entry["coverage_ratio"] = float(non_null_count) / float(total_rows)
+
+            if first_ts > timeline_start:
+                entry["missing_prefix"] = True
+                warnings.append(
+                    f"Column '{column}' is first observed at {first_ts.date()} but data starts at {timeline_start.date()}"
+                )
+            if last_ts < timeline_end:
+                entry["missing_suffix"] = True
+
+            coverage[column] = entry
+
+        if coverage:
+            policies = self.detection.setdefault("policies", {})
+            policies.setdefault("detection", "infer")
+            policies.setdefault("evolution", policy)
+            self.detection["coverage"] = coverage
+            self.detection["timeline"] = {
+                "start": timeline_start.isoformat(),
+                "end": timeline_end.isoformat(),
+            }
+
+        if warnings:
+            message = "; ".join(warnings)
+            if policy == "error":
+                raise ValueError(
+                    "Schema evolution detected that violates policy: " + message
+                )
+            logger.warning("Schema evolution detected: %s", message)
 
     def _log_resolution(self, overrides: Mapping[str, str]) -> None:
         parts = []
