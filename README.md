@@ -1,4 +1,4 @@
-# Recursive-TimesNet
+# Flow-TimesNet
 **FFT-guided period selection + 2D Inception CNN + embedding-aware adaptive probabilistic head** for multivariate time-series forecasting.  
 Keeps the canonical `[B, T, N] → [B, H, N]` interface while adding robust contextualization and calibrated uncertainty.
 
