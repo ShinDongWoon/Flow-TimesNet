@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple, Literal, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Literal, Optional, Mapping, Iterable, Any
 import os
 import json
 import pickle
@@ -11,12 +12,302 @@ import pandas as pd
 import logging
 
 
-def resolve_schema(cfg: dict) -> Dict[str, str]:
-    return {
-        "date": cfg["data"]["date_col"],
-        "target": cfg["data"]["target_col"],
-        "id": cfg["data"]["id_col"],
-    }
+logger = logging.getLogger(__name__)
+
+
+SCHEMA_ARTIFACT_VERSION = "1.0"
+
+
+def _is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
+
+
+def _sample_series(series: pd.Series, sample_size: int = 128) -> pd.Series:
+    if series.empty:
+        return series
+    if len(series) <= sample_size:
+        return series
+    return series.iloc[:sample_size]
+
+
+def _looks_datetime(series: pd.Series) -> bool:
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return True
+    sample = _sample_series(series)
+    if sample.dtype == object or pd.api.types.is_string_dtype(sample):
+        parsed = pd.to_datetime(sample, errors="coerce", utc=False)
+        non_null = parsed.notna().sum()
+        return non_null >= max(1, int(0.6 * len(sample)))
+    return False
+
+
+def _looks_identifier(series: pd.Series) -> bool:
+    dtype = series.dtype
+    if isinstance(dtype, pd.CategoricalDtype):
+        return True
+    if pd.api.types.is_string_dtype(dtype):
+        return True
+    if dtype == object:
+        return True
+    return False
+
+
+def _looks_numeric(series: pd.Series) -> bool:
+    return pd.api.types.is_numeric_dtype(series)
+
+
+def _find_first(df: pd.DataFrame, candidates: Iterable[str], predicate) -> Tuple[Optional[str], Optional[str]]:
+    for name in candidates:
+        if name in df.columns and predicate(df[name]):
+            return name, "name_match"
+    return None, None
+
+
+def _detect_schema(df: pd.DataFrame, preferred: Mapping[str, str] | None = None) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
+    preferred = preferred or {}
+    result: Dict[str, str] = {}
+    details: Dict[str, Dict[str, Any]] = {}
+    used: set[str] = set()
+
+    def assign(role: str, column: str, reason: str, extra: Optional[Dict[str, Any]] = None) -> None:
+        result[role] = column
+        used.add(column)
+        payload = {"reason": reason}
+        if extra:
+            payload.update(extra)
+        details[role] = payload
+
+    for role in ("date", "id", "target"):
+        pref = preferred.get(role)
+        if pref is not None and pref in df.columns:
+            assign(role, pref, "override_match")
+
+    date_candidates = [
+        "date",
+        "datetime",
+        "timestamp",
+        "ds",
+        "time",
+        "영업일자",
+    ]
+    id_candidates = [
+        "id",
+        "series",
+        "series_id",
+        "store_id",
+        "store",
+        "menu",
+        "item",
+        "영업장명_메뉴명",
+        "영업장명",
+    ]
+    target_candidates = [
+        "target",
+        "value",
+        "sales",
+        "demand",
+        "y",
+        "매출수량",
+        "qty",
+    ]
+
+    if "date" not in result:
+        name, reason = _find_first(
+            df, [c for c in date_candidates if c not in used], _looks_datetime
+        )
+        if name:
+            assign("date", name, reason or "name_match")
+    if "date" not in result:
+        for column in df.columns:
+            if column in used:
+                continue
+            if _looks_datetime(df[column]):
+                assign("date", column, "datetime_dtype")
+                break
+
+    if "id" not in result:
+        name, reason = _find_first(
+            df, [c for c in id_candidates if c not in used], _looks_identifier
+        )
+        if name:
+            assign("id", name, reason or "name_match")
+    if "id" not in result:
+        for column in df.columns:
+            if column in used or column == result.get("date"):
+                continue
+            if _looks_identifier(df[column]):
+                assign("id", column, "identifier_like")
+                break
+
+    if "target" not in result:
+        name, reason = _find_first(
+            df, [c for c in target_candidates if c not in used], _looks_numeric
+        )
+        if name:
+            assign("target", name, reason or "name_match")
+    if "target" not in result:
+        for column in df.columns:
+            if column in used:
+                continue
+            if column == result.get("date") or column == result.get("id"):
+                continue
+            if _looks_numeric(df[column]):
+                assign("target", column, "numeric_like")
+                break
+
+    return result, details
+
+
+def _extract_schema_overrides(data_cfg: Mapping[str, Any]) -> Dict[str, str]:
+    overrides: Dict[str, str] = {}
+    schema_cfg = data_cfg.get("schema", {}) if isinstance(data_cfg, Mapping) else {}
+    for key in ("date", "id", "target"):
+        explicit = schema_cfg.get(key)
+        alt = data_cfg.get(f"{key}_col") if isinstance(data_cfg, Mapping) else None
+        value = explicit if not _is_missing(explicit) else alt
+        if not _is_missing(value):
+            overrides[key] = str(value)
+    return overrides
+
+
+@dataclass
+class DataSchema:
+    date_col: str
+    id_col: str
+    target_col: str
+    sources: Dict[str, str] = field(default_factory=dict)
+    detection: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    @classmethod
+    def from_config(
+        cls,
+        data_cfg: Mapping[str, Any],
+        sample_df: pd.DataFrame | None = None,
+        *,
+        allow_auto: bool = True,
+    ) -> "DataSchema":
+        overrides = _extract_schema_overrides(data_cfg)
+        preferred = dict(overrides)
+
+        if sample_df is None and (allow_auto and len(preferred) < 3):
+            raise ValueError(
+                "DataSchema requires a sample dataframe to infer missing fields"
+            )
+
+        detected: Dict[str, str] = {}
+        details: Dict[str, Dict[str, Any]] = {}
+        if sample_df is not None and allow_auto:
+            detected, details = _detect_schema(sample_df, preferred)
+
+        fields: Dict[str, str] = {}
+        sources: Dict[str, str] = {}
+        for key in ("date", "id", "target"):
+            if key in overrides:
+                candidate = overrides[key]
+                if sample_df is not None and candidate not in sample_df.columns:
+                    raise KeyError(
+                        f"Configured {key}_col '{candidate}' not present in data columns"
+                    )
+                fields[key] = candidate
+                sources[key] = "override"
+            elif key in detected:
+                fields[key] = detected[key]
+                sources[key] = details.get(key, {}).get("reason", "detected")
+            else:
+                raise ValueError(
+                    f"Unable to determine column for '{key}'. Provide an override via data.{key}_col"
+                )
+
+        schema = cls(
+            date_col=str(fields["date"]),
+            id_col=str(fields["id"]),
+            target_col=str(fields["target"]),
+            sources=sources,
+            detection=details,
+        )
+        if sample_df is not None:
+            schema.require_columns(sample_df.columns)
+        schema._log_resolution(overrides)
+        return schema
+
+    @classmethod
+    def from_fields(
+        cls,
+        fields: Mapping[str, Any],
+        *,
+        sources: Mapping[str, str] | None = None,
+        detection: Mapping[str, Dict[str, Any]] | None = None,
+    ) -> "DataSchema":
+        missing = [k for k in ("date", "id", "target") if k not in fields]
+        if missing:
+            raise ValueError(
+                f"Schema artifact missing required fields: {', '.join(missing)}"
+            )
+        return cls(
+            date_col=str(fields["date"]),
+            id_col=str(fields["id"]),
+            target_col=str(fields["target"]),
+            sources=dict(sources or {}),
+            detection=dict(detection or {}),
+        )
+
+    def __getitem__(self, key: str) -> str:
+        if key == "date":
+            return self.date_col
+        if key == "id":
+            return self.id_col
+        if key == "target":
+            return self.target_col
+        raise KeyError(key)
+
+    def as_dict(self) -> Dict[str, str]:
+        return {"date": self.date_col, "id": self.id_col, "target": self.target_col}
+
+    def require_columns(self, columns: Iterable[str], *, context: str | None = None) -> None:
+        missing = [col for col in self.as_dict().values() if col not in columns]
+        if missing:
+            location = f" in {context}" if context else ""
+            raise KeyError(f"Missing required columns{location}: {', '.join(missing)}")
+
+    def validate_overrides(self, data_cfg: Mapping[str, Any]) -> None:
+        overrides = _extract_schema_overrides(data_cfg)
+        mismatched: Dict[str, Tuple[str, str]] = {}
+        for key in ("date", "id", "target"):
+            cfg_val = overrides.get(key)
+            if cfg_val is None:
+                continue
+            resolved = self[key]
+            if cfg_val != resolved:
+                mismatched[key] = (cfg_val, resolved)
+        if mismatched:
+            msgs = [
+                f"{k}: configured='{cfg}' stored='{resolved}'"
+                for k, (cfg, resolved) in mismatched.items()
+            ]
+            raise ValueError(
+                "Configured schema columns do not match stored artifact: "
+                + "; ".join(msgs)
+            )
+
+    def _log_resolution(self, overrides: Mapping[str, str]) -> None:
+        parts = []
+        for key, col in self.as_dict().items():
+            src = overrides.get(key)
+            if src == col:
+                origin = "override"
+            else:
+                origin = self.sources.get(key, "detected")
+            parts.append(f"{key}='{col}' ({origin})")
+        logger.info("Resolved data schema: %s", ", ".join(parts))
+
+
+def resolve_schema(cfg: dict, sample_df: pd.DataFrame | None = None) -> DataSchema:
+    data_cfg = cfg.get("data", {}) if isinstance(cfg, Mapping) else {}
+    return DataSchema.from_config(data_cfg, sample_df=sample_df)
 
 
 def normalize_id(s: str) -> str:
@@ -169,6 +460,104 @@ def save_json(obj: dict, path: str) -> None:
 def load_json(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def save_schema_artifact(
+    path: str,
+    schema: DataSchema,
+    *,
+    normalization: Mapping[str, Any] | None = None,
+    extras: Mapping[str, Any] | None = None,
+    version: str = SCHEMA_ARTIFACT_VERSION,
+) -> None:
+    payload: Dict[str, Any] = {
+        "version": str(version),
+        "fields": schema.as_dict(),
+        "sources": dict(schema.sources),
+        "detection": dict(schema.detection),
+    }
+    if normalization is not None:
+        payload["normalization"] = dict(normalization)
+    if extras is not None:
+        payload["extras"] = dict(extras)
+    save_json(payload, path)
+
+
+def load_schema_artifact(path: str) -> Tuple[DataSchema, Dict[str, Any]]:
+    payload = load_json(path)
+    if not isinstance(payload, dict):
+        raise ValueError("Schema artifact must be a JSON object")
+
+    if "fields" in payload:
+        fields = payload["fields"]
+    else:
+        # Backwards compatibility: legacy format stored fields at top level.
+        fields = {k: payload.get(k) for k in ("date", "id", "target")}
+    schema = DataSchema.from_fields(
+        fields,
+        sources=payload.get("sources"),
+        detection=payload.get("detection"),
+    )
+    meta = {
+        "version": payload.get("version", "0"),
+        "normalization": payload.get("normalization"),
+        "extras": payload.get("extras"),
+        "raw": payload,
+    }
+    return schema, meta
+
+
+def validate_normalization_config(
+    preprocess_cfg: Mapping[str, Any], normalization_meta: Mapping[str, Any] | None
+) -> None:
+    if normalization_meta is None:
+        return
+    expected_method = normalization_meta.get("method")
+    expected_per_series = normalization_meta.get("per_series")
+    expected_eps = normalization_meta.get("eps")
+
+    mismatches: List[str] = []
+
+    if expected_method is not None:
+        configured = preprocess_cfg.get("normalize")
+        if configured is None:
+            preprocess_cfg["normalize"] = expected_method
+        elif str(configured) != str(expected_method):
+            mismatches.append(
+                f"normalize configured='{configured}' stored='{expected_method}'"
+            )
+    if expected_per_series is not None:
+        configured_bool = preprocess_cfg.get("normalize_per_series")
+        if configured_bool is None:
+            preprocess_cfg["normalize_per_series"] = bool(expected_per_series)
+        elif bool(configured_bool) != bool(expected_per_series):
+            mismatches.append(
+                "normalize_per_series configured='{}' stored='{}'".format(
+                    configured_bool, expected_per_series
+                )
+            )
+    if expected_eps is not None:
+        configured_eps = preprocess_cfg.get("eps")
+        if configured_eps is None:
+            preprocess_cfg["eps"] = expected_eps
+        else:
+            try:
+                configured_eps_f = float(configured_eps)
+            except (TypeError, ValueError):
+                mismatches.append(
+                    f"eps configured='{configured_eps}' stored='{expected_eps}'"
+                )
+            else:
+                if not np.isclose(configured_eps_f, float(expected_eps)):
+                    mismatches.append(
+                        f"eps configured='{configured_eps}' stored='{expected_eps}'"
+                    )
+
+    if mismatches:
+        raise ValueError(
+            "Preprocess normalization settings do not match training artifacts: "
+            + "; ".join(mismatches)
+        )
 
 
 def merge_forecasts(pred_list: List[pd.DataFrame]) -> pd.DataFrame:

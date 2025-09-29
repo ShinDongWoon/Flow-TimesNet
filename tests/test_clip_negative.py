@@ -9,6 +9,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 from timesnet_forecast.config import Config
 from timesnet_forecast import train
+from timesnet_forecast.utils import io as io_utils
 
 
 def test_clip_negative(tmp_path, monkeypatch):
@@ -79,3 +80,74 @@ def test_clip_negative(tmp_path, monkeypatch):
     assert captured, "No data arrays captured"
     for arr in captured:
         assert np.all(arr >= 0.0), "Negative values remain after preprocessing"
+
+    schema_path = tmp_path / "artifacts" / "schema.json"
+    schema_obj, schema_meta = io_utils.load_schema_artifact(str(schema_path))
+    assert schema_obj["date"] == "date"
+    assert schema_obj.sources["target"] == "override"
+    normalization_meta = schema_meta.get("normalization")
+    assert normalization_meta["method"] == "none"
+    assert normalization_meta["per_series"] is True
+
+
+def test_train_auto_schema_detection(tmp_path):
+    dates = pd.date_range("2024-01-01", periods=8, freq="D")
+    rows = []
+    for d in dates:
+        rows.append({"timestamp": d, "series_id": "StoreA", "sales": 1.0})
+        rows.append({"timestamp": d, "series_id": "StoreB", "sales": 2.0})
+    df = pd.DataFrame(rows)
+    csv_path = tmp_path / "train.csv"
+    df.to_csv(csv_path, index=False)
+
+    overrides = [
+        f"data.train_csv={csv_path}",
+        "data.date_col=null",
+        "data.id_col=null",
+        "data.target_col=null",
+        "data.encoding=utf-8",
+        "data.fill_missing_dates=False",
+        "train.device=cpu",
+        "train.epochs=1",
+        "train.batch_size=2",
+        "train.num_workers=1",
+        "train.pin_memory=False",
+        "train.persistent_workers=False",
+        "train.prefetch_factor=2",
+        "train.amp=False",
+        "train.compile=False",
+        "train.val.strategy=holdout",
+        "train.val.holdout_days=3",
+        "preprocess.normalize=none",
+        "preprocess.normalize_per_series=True",
+        "preprocess.eps=1e-8",
+        "preprocess.clip_negative=False",
+        "model.mode=direct",
+        "model.input_len=2",
+        "model.pred_len=1",
+        "model.d_model=8",
+        "model.n_layers=1",
+        "model.dropout=0.0",
+        "model.k_periods=1",
+        "model.kernel_set=[[3,3]]",
+        "train.lr=1e-3",
+        "train.weight_decay=0.0",
+        "train.grad_clip_norm=0.0",
+        f"artifacts.dir={tmp_path}/artifacts",
+        "artifacts.model_file=model.pth",
+        "artifacts.scaler_file=scaler.pkl",
+        "artifacts.schema_file=schema.json",
+        "artifacts.config_file=config.yaml",
+    ]
+    cfg = Config.from_files("configs/default.yaml", overrides=overrides).to_dict()
+
+    train.train_once(cfg)
+
+    schema_obj, schema_meta = io_utils.load_schema_artifact(
+        str(tmp_path / "artifacts" / "schema.json")
+    )
+    assert schema_obj["date"] == "timestamp"
+    assert schema_obj.sources["date"] != "override"
+    assert schema_obj["id"] == "series_id"
+    assert schema_obj["target"] == "sales"
+    assert schema_meta.get("version") == io_utils.SCHEMA_ARTIFACT_VERSION

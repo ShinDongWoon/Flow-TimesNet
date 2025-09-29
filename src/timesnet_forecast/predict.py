@@ -123,8 +123,17 @@ def predict_once(cfg: Dict) -> str:
 
     art_dir = cfg_used["artifacts"]["dir"]
     model_file = os.path.join(art_dir, cfg_used["artifacts"]["model_file"])
-    scaler_meta = io_utils.load_pickle(os.path.join(art_dir, cfg_used["artifacts"]["scaler_file"]))
-    schema = io_utils.load_json(os.path.join(art_dir, cfg_used["artifacts"]["schema_file"]))
+    scaler_meta = io_utils.load_pickle(
+        os.path.join(art_dir, cfg_used["artifacts"]["scaler_file"])
+    )
+    schema_obj, schema_meta = io_utils.load_schema_artifact(
+        os.path.join(art_dir, cfg_used["artifacts"]["schema_file"])
+    )
+    schema_obj.validate_overrides(cfg_used.get("data", {}))
+    preprocess_cfg = cfg_used.setdefault("preprocess", {})
+    io_utils.validate_normalization_config(
+        preprocess_cfg, schema_meta.get("normalization")
+    )
 
     ids: List[str] = list(scaler_meta["ids"])
     method = scaler_meta["method"]
@@ -402,11 +411,12 @@ def predict_once(cfg: Dict) -> str:
     test_files = sorted(glob(os.path.join(test_dir, "TEST_*.csv")))
     for fp in test_files:
         df = pd.read_csv(fp)
+        schema_obj.require_columns(df.columns, context=fp)
         wide_raw = io_utils.pivot_long_to_wide(
             df,
-            date_col=schema["date"],
-            id_col=schema["id"],
-            target_col=schema["target"],
+            date_col=schema_obj["date"],
+            id_col=schema_obj["id"],
+            target_col=schema_obj["target"],
             fill_missing_dates=cfg_used["data"]["fill_missing_dates"],
             fillna0=True,
         )

@@ -712,7 +712,6 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     cfg["train"]["use_checkpoint"] = bool(use_checkpoint)
 
     # --- data loading
-    schema = io_utils.resolve_schema(cfg)
     data_cfg = cfg.setdefault("data", {})
     time_feature_cfg_raw = data_cfg.get("time_features") or {}
     time_feature_cfg = dict(time_feature_cfg_raw)
@@ -722,8 +721,13 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     enc = cfg["data"]["encoding"]
     train_path = cfg["data"]["train_csv"]
     df = pd.read_csv(train_path, encoding=enc)
+    schema = io_utils.DataSchema.from_config(data_cfg, sample_df=df)
+    data_cfg.setdefault("schema", schema.as_dict())
     wide_raw = io_utils.pivot_long_to_wide(
-        df, date_col=schema["date"], id_col=schema["id"], target_col=schema["target"],
+        df,
+        date_col=schema["date"],
+        id_col=schema["id"],
+        target_col=schema["target"],
         fill_missing_dates=cfg["data"]["fill_missing_dates"], fillna0=False
     )
     mask_wide = (~wide_raw.isna()).astype(np.float32)
@@ -1463,10 +1467,15 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     scaler_path = os.path.join(art_dir, cfg["artifacts"]["scaler_file"])
     schema_path = os.path.join(art_dir, cfg["artifacts"]["schema_file"])
     cfg_path = os.path.join(art_dir, cfg["artifacts"]["config_file"])
+    normalization_meta = {
+        "method": cfg["preprocess"]["normalize"],
+        "per_series": cfg["preprocess"]["normalize_per_series"],
+        "eps": cfg["preprocess"]["eps"],
+    }
     io_utils.save_pickle(
         {
             "scaler": scaler,
-            "method": cfg["preprocess"]["normalize"],
+            "method": normalization_meta["method"],
             "ids": ids,
             "static_features": series_static_np,
             "feature_names": static_feature_names,
@@ -1474,7 +1483,12 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         },
         scaler_path,
     )
-    io_utils.save_json({"date": schema["date"], "target": schema["target"], "id": schema["id"]}, schema_path)
+    io_utils.save_schema_artifact(
+        schema_path,
+        schema,
+        normalization=normalization_meta,
+        extras={"time_features": time_feature_meta},
+    )
     save_yaml(cfg, cfg_path)
     console().print(f"[green]Saved:[/green] {model_path}, {scaler_path}, {schema_path}, {cfg_path}")
     return best_nll, {
