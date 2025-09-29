@@ -9,7 +9,7 @@ import torch
 # Ensure the project src is on the path for imports
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
-from timesnet_forecast.config import Config
+from timesnet_forecast.config import PipelineConfig
 from timesnet_forecast import train
 from timesnet_forecast.models.timesnet import TimesNet
 from timesnet_forecast.utils import io as io_utils
@@ -85,6 +85,7 @@ def test_train_once_runs_without_pmax(tmp_path):
         "model.n_layers=1",
         "model.dropout=0.0",
         "model.k_periods=1",
+        "model.min_period_threshold=1",
         "model.kernel_set=[[3,3]]",
         "train.lr=1e-3",
         "train.weight_decay=0.0",
@@ -95,30 +96,31 @@ def test_train_once_runs_without_pmax(tmp_path):
         "artifacts.schema_file=schema.json",
         "artifacts.config_file=config.yaml",
     ]
-    cfg = Config.from_files("configs/default.yaml", overrides=overrides).to_dict()
+    cfg = PipelineConfig.from_files("configs/default.yaml", overrides=overrides)
+    cfg_dict = cfg.to_dict()
 
     df_loaded = pd.read_csv(csv_path)
-    schema = io_utils.DataSchema.from_config(cfg["data"], sample_df=df_loaded)
+    schema = io_utils.DataSchema.from_config(cfg_dict["data"], sample_df=df_loaded)
     wide = io_utils.pivot_long_to_wide(
         df_loaded,
         date_col=schema["date"],
         id_col=schema["id"],
         target_col=schema["target"],
-        fill_missing_dates=cfg["data"]["fill_missing_dates"],
+        fill_missing_dates=cfg_dict["data"]["fill_missing_dates"],
         fillna0=True,
     )
-    train_df, _ = make_holdout_slices(wide, cfg["train"]["val"]["holdout_days"])
+    train_df, _ = make_holdout_slices(wide, cfg_dict["train"]["val"]["holdout_days"])
     _, trn_norm = io_utils.fit_series_scaler(
         train_df,
-        cfg["preprocess"]["normalize"],
-        cfg["preprocess"]["normalize_per_series"],
-        cfg["preprocess"]["eps"],
+        cfg_dict["preprocess"]["normalize"],
+        cfg_dict["preprocess"]["normalize_per_series"],
+        cfg_dict["preprocess"]["eps"],
     )
-    assert trn_norm.shape[0] >= cfg["model"]["input_len"]
+    assert trn_norm.shape[0] >= cfg_dict["model"]["input_len"]
 
     train.train_once(cfg)
     scaler_meta = io_utils.load_pickle(
-        tmp_path / "artifacts" / cfg["artifacts"]["scaler_file"]
+        tmp_path / "artifacts" / cfg_dict["artifacts"]["scaler_file"]
     )
     static_features = scaler_meta.get("static_features")
     feature_names = scaler_meta.get("feature_names")
@@ -132,5 +134,5 @@ def test_train_once_runs_without_pmax(tmp_path):
         "seasonal_strength",
         "dominant_period",
     ]
-    assert "pmax" not in cfg.get("model", {})
+    assert "pmax" not in cfg_dict.get("model", {})
 

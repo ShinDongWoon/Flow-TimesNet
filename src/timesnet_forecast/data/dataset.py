@@ -42,6 +42,7 @@ class SlidingWindowDataset(Dataset):
         mode: str,  # "direct"|"recursive"
         recursive_pred_len: int | None = None,
         augment: Dict | None = None,
+        stride: int = 1,
         valid_mask: np.ndarray | None = None,  # [T, N]
         series_static: np.ndarray | None = None,
         series_ids: Sequence[int] | np.ndarray | None = None,
@@ -77,7 +78,12 @@ class SlidingWindowDataset(Dataset):
         self.time_shift = int(augment.get("time_shift", 0))
         # Indices where a full (L,H) window fits. ``self.H`` is the mode-specific
         # output length, so the last valid start index is ``T - L - H``.
-        self.idxs = np.arange(self.T - self.L - self.H + 1)
+        max_start = self.T - self.L - self.H
+        step = max(1, int(stride))
+        if max_start < 0:
+            self.idxs = np.zeros(0, dtype=np.int64)
+        else:
+            self.idxs = np.arange(0, max_start + 1, step, dtype=np.int64)
         # In recursive mode ``self.H`` may be 1 (training) or >1 (validation).
         self._X_tensor = torch.from_numpy(self.X)
         self._M_tensor = torch.from_numpy(self.M)

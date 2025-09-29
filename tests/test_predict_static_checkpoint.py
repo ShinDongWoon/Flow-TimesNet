@@ -159,6 +159,7 @@ def test_predict_once_restores_static_checkpoint(tmp_path):
             "amp": False,
             "use_checkpoint": False,
             "cuda_graphs": False,
+            "val": {"strategy": "holdout", "holdout_days": input_len + pred_len},
         },
         "model": {
             "mode": "direct",

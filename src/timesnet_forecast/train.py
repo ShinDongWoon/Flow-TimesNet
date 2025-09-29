@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 import math
-from typing import Dict, List, Tuple, Optional, Iterable
+from typing import Any, Dict, List, Tuple, Optional, Iterable
 import numpy as np
 import pandas as pd
 import torch
@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
-from .config import Config, save_yaml
+from .config import PipelineConfig, save_yaml
 from .utils.logging import console, print_config
 from .utils.seed import seed_everything
 from .losses import negative_binomial_mask, negative_binomial_nll
@@ -96,6 +96,7 @@ def _build_dataloader(
     masks: List[np.ndarray | None],
     input_len: int,
     pred_len: int,
+    stride: int,
     mode: str,
     batch_size: int,
     num_workers: int,
@@ -136,6 +137,7 @@ def _build_dataloader(
             time_index=time_indices[i] if time_indices is not None else None,
             time_features=time_features[i] if time_features is not None else None,
             time_feature_config=time_feature_config,
+            stride=stride,
         )
         for i, (a, m) in enumerate(zip(arrays, masks))
     ]
@@ -693,8 +695,32 @@ def _eval_metrics(
     return {"nll": nll_num / denom, "smape": smape}
 
 
-def train_once(cfg: Dict) -> Tuple[float, Dict]:
+def train_once(cfg: PipelineConfig | Dict[str, Any]) -> Tuple[float, Dict]:
     # --- bootstrap
+    if isinstance(cfg, PipelineConfig):
+        pipeline_cfg = cfg
+        cfg = pipeline_cfg.to_dict()
+    elif isinstance(cfg, dict):
+        pipeline_cfg = PipelineConfig.from_mapping(cfg)
+        cfg = pipeline_cfg.to_dict()
+    else:
+        raise TypeError("cfg must be a PipelineConfig or mapping")
+
+    window_cfg = pipeline_cfg.window
+    cfg.setdefault("window", {}).update(window_cfg.to_dict())
+    cfg.setdefault("model", {}).update(pipeline_cfg.model.to_dict(window_cfg))
+    cfg.setdefault("artifacts", {}).setdefault("signature_file", "model_signature.json")
+
+    train_section = cfg.setdefault("train", {})
+    val_section = train_section.setdefault("val", {})
+    if pipeline_cfg.train.val_holdout_days is not None:
+        val_section.setdefault("holdout_days", int(pipeline_cfg.train.val_holdout_days))
+    val_section.setdefault("strategy", pipeline_cfg.train.val_strategy)
+    if pipeline_cfg.train.val_rolling_folds is not None:
+        val_section.setdefault("rolling_folds", int(pipeline_cfg.train.val_rolling_folds))
+    if pipeline_cfg.train.val_rolling_step_days is not None:
+        val_section.setdefault("rolling_step_days", int(pipeline_cfg.train.val_rolling_step_days))
+
     device = _select_device(cfg["train"]["device"])
     deterministic = bool(cfg["train"].get("deterministic", False))
     torch.set_float32_matmul_precision(cfg["train"]["matmul_precision"])
@@ -819,8 +845,10 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     cfg["model"]["min_period_threshold"] = min_period_threshold
 
     # --- dataloaders
-    input_len = int(cfg["model"]["input_len"])
-    pred_len = int(cfg["model"]["pred_len"])
+    input_len = int(window_cfg.input_len)
+    pred_len = int(window_cfg.pred_len)
+    cfg["model"]["input_len"] = input_len
+    cfg["model"]["pred_len"] = pred_len
     mode = cfg["model"]["mode"]
     series_id_array = np.arange(len(ids), dtype=np.int64)
     train_static_list = [series_static_np] * len(train_arrays)
@@ -828,7 +856,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     train_id_list = [series_id_array] * len(train_arrays)
     val_id_list = [series_id_array] * len(val_arrays)
     dl_train = _build_dataloader(
-        train_arrays, train_mask_arrays, input_len, pred_len, mode, cfg["train"]["batch_size"],
+        train_arrays, train_mask_arrays, input_len, pred_len, window_cfg.stride, mode, cfg["train"]["batch_size"],
         cfg["train"]["num_workers"], cfg["train"]["pin_memory"], cfg["train"]["persistent_workers"],
         cfg["train"]["prefetch_factor"], shuffle=True, drop_last=True,
         augment=cfg["data"].get("augment"),
@@ -838,7 +866,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         time_feature_config=time_feature_cfg if time_features_enabled else None,
     )
     dl_val = _build_dataloader(
-        val_arrays, val_mask_arrays, input_len, pred_len, mode, batch_size=cfg["train"]["batch_size"],
+        val_arrays, val_mask_arrays, input_len, pred_len, window_cfg.stride, mode, batch_size=cfg["train"]["batch_size"],
         num_workers=cfg["train"]["num_workers"], pin_memory=cfg["train"]["pin_memory"],
         persistent_workers=cfg["train"]["persistent_workers"], prefetch_factor=cfg["train"]["prefetch_factor"],
         shuffle=False, drop_last=False,
@@ -1467,6 +1495,7 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
     scaler_path = os.path.join(art_dir, cfg["artifacts"]["scaler_file"])
     schema_path = os.path.join(art_dir, cfg["artifacts"]["schema_file"])
     cfg_path = os.path.join(art_dir, cfg["artifacts"]["config_file"])
+    signature_path = os.path.join(art_dir, cfg["artifacts"]["signature_file"])
     normalization_meta = {
         "method": cfg["preprocess"]["normalize"],
         "per_series": cfg["preprocess"]["normalize_per_series"],
@@ -1490,7 +1519,49 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
         extras={"time_features": time_feature_meta},
     )
     save_yaml(cfg, cfg_path)
-    console().print(f"[green]Saved:[/green] {model_path}, {scaler_path}, {schema_path}, {cfg_path}")
+    preprocess_signature = dict(normalization_meta)
+    preprocess_signature["schema_artifact_version"] = io_utils.SCHEMA_ARTIFACT_VERSION
+    static_feature_dim = (
+        int(series_static_np.shape[1])
+        if isinstance(series_static_np, np.ndarray) and series_static_np.size > 0
+        else 0
+    )
+    signature_payload = {
+        "signature_version": 1,
+        "window": window_cfg.to_dict(),
+        "model": {
+            "mode": str(cfg["model"]["mode"]),
+            "d_model": int(cfg["model"]["d_model"]),
+            "d_ff": int(cfg["model"]["d_ff"]),
+            "n_layers": int(cfg["model"]["n_layers"]),
+            "k_periods": int(cfg["model"]["k_periods"]),
+            "min_period_threshold": int(cfg["model"]["min_period_threshold"]),
+            "id_embed_dim": int(cfg["model"]["id_embed_dim"]),
+            "static_proj_dim": (
+                None if cfg["model"]["static_proj_dim"] is None else int(cfg["model"]["static_proj_dim"])
+            ),
+        },
+        "train": {
+            "batch_size": int(cfg["train"]["batch_size"]),
+            "channels_last": bool(cfg["train"]["channels_last"]),
+            "use_checkpoint": bool(cfg["train"]["use_checkpoint"]),
+            "min_sigma_effective": float(cfg["train"].get("min_sigma_effective", 0.0)),
+            "min_sigma_method": cfg["train"].get("min_sigma_method"),
+            "min_sigma_scale": float(cfg["train"].get("min_sigma_scale", 0.0)),
+        },
+        "data": {
+            "num_series": len(ids),
+            "static_feature_dim": static_feature_dim,
+            "time_feature_dim": int(time_feature_dim),
+            "time_features_enabled": bool(time_features_enabled and time_feature_dim > 0),
+            "time_feature_freq": inferred_freq,
+        },
+        "preprocess": preprocess_signature,
+    }
+    io_utils.save_json(signature_payload, signature_path)
+    console().print(
+        f"[green]Saved:[/green] {model_path}, {scaler_path}, {schema_path}, {cfg_path}, {signature_path}"
+    )
     return best_nll, {
         "model": model_path,
         "scaler": scaler_path,
@@ -1502,12 +1573,13 @@ def train_once(cfg: Dict) -> Tuple[float, Dict]:
 
 def main() -> None:
     import argparse
-    from .config import Config
+    from .config import PipelineConfig
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--override", nargs="*", default=[])
     args = parser.parse_args()
-    cfg = Config.from_files(args.config, overrides=args.override).to_dict()
+    cfg = PipelineConfig.from_files(args.config, overrides=args.override)
     best_nll, paths = train_once(cfg)
     metrics = paths.get("metrics") if isinstance(paths, dict) else None
     if isinstance(metrics, dict) and "smape" in metrics:

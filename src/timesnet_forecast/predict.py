@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import os
 from glob import glob
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Tuple
 import numpy as np
 import pandas as pd
 import torch
 from pandas.tseries.frequencies import to_offset
 
-from .config import Config
+from .config import PipelineConfig
 from .utils.logging import console
 from .utils.torch_opt import amp_autocast
 from .utils import io as io_utils
@@ -20,6 +20,55 @@ def _select_device(req: str) -> torch.device:
     if req == "cuda" and torch.cuda.is_available():
         return torch.device("cuda:0")
     return torch.device("cpu")
+
+
+def _validate_signature(signature: Mapping[str, Any], cfg: PipelineConfig) -> None:
+    errors: List[str] = []
+    window_sig = signature.get("window") if isinstance(signature, Mapping) else None
+    if isinstance(window_sig, Mapping):
+        sig_input = window_sig.get("input_len")
+        if sig_input is not None and int(sig_input) != cfg.window.input_len:
+            errors.append(
+                f"Configured window.input_len={cfg.window.input_len} differs from checkpoint value {sig_input}"
+            )
+        sig_pred = window_sig.get("pred_len")
+        if sig_pred is not None and int(sig_pred) != cfg.window.pred_len:
+            errors.append(
+                f"Configured window.pred_len={cfg.window.pred_len} differs from checkpoint value {sig_pred}"
+            )
+        sig_stride = window_sig.get("stride")
+        if sig_stride is not None and int(sig_stride) != cfg.window.stride:
+            errors.append(
+                f"Configured window.stride={cfg.window.stride} differs from checkpoint value {sig_stride}"
+            )
+    model_sig = signature.get("model") if isinstance(signature, Mapping) else None
+    if isinstance(model_sig, Mapping):
+        for key in ["d_model", "d_ff", "n_layers", "k_periods", "min_period_threshold", "id_embed_dim"]:
+            sig_val = model_sig.get(key)
+            if sig_val is None:
+                continue
+            current_val = getattr(cfg.model, key)
+            if int(sig_val) != int(current_val):
+                errors.append(
+                    f"Configured model.{key}={current_val} differs from checkpoint value {sig_val}"
+                )
+        sig_proj = model_sig.get("static_proj_dim")
+        current_proj = cfg.model.static_proj_dim
+        if sig_proj is not None:
+            sig_proj_val = None if sig_proj in {None, "null"} else int(sig_proj)
+            if sig_proj_val != current_proj:
+                errors.append(
+                    f"Configured model.static_proj_dim={current_proj} differs from checkpoint value {sig_proj_val}"
+                )
+        sig_mode = model_sig.get("mode")
+        if sig_mode is not None and str(sig_mode) != cfg.model.mode:
+            errors.append(
+                f"Configured model.mode={cfg.model.mode} differs from checkpoint value {sig_mode}"
+            )
+    if errors:
+        raise ValueError(
+            "Configuration incompatible with checkpoint metadata:\n" + "\n".join(f"- {msg}" for msg in errors)
+        )
 def _invoke_model(
     model: TimesNet,
     xb: torch.Tensor,
@@ -104,17 +153,53 @@ def forecast_recursive_batch(
     return torch.cat(rates, dim=1), torch.cat(dispersions, dim=1)
 
 
-def predict_once(cfg: Dict) -> str:
-    art_dir = cfg["artifacts"]["dir"]
-    cfg_used = io_utils.load_yaml(os.path.join(art_dir, cfg["artifacts"]["config_file"]))
-    cfg_used.setdefault("artifacts", {}).update(cfg["artifacts"])
-    for k, v in cfg.items():
-        if k in {"model", "artifacts"}:
+def predict_once(cfg: PipelineConfig | Dict[str, Any]) -> str:
+    if isinstance(cfg, PipelineConfig):
+        runtime_cfg = cfg
+    elif isinstance(cfg, dict):
+        runtime_cfg = PipelineConfig.from_mapping(cfg)
+    else:
+        raise TypeError("cfg must be a PipelineConfig or mapping")
+
+    runtime_dict = runtime_cfg.to_dict()
+    runtime_artifacts = runtime_dict.setdefault("artifacts", {})
+    runtime_artifacts.setdefault("signature_file", "model_signature.json")
+    art_dir = runtime_artifacts["dir"]
+
+    trained_raw = io_utils.load_yaml(
+        os.path.join(art_dir, runtime_artifacts["config_file"])
+    )
+    trained_cfg = PipelineConfig.from_mapping(trained_raw)
+
+    merged_dict = trained_cfg.to_dict()
+    merged_dict.setdefault("artifacts", {}).update(runtime_artifacts)
+    for key, value in runtime_dict.items():
+        if key == "artifacts":
             continue
-        if isinstance(v, dict):
-            cfg_used.setdefault(k, {}).update(v)
+        if isinstance(value, dict):
+            merged_dict.setdefault(key, {}).update(value)
         else:
-            cfg_used[k] = v
+            merged_dict[key] = value
+
+    active_cfg = PipelineConfig.from_mapping(merged_dict)
+    cfg_used = active_cfg.to_dict()
+
+    signature_file = cfg_used["artifacts"].get("signature_file", "model_signature.json")
+    signature_path = os.path.join(art_dir, signature_file)
+    signature_meta: Mapping[str, Any] | None = None
+    if os.path.exists(signature_path):
+        try:
+            signature_meta = io_utils.load_json(signature_path)
+        except Exception as err:  # noqa: BLE001
+            console().print(
+                f"[yellow]Failed to read signature metadata '{signature_path}': {err}. Continuing without compatibility checks.[/yellow]"
+            )
+    else:
+        console().print(
+            f"[yellow]Signature metadata '{signature_path}' not found; compatibility checks skipped.[/yellow]"
+        )
+    if signature_meta is not None:
+        _validate_signature(signature_meta, active_cfg)
 
     device = _select_device(cfg_used["train"]["device"])
     torch.backends.cudnn.benchmark = True
@@ -149,6 +234,25 @@ def predict_once(cfg: Dict) -> str:
         {"feature_dim": meta_dim, "freq": meta_freq, "enabled": meta_enabled}
     )
     time_features_enabled = bool(meta_enabled and meta_dim > 0)
+
+    if signature_meta is not None:
+        data_sig = signature_meta.get("data") if isinstance(signature_meta, Mapping) else None
+        if isinstance(data_sig, Mapping):
+            sig_series = data_sig.get("num_series")
+            if sig_series is not None and int(sig_series) != len(ids):
+                raise ValueError(
+                    f"Checkpoint expects {sig_series} series but scaler metadata provides {len(ids)}"
+                )
+            sig_time_dim = data_sig.get("time_feature_dim")
+            if sig_time_dim is not None and int(sig_time_dim) != int(meta_dim):
+                raise ValueError(
+                    "Time feature dimension does not match checkpoint metadata"
+                )
+            sig_time_enabled = data_sig.get("time_features_enabled")
+            if sig_time_enabled is not None and bool(sig_time_enabled) != bool(time_features_enabled):
+                raise ValueError(
+                    "Time feature enablement differs from checkpoint metadata"
+                )
 
     static_features_np = None
     static_feature_ids: List[str] | None = None
@@ -234,6 +338,20 @@ def predict_once(cfg: Dict) -> str:
                 )
             static_tensor_full = aligned
 
+    if signature_meta is not None:
+        data_sig = signature_meta.get("data") if isinstance(signature_meta, Mapping) else None
+        if isinstance(data_sig, Mapping):
+            sig_static_dim = data_sig.get("static_feature_dim")
+            actual_static_dim = (
+                int(static_tensor_full.size(1))
+                if isinstance(static_tensor_full, torch.Tensor) and static_tensor_full.ndim == 2
+                else 0
+            )
+            if sig_static_dim is not None and int(sig_static_dim) != actual_static_dim:
+                raise ValueError(
+                    f"Static feature dimension {actual_static_dim} does not match checkpoint metadata {sig_static_dim}"
+                )
+
     id_position_map = {series_id: idx for idx, series_id in enumerate(ids)}
     full_series_ids_tensor = torch.arange(len(ids), dtype=torch.long, device=device)
 
@@ -257,8 +375,12 @@ def predict_once(cfg: Dict) -> str:
         else:
             min_sigma_vector_tensor = min_sigma_vector_tensor.reshape(1, 1, -1)
 
-    input_len = int(cfg_used["model"]["input_len"])
-    pred_len = int(cfg_used["model"]["pred_len"])
+    window_cfg = active_cfg.window
+    cfg_used.setdefault("window", {}).update(window_cfg.to_dict())
+    cfg_used.setdefault("model", {}).update(active_cfg.model.to_dict(window_cfg))
+
+    input_len = int(window_cfg.input_len)
+    pred_len = int(window_cfg.pred_len)
     model_cfg = cfg_used["model"]
     d_model = int(model_cfg["d_model"])
     d_ff = int(model_cfg.get("d_ff", 4 * d_model))
@@ -450,10 +572,29 @@ def predict_once(cfg: Dict) -> str:
                 else:
                     Xn[:, j] = X[:, j]
 
+        disable_marks_for_batch = False
         if Xn.shape[0] < input_len:
-            raise ValueError(
-                f"Test series '{fp}' shorter than required input_len={input_len}"
-            )
+            missing = int(input_len - Xn.shape[0])
+            strategy = window_cfg.short_series_strategy
+            if strategy == "repeat":
+                pad_source = Xn[:1] if Xn.size > 0 else np.zeros((1, Xn.shape[1]), dtype=np.float32)
+                pad_block = np.repeat(pad_source, missing, axis=0)
+                Xn = np.concatenate([pad_block, Xn], axis=0)
+                disable_marks_for_batch = True
+                console().print(
+                    f"[yellow]{fp} shorter than input_len={input_len}; repeating earliest observations to fill the window.[/yellow]"
+                )
+            elif strategy == "pad":
+                pad_block = np.full((missing, Xn.shape[1]), window_cfg.pad_value, dtype=np.float32)
+                Xn = np.concatenate([pad_block, Xn], axis=0)
+                disable_marks_for_batch = True
+                console().print(
+                    f"[yellow]{fp} shorter than input_len={input_len}; padding leading values with {window_cfg.pad_value}.[/yellow]"
+                )
+            else:
+                raise ValueError(
+                    f"Test series '{fp}' shorter than required input_len={input_len} and window.short_series_strategy='error'"
+                )
         gather_positions = [id_position_map[c] for c in present_columns]
         gather_idx_np = np.asarray(gather_positions, dtype=np.int64)
         last_seq_full = Xn[-input_len:, :]
@@ -470,7 +611,7 @@ def predict_once(cfg: Dict) -> str:
         )
         x_mark_tensor: torch.Tensor | None = None
         y_mark_tensor: torch.Tensor | None = None
-        if time_features_enabled:
+        if time_features_enabled and not disable_marks_for_batch:
             history_index = pd.DatetimeIndex(wide.index)
             recent_index = history_index[-input_len:]
             active_cfg = dict(meta_config)
@@ -504,6 +645,10 @@ def predict_once(cfg: Dict) -> str:
                         y_mark_np = marks_np[input_len:]
                         x_mark_tensor = torch.from_numpy(x_mark_np).unsqueeze(0)
                         y_mark_tensor = torch.from_numpy(y_mark_np).unsqueeze(0)
+        elif time_features_enabled and disable_marks_for_batch:
+            console().print(
+                f"[yellow]Temporal marks disabled for {fp} because padded windows may not align with calendar frequencies.[/yellow]"
+            )
         if cfg_used["train"]["channels_last"]:
             xb = xb.unsqueeze(-1).to(
                 device=device,
@@ -596,7 +741,7 @@ def main() -> None:
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--override", nargs="*", default=[])
     args = parser.parse_args()
-    cfg = Config.from_files(args.config, overrides=args.override).to_dict()
+    cfg = PipelineConfig.from_files(args.config, overrides=args.override)
     predict_once(cfg)
 
 
