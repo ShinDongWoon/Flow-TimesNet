@@ -24,6 +24,7 @@ from .utils.torch_opt import (
 )
 from .utils.metrics import wsmape_grouped, smape_mean
 from .utils import io as io_utils
+from .utils import metadata as metadata_utils
 from .utils.static_features import compute_series_features
 from .data.split import make_holdout_slices, make_rolling_slices
 from .data.dataset import SlidingWindowDataset
@@ -709,7 +710,9 @@ def train_once(cfg: PipelineConfig | Dict[str, Any]) -> Tuple[float, Dict]:
     window_cfg = pipeline_cfg.window
     cfg.setdefault("window", {}).update(window_cfg.to_dict())
     cfg.setdefault("model", {}).update(pipeline_cfg.model.to_dict(window_cfg))
-    cfg.setdefault("artifacts", {}).setdefault("signature_file", "model_signature.json")
+    artifacts_section = cfg.setdefault("artifacts", {})
+    artifacts_section.setdefault("signature_file", "model_signature.json")
+    artifacts_section.setdefault("metadata_file", "metadata.json")
 
     train_section = cfg.setdefault("train", {})
     val_section = train_section.setdefault("val", {})
@@ -1496,6 +1499,7 @@ def train_once(cfg: PipelineConfig | Dict[str, Any]) -> Tuple[float, Dict]:
     schema_path = os.path.join(art_dir, cfg["artifacts"]["schema_file"])
     cfg_path = os.path.join(art_dir, cfg["artifacts"]["config_file"])
     signature_path = os.path.join(art_dir, cfg["artifacts"]["signature_file"])
+    metadata_path = os.path.join(art_dir, cfg["artifacts"]["metadata_file"])
     normalization_meta = {
         "method": cfg["preprocess"]["normalize"],
         "per_series": cfg["preprocess"]["normalize_per_series"],
@@ -1526,6 +1530,17 @@ def train_once(cfg: PipelineConfig | Dict[str, Any]) -> Tuple[float, Dict]:
         if isinstance(series_static_np, np.ndarray) and series_static_np.size > 0
         else 0
     )
+    metadata_artifact = metadata_utils.MetadataArtifact.from_training(
+        window=window_cfg,
+        schema=schema,
+        time_features=time_feature_meta,
+        static_features={
+            "feature_names": list(static_feature_names or []),
+            "feature_dim": static_feature_dim,
+        },
+    )
+    metadata_utils.save_metadata_artifact(metadata_artifact, metadata_path)
+
     signature_payload = {
         "signature_version": 1,
         "window": window_cfg.to_dict(),
@@ -1560,7 +1575,7 @@ def train_once(cfg: PipelineConfig | Dict[str, Any]) -> Tuple[float, Dict]:
     }
     io_utils.save_json(signature_payload, signature_path)
     console().print(
-        f"[green]Saved:[/green] {model_path}, {scaler_path}, {schema_path}, {cfg_path}, {signature_path}"
+        f"[green]Saved:[/green] {model_path}, {scaler_path}, {schema_path}, {cfg_path}, {signature_path}, {metadata_path}"
     )
     return best_nll, {
         "model": model_path,
@@ -1575,9 +1590,27 @@ def main() -> None:
     import argparse
     from .config import PipelineConfig
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/default.yaml")
-    parser.add_argument("--override", nargs="*", default=[])
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train a TimesNet forecaster and emit artifacts including metadata.json "
+            "for compatibility checks."
+        )
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="configs/default.yaml",
+        help="Path to the pipeline configuration YAML file.",
+    )
+    parser.add_argument(
+        "--override",
+        nargs="*",
+        default=[],
+        help=(
+            "Override configuration entries using key=value pairs (e.g. "
+            "window.input_len=64 submission.format=row_key)."
+        ),
+    )
     args = parser.parse_args()
     cfg = PipelineConfig.from_files(args.config, overrides=args.override)
     best_nll, paths = train_once(cfg)

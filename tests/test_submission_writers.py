@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 
 import pandas as pd
+import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -10,6 +11,7 @@ from timesnet_forecast.utils.submission import (  # noqa: E402
     RowKeyLongWriter,
     SubmissionRowMeta,
     build_submission_context,
+    get_submission_writer,
 )
 
 
@@ -145,3 +147,10 @@ def test_date_menu_writer_synthesizes_template_without_sample():
     assert out.loc[1, "MENU_2"] == 4.0
     assert out.loc[2, "MENU_1"] == 0.0
     assert out.loc[2, "MENU_2"] == 0.0
+
+
+def test_get_submission_writer_dispatches_and_validates():
+    assert get_submission_writer("row_key") is RowKeyLongWriter
+    assert get_submission_writer("date_menu") is DateMenuWriter
+    with pytest.raises(KeyError):
+        get_submission_writer("unknown_format")

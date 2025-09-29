@@ -97,6 +97,8 @@ artifacts:
   scaler_file: "scaler.pkl"
   schema_file: "schema.json"
   config_file: "config_used.yaml"
+  signature_file: "model_signature.json"
+  metadata_file: "metadata.json"
 
 submission:
   out_path: "outputs/submissions/submission.csv"
