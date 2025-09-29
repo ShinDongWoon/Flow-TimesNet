@@ -13,6 +13,80 @@ Keeps the canonical `[B, T, N] → [B, H, N]` interface while adding robust cont
 - **Modular data I/O.** Input schemas and test loaders are fully pluggable. Swap CSV layouts, feature sets, and eval folds via config — no code surgery required.
 
 ---
+# TimesNet with Advanced Embeddings: An Architectural Deep Dive
+
+This document outlines the architectural innovations implemented in this repository to effectively integrate external features (embeddings) into the TimesNet model, a task that presents significant conceptual and technical challenges.
+
+---
+
+## 1. The Challenge: Why Is Adding Embeddings to TimesNet Difficult?
+
+TimesNet's core strength lies in its unique ability to transform a 1D time-series into a 2D tensor, allowing it to capture both intra-period (within a cycle) and inter-period (between cycles) variations simultaneously.
+
+> This 2D transformation is fundamental to the model's performance. A naive injection of external information can disrupt this delicate structure, much like shouting over a finely tuned orchestra, leading to performance degradation.
+
+### Conceptual Challenge: Architectural Disruption
+Simply adding embedding vectors to the initial time-series values "contaminates" the signal. The model, which is designed to find periodicities in the original signal, gets confused by this new, unrelated information, making it difficult to perform its primary task of 2D spectral analysis.
+
+### Technical Challenge: The 4D Tensor Problem & Memory Explosion
+A critical issue arises when handling **static embeddings** (e.g., store ID, item category). To provide this context to every time step of every series, a naive approach would expand the data tensor from 3D `[Batch, Time, Series]` to 4D `[Batch, Time, Series, Features]`. This leads to a massive increase in GPU memory usage, rendering the model impractical for large datasets and undermining TimesNet's efficiency.
+
+---
+
+## 2. Our Solution: Decoupled Context Injection
+
+To overcome these challenges, we designed a novel architecture that **decouples the context injection from the primary time-series analysis path**. Instead of contaminating the input signal, we provide context through two specialized, non-invasive channels.
+
+### For Temporal Features (`x_mark`)
+Dynamic, time-varying features (like date-related embeddings) are handled at the initial embedding stage (`DataEmbedding`). This is a standard and robust approach where temporal context is blended with the value and positional embeddings before the main TimesNet blocks, enriching the initial signal without fundamentally altering its structure.
+
+### For Static Features (`series_ids`, `series_static`)
+This is where our core innovation lies. Static context is injected via a dual-pathway mechanism that influences the model without passing through the sensitive 2D transformation pipeline.
+
+**1. Zero-Mean Temporal Context (`LowRankTemporalContext`)**
+-   **Idea:** Instead of a constant, jarring signal, we generate a smooth, time-varying "context signal" that has a mean of zero. This signal subtly modulates the time-series pattern based on its static ID without affecting its overall scale.
+-   **Effect:** This allows the model to learn how a series' unique ID influences its temporal dynamics (e.g., "Store A has a sharper morning peak than Store B") while preserving the integrity of the signal for periodicity analysis.
+
+**2. Late-Stage Bias Injection (`LateBiasHead`)**
+-   **Idea:** A series' static features often directly influence its absolute value, or level (e.g., "Store A is a high-volume store"). This effect is best applied at the end of the process.
+-   **Effect:** After the TimesNet blocks have analyzed the temporal patterns, a separate head uses the static embedding to apply a final, direct bias to the output forecast. This accurately models the scale/level component of the forecast without interfering with the pattern analysis.
+
+---
+
+## 3. Mathematical Foundation: Low-Rank Temporal Context
+
+The elegance of the `LowRankTemporalContext` module comes from its use of **Low-Rank Approximation**, a powerful mathematical principle for efficient signal representation.
+
+### The Principle
+Instead of learning a unique and complex context signal $S_{t,n}foreverytimestep for every time step foreverytimesteptandseries and series andseriesn,weapproximateitasalinearcombinationofasmallset(, we approximate it as a linear combination of a small set (,weapproximateitasalinearcombinationofasmallset(R)ofshared,fundamental"basissignals") of shared, fundamental "basis signals" )ofshared,fundamental"basissignals"b_r(t).Theindividualityofeachseries.
+
+The individuality of each series .Theindividualityofeachseriesniscapturedbyasmallsetofcoefficients is captured by a small set of coefficients iscapturedbyasmallsetofcoefficientsw_{n,r}$ that define the unique "recipe" for mixing these basis signals.
+
+$$ S_{t, n} \approx \sum_{r=1}^{R} w_{n,r} \cdot b_r(t) $$
+
+Where $R \ll L$ (the sequence length). This dramatically reduces the number of parameters to be learned from $L \times N$ to approximately $R \times N$.
+
+### Implementation Details
+
+**1. Basis Signal Generation (`_compute_basis`)**
+We use Discrete Cosine Transform (DCT)-like functions as our basis signals, which are excellent for approximating natural signals efficiently. The formula for the $r$-th basis signal at time $t$ is:
+
+$$ b_r(t) = \cos\left(\frac{\pi}{L} \left(t + \frac{1}{2}\right) r\right) 
+
+Crucially, we enforce a zero-mean constraint on these basis signals, ensuring that the resulting context signal does not shift the scale of the original time-series.
+
+**2. Coefficient Learning & Signal Synthesis (`forward`)**
+A linear layer learns the coefficients $\boldsymbol{w}_n = [w_{n,1}, \dots, w_{n,R}]$ from each series' static embedding vector $\boldsymbol{e}_n..
+
+.$ \boldsymbol{w}_n = \text{Linear}(\boldsymbol{e}_n) 
+
+The final context signal is then synthesized using an efficient `torch.einsum` operation that performs the weighted sum for all series in a batch simultaneously:
+
+```python
+# context [B, L, N] is synthesized from basis [L, R] and coeff [B, N, R]
+context = torch.einsum("lr,bnr->bln", basis, coeff)
+
+---
 
 ## What’s New (Core Behavior Updates)
 - **Strict validation windowing.** The **validation holdout period must be at least `input_len + pred_len` days**. The trainer enforces this and raises a clear error otherwise.
@@ -61,7 +135,6 @@ Keeps the canonical `[B, T, N] → [B, H, N]` interface while adding robust cont
 **Net effect:** Embeddings raise *semantic SNR*, **2D Inception CNN** exploits *phase-by-cycle* structure, and the **probabilistic head** adapts level/dispersion per series — a synergistic trio that outperforms naively stacked modules.
 
 ---
-
 ## Architecture Overview
 
 - **DataEmbedding**: value + positional + optional time features; integrates **ID & static** embeddings and **LRTC**.  
