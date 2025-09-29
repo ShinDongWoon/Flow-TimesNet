@@ -7,8 +7,8 @@ Keeps the canonical `[B, T, N] → [B, H, N]` interface while adding robust cont
 ---
 
 ## TL;DR
-- **Beyond vanilla TimesNet.** We preserve TimesNet’s FFT-to-2D idea but add: channel-robust *shared* period search, **PeriodGrouper** (merge penalized/duplicate periods), **rich embeddings** (IDs + statics + low-rank temporal context), and an **adaptive probabilistic head** (Negative Binomial optional) with stability guards.
-- **CNN synergy.** Embeddings lift semantic signal; the 2D Inception CNN captures intra-/inter-period structure; the probabilistic head calibrates mean/variance per series and horizon — *three gears meshing* for accuracy and robustness.
+- **Beyond vanilla TimesNet.** We preserve TimesNet’s FFT-to-2D idea but add: channel-robust *shared* period search, **PeriodGrouper** (merge penalized/duplicate periods), **rich embeddings** (IDs + statics + low-rank temporal context), and an **adaptive probabilistic head** (Negative Binomial with dispersion floors) for stability.
+- **CNN synergy.** Embeddings lift semantic signal; the 2D Inception CNN captures intra-/inter-period structure; the probabilistic head calibrates rate/dispersion per series and horizon — *three gears meshing* for accuracy and robustness.
 - **Direct & recursive.** Train once, forecast direct (`H` at once) or recursive (rolling one-step) with the same checkpoints.
 - **Modular data I/O.** Input schemas and test loaders are fully pluggable. Swap CSV layouts, feature sets, and eval folds via config — no code surgery required.
 
@@ -18,13 +18,12 @@ Keeps the canonical `[B, T, N] → [B, H, N]` interface while adding robust cont
 - **Strict validation windowing.** The **validation holdout period must be at least `input_len + pred_len` days**. The trainer enforces this and raises a clear error otherwise.
 - **Experiment lineage.** Training emits a `artifacts/metadata.json` (**`meta_version=1`**) capturing window configuration, detected schema, time-feature settings, and static-feature names. The prediction CLI **validates metadata** to surface configuration drift between train and inference.
 - **Submission format.** Submissions now write **actual business dates** in the first column (no opaque row keys).
-- **Early stopping (optional).** Set `train.early_stopping_patience: <int>` to stop when **validation Gaussian NLL** fails to improve for that many consecutive epochs. Leave unset or `null` to disable.
+- **Early stopping (optional).** Set `train.early_stopping_patience: <int>` to stop when **validation NB NLL** fails to improve for that many consecutive epochs. Leave unset or `null` to disable.
 - **Simple data augmentation.** Enable `data.augment`:
   - `add_noise_std`: std-dev of Gaussian noise added to input windows.
   - `time_shift`: maximum random shift (in steps) applied to window start.
 - **Normalization defaults.** `preprocess.normalize: "none"` by default — the model learns on the **original scale**. If disabled, the **saved scaler artifact stores `None`**.
-- **Probabilistic forecasts.** The default head predicts **Gaussian (`mu`, `sigma`)** and training optimizes **Gaussian NLL** with `train.min_sigma` as a lower bound for stability. **Validation selects by mean Gaussian NLL** while still reporting **sMAPE** as a secondary diagnostic.
-  - **Negative Binomial** remains available: set `head.distribution: nb` to train with NB-NLL (helpful for over-dispersed counts).
+- **Probabilistic forecasts.** The head predicts **Negative Binomial (`rate`, `dispersion`)** and training optimizes **NB-NLL** with `train.min_sigma` (or a learned vector) supplying dispersion floors for stability. **Validation selects by mean NB-NLL** while still reporting **sMAPE** as a secondary diagnostic.
 - **Config renames & backward compatibility.**
   - `model.inception_kernel_set` → **`model.kernel_set`** (old name still accepted; a deprecation warning is logged).
   - `model.bottleneck_ratio` controls 1×1 → k×k → 1×1 bottlenecks in each Inception branch.  
@@ -56,10 +55,10 @@ Keeps the canonical `[B, T, N] → [B, H, N]` interface while adding robust cont
    - **PeriodGrouper** merges near-duplicate periods (log buckets, min-cycle guards), producing stable, *soft-weighted* candidates for CNN processing.
 
 3. **Adaptive probabilistic head**
-   - **Gaussian (`mu`, `sigma`)** by default with **`min_sigma`** guard; **NB(rate, dispersion)** optional for count/intermittent demand.
+   - **Negative Binomial (`rate`, `dispersion`)** with `min_sigma`/per-series floors to keep dispersion positive on sparse demand.
    - Heads are AMP-safe; outputs are masked at invalid points.
 
-**Net effect:** Embeddings raise *semantic SNR*, **2D Inception CNN** exploits *phase-by-cycle* structure, and the **probabilistic head** adapts level/variance per series — a synergistic trio that outperforms naively stacked modules.
+**Net effect:** Embeddings raise *semantic SNR*, **2D Inception CNN** exploits *phase-by-cycle* structure, and the **probabilistic head** adapts level/dispersion per series — a synergistic trio that outperforms naively stacked modules.
 
 ---
 
@@ -69,8 +68,8 @@ Keeps the canonical `[B, T, N] → [B, H, N]` interface while adding robust cont
 - **FFTPeriodSelector**: channel-robust spectrum summary → top-k frequencies (DC removed, long-period damped) → period lengths (≥2 cycles).  
 - **PeriodGrouper**: merges close periods, yields logits for **softmax weighting**.  
 - **TimesBlock (2D Inception CNN)**: reshape `[B,T,N]` to period grids, apply **multi-kernel Inception** with bottlenecks, compute residuals, then **weighted sum across periods**.  
-- **Forecast head**: time projection to horizon `H`, plus **Gaussian or NB** heads with stability floors.  
-- **Training**: Gaussian-NLL (**default**) or NB-NLL (optional), AMP-safe; supports **direct** and **recursive** decoding; logs **sMAPE/NLL** and coverage.
+- **Forecast head**: time projection to horizon `H`, plus **Negative Binomial** rate/dispersion heads with stability floors.
+- **Training**: NB-NLL (**default**) with AMP-safe masking; supports **direct** and **recursive** decoding; logs **sMAPE/NLL** and coverage.
 
 ---
 
@@ -103,20 +102,20 @@ python -m timesnet_forecast.cli tune \
 ## Recursive-TimesNet Dataset Usage Guide
 
 ### 1. Training Data (`data/train.csv`)
-- **Structure**: A single CSV file consisting of three columns: `SalesDate`, `StoreName_MenuName`, and `SalesQuantity`.
+- **Structure**: A single CSV file consisting of three columns: `영업일자` (business date), `영업장명_메뉴명` (store-menu identifier), and `매출수량` (sales quantity).
 - Each row represents the sales quantity for a specific (date, store-menu combination), providing the date in `YYYY-MM-DD` format and an integer sales quantity.
 - The file is saved in **UTF-8 with BOM**, so BOM handling should be considered when reading it in environments like Python.
 
 ### 2. Evaluation Data (`data/test/TEST_*.csv`)
 - Consists of **10 files in total**, from `TEST_00.csv` to `TEST_09.csv`, all using the same schema.
-- The column structure is identical to the training data: `SalesDate`, `StoreName_MenuName`, and `SalesQuantity`.
+- The column structure is identical to the training data: `영업일자`, `영업장명_메뉴명`, and `매출수량`.
 - Each file contains **5,404 rows** (193 store-menu combinations × 28 days of records), providing the most recent 4 weeks of sales history for the subsequent 7-day forecast.
 - For analysis, you can read a single test file and sort it by the required store-menu combination and date to preprocess it in the same manner as the training data.
-
+ 
 ### 3. Submission Format (`data/sample_submission.csv`)
-- Composed of **194 columns in total**. The first column is `SalesDate` (e.g., `TEST_00+1day`), and the following 193 columns correspond to each store-menu combination.
+- Composed of **194 columns in total**. The first column is `영업일자` (e.g., `TEST_00+1day`), and the following 193 columns correspond to each store-menu combination.
 - It consists of **70 rows**, where you must fill in 7 days of predictions (`+1day` to `+7day`) for each test set from `TEST_00` to `TEST_09`.
-- The sample submission file is also saved in **UTF-8 with BOM**. You should overwrite the `SalesQuantity` prediction values while maintaining the same encoding for submission.
+- The sample submission file is also saved in **UTF-8 with BOM**. You should overwrite the `매출수량` prediction values while maintaining the same encoding for submission.
 - The model's output must be non-negative sales quantity predictions, and the column order and headers must **exactly match** the sample submission file.
 
 ## Data & I/O Modularity
@@ -144,7 +143,7 @@ python -m timesnet_forecast.cli tune \
 
 
 ### Submission output
-- The first column is now **`date` (business date)**, not an abstract row key.  
+- The first column is now **the business date column (`submission.date_col`, default `영업일자`)**, not an abstract row key.
   Downstream graders and dashboards can join on calendar directly.
 
 
@@ -163,14 +162,16 @@ python -m timesnet_forecast.cli tune \
 ## Programmatic use
 
 ~~~python
-from timesnet_forecast.pipeline import PipelineConfig, train_once, predict_once
+from timesnet_forecast.config import PipelineConfig
+from timesnet_forecast.train import train_once
+from timesnet_forecast.predict import predict_once
 
 cfg = PipelineConfig.from_files(
     "configs/default.yaml",
     overrides={"window.input_len": 336, "window.pred_len": 24},
 )
-artifacts = train_once(cfg)  # checkpoints, scalers (or None), schema, signature, metadata.json
-pred_df   = predict_once(cfg)  # tidy predictions (wide or long)
+val_nll, artifacts = train_once(cfg)  # (best_nll, paths for checkpoints/scalers/schema/etc.)
+submission_path = predict_once(cfg)  # CSV written to submission.output_path/out_path
 ~~~
 
 
@@ -179,68 +180,58 @@ pred_df   = predict_once(cfg)  # tidy predictions (wide or long)
 ## Configuration Anatomy
 
 ~~~yaml
-model:
-  d_model: 256
-  d_ff: 512
-  n_layers: 3
-  k_periods: 4
-  kernel_set: [3, 5, 7, 11]   # formerly inception_kernel_set (still accepted)
-  bottleneck_ratio: 4.0       # 1x1 → kxk → 1x1; >1 shrink, <1 expand, 1.0 = single kxk
-  id_embed_dim: 32            # set 0 to disable ID embeddings
-  static_proj_dim: 32         # null to keep raw dim
-  static_layernorm: true      # LayerNorm after static projection
-  lrtc_rank: 8                # low-rank temporal context
-
-period_search:
-  min_period: 4
-  dc_remove: true
-  long_period_log_penalty: 0.05
-  merge_buckets_log: true
-  min_cycles: 2
-
-head:
-  distribution: gaussian      # or nb
-  min_sigma: 1e-3             # lower bound for Gaussian sigma
-  nb_min_dispersion: 1e-3     # (used only if distribution: nb)
-  delay_bias: true
-
-train:
-  lr: 1e-3
-  batch_size: 64
-  accumulation_steps: 1
-  scheduler: cosine
-  amp: true
-  grad_clip: 1.0
-  early_stopping_patience: 8  # monitor: mean Gaussian NLL (unset/null to disable)
-  deterministic: false
-  use_checkpoint: false
-  cuda_graphs: false
-  compile: false
-
-eval:
-  strategy: rolling           # or holdout
-  folds: 3
-  metric: [gaussian_nll, smape]  # model selection uses mean Gaussian NLL
+data:
+  train_csv: "data/train.csv"
+  test_dir: "data/test"
+  sample_submission: "data/sample_submission.csv"
+  date_col: "영업일자"
+  target_col: "매출수량"
+  id_col: "영업장명_메뉴명"
+  fill_missing_dates: true
+  augment:
+    add_noise_std: 0.005
+    time_shift: 2
 
 preprocess:
-  normalize: none             # zscore/minmax/none
-  time_features: [dow, dom, month, is_weekend]
+  normalize: "none"
+  normalize_per_series: true
+  clip_negative: true
 
-data:
-  train_csv: data/train.csv
-  test_dir:  data/test/
-  sample_submission: data/sample_submission.csv
-  schema:
-    date: [영업일자, date, ds]
-    target: [매출수량, y, target]
-    series_id: [영업장명_메뉴명, id, series]
-  augment:
-    add_noise_std: 0.0        # e.g., 0.05 for light noise
-    time_shift:    0          # e.g., 3 for small start jitter
+train:
+  device: "cuda"
+  epochs: 70
+  early_stopping_patience: 5
+  batch_size: 128
+  lr: 1.0e-4
+  amp: true
+  cuda_graphs: false
+  compile: false
+  val:
+    strategy: "rolling"
+    holdout_days: 35
+    rolling_folds: 3
+    rolling_step_days: 14
+
+model:
+  mode: "direct"
+  input_len: 28
+  pred_len: 7
+  d_model: 128
+  d_ff: 256
+  n_layers: 2
+  k_periods: 2
+  kernel_set:
+    - [3, 3]
+    - [5, 5]
+    - [7, 7]
+  bottleneck_ratio: 4.0
+  id_embed_dim: 32
+  static_proj_dim: 32
+  static_layernorm: true
 
 window:
-  input_len: 336
-  pred_len:  24
+  input_len: 28
+  pred_len: 7
 ~~~
 
 
@@ -308,8 +299,8 @@ model.id_embed_dim:
   - Multi-kernel branches act like “band-pass microscopes” over phase and cycle.
 
 - **Adaptive Probabilistic Head → calibrated outputs**
-  - Gaussian (`mu`, `sigma`) by default; NB optional for counts/intermittency.
-  - Softplus floors (sigma/dispersion) stabilize training at low signal levels.
+  - Negative Binomial (`rate`, `dispersion`) forecasts by default for count-style demand.
+  - Softplus + dispersion floors (driven by `train.min_sigma` or per-series buffers) stabilize training at low signal levels.
 
 - **Together**
   - Context sets the playing field; CNN plays the structure; the head keeps score honestly.
@@ -319,23 +310,19 @@ model.id_embed_dim:
 
 ## Losses & Metrics
 
-**Gaussian NLL (default)**  
-`L_GNLL = mean_over_valid[ 0.5 * log(2πσ^2) + 0.5 * ((y - μ)^2 / σ^2) ]`, with `σ ← clamp_min(σ, train.min_sigma)`.
+**Negative-Binomial NLL (default)**
+Training and validation call `negative_binomial_nll(rate, dispersion, y, mask)` with masks from `negative_binomial_mask` so only finite targets contribute. Dispersion floors (from `train.min_sigma` or per-series vectors) keep the likelihood well-behaved.
 
-**Negative-Binomial NLL (optional)**  
-Switch `head.distribution: nb` to model over-dispersion in counts via rate/dispersion heads (Softplus + floors).  
-Monitoring remains Gaussian NLL if the Gaussian head is used; when NB is used, validation reports **NB-NLL** primary and **sMAPE** secondary.
-
-**sMAPE (reported)**  
+**sMAPE (reported)**
 `sMAPE = mean( 2|y - ŷ| / (|y| + |ŷ| + ε) )` over valid targets.
 
 
 ---
 
 ## Direct vs. Recursive Forecasting
-- **Direct**: single forward pass yields `H`-step forecasts (lower error accumulation).  
-- **Recursive**: repeated 1-step predictions rolled over horizon (more flexible with covariates).  
-- Switch via config: `eval.decoder = direct | recursive`.
+- **Direct**: single forward pass yields `H`-step forecasts (lower error accumulation).
+- **Recursive**: repeated 1-step predictions rolled over horizon (more flexible with covariates).
+- Switch via config: set `model.mode: direct` or `model.mode: recursive` (can override via `--override model.mode=recursive`).
 
 
 ---
@@ -345,10 +332,9 @@ Monitoring remains Gaussian NLL if the Gaussian head is used; when NB is used, v
   - Increase `k_periods` slightly and enable log-bucket merging.
   - Ensure `min_cycles ≥ 2` and DC removal is on.
 - **Over/under-dispersion or poor calibration?**
-  - For Gaussian: tune `train.min_sigma`; consider statics/ID or scaling features.
-  - For counts: try `head.distribution: nb` and adjust dispersion floor.
+  - Adjust `train.min_sigma` / `min_sigma_scale`; enrich statics/ID embeddings; review normalization choices.
 - **Intermittent zeros dominate?**
-  - Keep Gaussian but add statics/ID; or switch to NB head and add calendar covariates.
+  - Stay with the NB head but add calendar covariates or richer statics to stabilize baselines.
 - **AMP overflow/NaNs?**
   - Clamp logits/residuals; keep Softplus β modest; verify mixed-precision safe ops.
 - **Memory pressure?**
@@ -362,11 +348,11 @@ Monitoring remains Gaussian NLL if the Gaussian head is used; when NB is used, v
 ## Benchmark (Walmart Kaggle)
 - **Dataset**: Walmart retail demand (Kaggle)  
 - **Split**: rolling CV (7-day horizon), seeded  
-- **Metric**: sMAPE (reported), Gaussian NLL (selection)  
+- **Metric**: sMAPE (reported), NB NLL (selection)
 - **Score**: ≈ **0.14**  
-- **Notes**: Gaussian head (mu, sigma) with `min_sigma` guard; embeddings + LRTC on; PeriodGrouper enabled; AMP on GPU.
+- **Notes**: Negative Binomial head (rate/dispersion) with dispersion floors; embeddings + LRTC on; PeriodGrouper enabled; AMP on GPU.
 
-_Reproduce by fixing `seed`, `window.pred_len=7`, enabling Gaussian head with `train.min_sigma`, and using the provided rolling CV profile in `configs/benchmarks/walmart.yaml`._
+_Reproduce by fixing `seed`, `window.pred_len=7`, keeping the NB head active with `train.min_sigma`, and using the provided rolling CV profile in `configs/benchmarks/walmart.yaml`._
 
 
 ---
