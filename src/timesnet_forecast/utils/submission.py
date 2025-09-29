@@ -250,6 +250,9 @@ def build_submission_context(
         normalized = [normalize_series_name(col) for col in menu_columns]
     else:
         menu_columns = list(ids)
+        for candidate in new_ids:
+            if candidate not in menu_columns:
+                menu_columns.append(candidate)
         normalized = [normalize_series_name(col) for col in menu_columns]
 
     normalized_to_output = dict(zip(normalized, menu_columns))
