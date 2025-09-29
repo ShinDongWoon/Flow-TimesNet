@@ -2,7 +2,7 @@
 **FFT-guided period selection + 2D Inception CNN + embedding-aware adaptive probabilistic head** for multivariate time-series forecasting.  
 Keeps the canonical `[B, T, N] → [B, H, N]` interface while adding robust contextualization and calibrated uncertainty.
 
-> **Benchmark highlight** — On the **Walmart (Kaggle)** dataset, this repository achieves **sMAPE ≈ 0.14** (7-day horizon, seeded), demonstrating strong predictive power in a real retail demand setting.
+> **Benchmark highlight** — On the **Walmart (Kaggle)** dataset, this repository achieves **sMAPE ≈ 0.14** (7-day horizon, seeded), demonstrating strong predictive power in a real retail demand setting. 
 
 ---
 
@@ -13,6 +13,7 @@ Keeps the canonical `[B, T, N] → [B, H, N]` interface while adding robust cont
 - **Modular data I/O.** Input schemas and test loaders are fully pluggable. Swap CSV layouts, feature sets, and eval folds via config — no code surgery required.
 
 ---
+
 # Low‑Rank Temporal Context: Turning Static Embeddings into Time‑Varying Signals
 
 > **Why this matters**
