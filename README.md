@@ -76,16 +76,16 @@ $$ b_r(t) = \cos\left(\frac{\pi}{L} \left(t + \frac{1}{2}\right) r\right)
 Crucially, we enforce a zero-mean constraint on these basis signals, ensuring that the resulting context signal does not shift the scale of the original time-series.
 
 **2. Coefficient Learning & Signal Synthesis (`forward`)**
-A linear layer learns the coefficients $\boldsymbol{w}_n = [w_{n,1}, \dots, w_{n,R}]$ from each series' static embedding vector $\boldsymbol{e}_n..
+A linear layer learns the coefficients $\boldsymbol{w}_n = [w_{n,1}, \dots, w_{n,R}]$ from each series' static embedding vector $\boldsymbol{e}_n..$
 
-.$ \boldsymbol{w}_n = \text{Linear}(\boldsymbol{e}_n) 
+.$ \boldsymbol{w}_n = \text{Linear}(\boldsymbol{e}_n)$
 
 The final context signal is then synthesized using an efficient `torch.einsum` operation that performs the weighted sum for all series in a batch simultaneously:
 
 ```python
 # context [B, L, N] is synthesized from basis [L, R] and coeff [B, N, R]
 context = torch.einsum("lr,bnr->bln", basis, coeff)
-
+```
 ---
 
 ## What’s New (Core Behavior Updates)
