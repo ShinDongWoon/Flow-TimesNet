@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from .config import Config
+from .config import PipelineConfig
 from .utils.logging import console
 from .utils.seed import seed_everything
 
@@ -22,7 +22,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     args = parser.parse_args()
-    cfg = Config.from_files(args.config).to_dict()
+    cfg = PipelineConfig.from_files(args.config).to_dict()
     device = bootstrap(cfg)
     console().print(f"[bold green]Bootstrap complete. Device: {device}[/bold green]")
 

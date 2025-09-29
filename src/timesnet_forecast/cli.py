@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import copy
 import time
 from typing import Dict, Any, List
 import optuna
 
-from .config import Config, load_yaml
+from .config import PipelineConfig, load_yaml
 from .train import train_once
 from .predict import predict_once
 from .utils.logging import console
@@ -15,7 +16,7 @@ from .utils import io as io_utils
 
 
 def _apply_trial_to_cfg(cfg: Dict[str, Any], space: Dict[str, Any], trial: optuna.Trial) -> Dict[str, Any]:
-    out = dict(cfg)
+    out = copy.deepcopy(cfg)
     for key, spec in space.items():
         path = key.split(".")
         t = spec.get("type")
@@ -43,17 +44,18 @@ def _apply_trial_to_cfg(cfg: Dict[str, Any], space: Dict[str, Any], trial: optun
 
 
 def cmd_train(args: argparse.Namespace) -> None:
-    cfg = Config.from_files(args.config, overrides=args.override).to_dict()
+    cfg = PipelineConfig.from_files(args.config, overrides=args.override)
     train_once(cfg)
 
 
 def cmd_predict(args: argparse.Namespace) -> None:
-    cfg = Config.from_files(args.config, overrides=args.override).to_dict()
+    cfg = PipelineConfig.from_files(args.config, overrides=args.override)
     predict_once(cfg)
 
 
 def cmd_tune(args: argparse.Namespace) -> None:
-    base = Config.from_files(args.config, overrides=args.override).to_dict()
+    base_cfg = PipelineConfig.from_files(args.config, overrides=args.override)
+    base = base_cfg.to_dict()
     space = load_yaml(args.space)
 
     if base["tuning"]["sampler"] == "tpe_multivariate":
@@ -70,9 +72,10 @@ def cmd_tune(args: argparse.Namespace) -> None:
         timeout = int(base["tuning"]["timeout_min"]) * 60
 
     def objective(trial: optuna.Trial) -> float:
-        cfg = _apply_trial_to_cfg(base, space, trial)
+        cfg_dict = _apply_trial_to_cfg(base, space, trial)
+        trial_cfg = PipelineConfig.from_mapping(cfg_dict)
         # train_once returns best validation NLL
-        val_nll, _ = train_once(cfg)
+        val_nll, _ = train_once(trial_cfg)
         trial.report(val_nll, step=1)
         if trial.should_prune():
             raise optuna.TrialPruned()
@@ -89,7 +92,8 @@ def cmd_tune(args: argparse.Namespace) -> None:
     io_utils.save_json(study.best_trial.params, f"{art_dir}/best_params.json")
     # Optionally save merged config
     best_cfg = _apply_trial_to_cfg(base, space, study.best_trial)
-    save_yaml(best_cfg, f"{art_dir}/{base['artifacts']['config_file']}")
+    best_cfg_normalized = PipelineConfig.from_mapping(best_cfg).to_dict()
+    save_yaml(best_cfg_normalized, f"{art_dir}/{base['artifacts']['config_file']}")
 
 
 def main() -> None:

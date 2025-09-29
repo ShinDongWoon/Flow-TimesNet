@@ -7,7 +7,7 @@ import pandas as pd
 # Ensure the project src is on the path for imports
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
-from timesnet_forecast.config import Config
+from timesnet_forecast.config import PipelineConfig
 from timesnet_forecast import train
 from timesnet_forecast.utils import io as io_utils
 
@@ -53,6 +53,7 @@ def test_clip_negative(tmp_path, monkeypatch):
         "model.n_layers=1",
         "model.dropout=0.0",
         "model.k_periods=2",
+        "model.min_period_threshold=1",
         "model.kernel_set=[[3,3]]",
         "train.lr=1e-3",
         "train.weight_decay=0.0",
@@ -63,7 +64,7 @@ def test_clip_negative(tmp_path, monkeypatch):
         "artifacts.schema_file=schema.json",
         "artifacts.config_file=config.yaml",
     ]
-    cfg = Config.from_files("configs/default.yaml", overrides=overrides).to_dict()
+    cfg = PipelineConfig.from_files("configs/default.yaml", overrides=overrides)
 
     captured = []
     orig_build = train._build_dataloader
@@ -129,6 +130,7 @@ def test_train_auto_schema_detection(tmp_path):
         "model.n_layers=1",
         "model.dropout=0.0",
         "model.k_periods=1",
+        "model.min_period_threshold=1",
         "model.kernel_set=[[3,3]]",
         "train.lr=1e-3",
         "train.weight_decay=0.0",
@@ -139,7 +141,7 @@ def test_train_auto_schema_detection(tmp_path):
         "artifacts.schema_file=schema.json",
         "artifacts.config_file=config.yaml",
     ]
-    cfg = Config.from_files("configs/default.yaml", overrides=overrides).to_dict()
+    cfg = PipelineConfig.from_files("configs/default.yaml", overrides=overrides)
 
     train.train_once(cfg)
 
