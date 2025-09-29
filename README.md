@@ -100,6 +100,24 @@ python -m timesnet_forecast.cli tune \
   --space  configs/search_space.yaml
 ```
 ---
+# Recursive-TimesNet Dataset Usage Guide
+
+## 1. Training Data (`data/train.csv`)
+- **Structure**: A single CSV file consisting of three columns: `SalesDate`, `StoreName_MenuName`, and `SalesQuantity`.
+- Each row represents the sales quantity for a specific (date, store-menu combination), providing the date in `YYYY-MM-DD` format and an integer sales quantity.
+- The file is saved in **UTF-8 with BOM**, so BOM handling should be considered when reading it in environments like Python.
+
+## 2. Evaluation Data (`data/test/TEST_*.csv`)
+- Consists of **10 files in total**, from `TEST_00.csv` to `TEST_09.csv`, all using the same schema.
+- The column structure is identical to the training data: `SalesDate`, `StoreName_MenuName`, and `SalesQuantity`.
+- Each file contains **5,404 rows** (193 store-menu combinations × 28 days of records), providing the most recent 4 weeks of sales history for the subsequent 7-day forecast.
+- For analysis, you can read a single test file and sort it by the required store-menu combination and date to preprocess it in the same manner as the training data.
+
+## 3. Submission Format (`data/sample_submission.csv`)
+- Composed of **194 columns in total**. The first column is `SalesDate` (e.g., `TEST_00+1day`), and the following 193 columns correspond to each store-menu combination.
+- It consists of **70 rows**, where you must fill in 7 days of predictions (`+1day` to `+7day`) for each test set from `TEST_00` to `TEST_09`.
+- The sample submission file is also saved in **UTF-8 with BOM**. You should overwrite the `SalesQuantity` prediction values while maintaining the same encoding for submission.
+- The model's output must be non-negative sales quantity predictions, and the column order and headers must **exactly match** the sample submission file.
 
 ## Data & I/O Modularity
 
