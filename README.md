@@ -13,104 +13,88 @@ Keeps the canonical `[B, T, N] → [B, H, N]` interface while adding robust cont
 - **Modular data I/O.** Input schemas and test loaders are fully pluggable. Swap CSV layouts, feature sets, and eval folds via config — no code surgery required.
 
 ---
-# Low-Rank Temporal Context: Turning Static Embeddings into Time‑Varying Signals
+# Low‑Rank Temporal Context: Turning Static Embeddings into Time‑Varying Signals
 
 > **Why this matters**
-> Injecting *static* per-series information (IDs, categories) as a *dynamic* signal that evolves over time is notoriously hard.
-> **`LowRankTemporalContext`** solves this by **low-rank approximation**: a compact, principled way to compose per‑ID temporal “background music” from a tiny set of shared basis waves.
+> Injecting *static* per‑series information (IDs, categories) as a *dynamic* signal that evolves over time is notoriously hard.
+> **`LowRankTemporalContext`** solves this with **low‑rank approximation**: a compact, principled way to compose per‑ID temporal background signals from a tiny set of shared basis waves.
 
 ---
 
 ## 1) Problem → Why naive approaches break
 
-We want to add to each series `X_{t,n}` a learned, time‑varying context `S_{t,n}`, producing
+We add to each series a learned, time‑varying context:
 
-```
-X'_{t,n} = X_{t,n} + S_{t,n}
-```
+$$
+X'*{t,n} = X*{t,n} + S_{t,n}
+$$
 
-where:
+where $t\in{0,\dots,L-1}$ is time and $n\in{1,\dots,N}$ is the series ID.
 
-* `t ∈ {0,...,L-1}`: time,
-* `n ∈ {1,...,N}`: series ID.
+**Naive plan:** learn every $S_{t,n}$ separately.
+**Cost:** $L\times N$ parameters (per batch) → brittle and overfits.
 
-**Naive plan:** learn every `S_{t,n}` separately.
-**Cost:** `L × N` parameters (per batch), brittle and overfits.
+| Approach                   |           Parameter scale | Generalization | Notes                                     |
+| -------------------------- | ------------------------: | -------------- | ----------------------------------------- |
+| Per‑timestep per‑ID table  |          $\mathcal O(LN)$ | ❌ poor         | Memorizes, no sharing                     |
+| One shared temporal vector |           $\mathcal O(L)$ | ❌ ignores ID   | Misses heterogeneity                      |
+| **Low‑rank (ours)**        | **$\mathcal O(LR + NR)$** | ✅ strong       | Shares *basis*, personalizes via *coeffs* |
 
-| Approach                   |    Parameter scale | Generalization | Notes                                     |
-| -------------------------- | -----------------: | -------------- | ----------------------------------------- |
-| Per‑timestep per‑ID table  |           `O(L·N)` | ❌ poor         | Memorizes, no sharing                     |
-| One shared temporal vector |             `O(L)` | ❌ ignores ID   | Misses heterogeneity                      |
-| **Low‑rank (ours)**        | **`O(L·R + N·R)`** | ✅ strong       | Shares *basis*, personalizes via *coeffs* |
-
-With rank `R << L`, we reduce cost by orders of magnitude while keeping ID‑specific variation.
+With rank $R\ll L$, we reduce cost by orders of magnitude while keeping ID‑specific variation.
 
 ---
 
 ## 2) Key idea → Low‑rank temporal factorization
 
-Assume each per‑ID context is a linear mix of a **small** set of shared basis signals `{ b_r(t) }_{r=1..R}`:
+Assume each per‑ID context is a linear mix of a **small** set of shared basis signals ${b_r(t)}_{r=1}^R$:
 
-```
-S_{t,n} ≈ Σ_{r=1..R} w_{n,r} · b_r(t)
+$$
+S_{t,n} \approx \sum_{r=1}^{R} w_{n,r}, b_r(t).
+$$
 
-Matrix form:
-S  [L × N]  ≈  B [L × R] · W [R × N]
-```
+Matrix view (dimensions in brackets):
 
-* `B`: **shared** bases across IDs (temporal atoms),
-* `W`: **per‑ID** mixture weights,
-* `R`: rank (number of bases), a small hyperparameter.
+$$
+\mathbf S,[L!\times!N] ;\approx; \mathbf B,[L!\times!R];\mathbf W,[R!\times!N].
+$$
 
-This is classic **low‑rank approximation**: capture the “essence” with a few near‑orthogonal directions.
+Here $\mathbf B$ are **shared** bases across IDs and $\mathbf W$ are **per‑ID** mixture weights.
 
 ---
 
 ## 3) Our construction → DCT‑like cosine bases + zero‑mean stabilization
 
-### 3.1 Cosine basis (DCT‑II form)
+### 3.1 Cosine basis (DCT‑II style)
 
-For `t = 0..L-1`, `r = 1..R`:
+For $t=0,\dots,L-1$ and $r=1,\dots,R$:
 
-```
-b_r(t) = cos(π/L · (t + 0.5) · r)
-```
+$$
+b_r(t) = \cos!\Big(\tfrac{\pi}{L},(t+\tfrac{1}{2}),r\Big).
+$$
 
-**Why cosine/DCT?**
-• **Energy compaction:** few low‑frequency components explain most natural signals.
-• **Near‑orthogonality:** disentangles components and eases optimization.
-• **FFT‑friendly:** fast to generate, stable numerics.
+**Why cosine/DCT?** energy compaction, near‑orthogonality, FFT‑friendly numerics.
 
 ### 3.2 Zero‑mean constraint (optional, recommended)
 
-Center each basis columnwise:
+We center each basis columnwise:
 
-```
-B_tilde = B − mean_t(B)
-```
+$$
+\tilde{\mathbf B} = \mathbf B - \mathrm{mean}*{t}(\mathbf B),\quad \text{so}\quad \mathrm{mean}*{t}(\tilde{\mathbf B},\mathbf W) \approx \mathbf 0.
+$$
 
-Any linear combo stays near zero‑mean:
+**Effect:** the context **modulates patterns** without drifting the global scale/level of $X$.
 
-```
-mean_t(B_tilde · W) ≈ 0
-```
-
-**Effect:** the context **modulates patterns** without drifting the global scale/level of `X`.
-
-> **TIP**
-> Use zero‑mean contexts when you want to **shape temporal texture** (seasonality, pulse, curvature) but **not** bias levels.
-> Turn it off if you explicitly want the context to adjust baselines.
+> **Tip:** Use zero‑mean when you want to shape temporal texture (seasonality, pulse, curvature) but not bias levels. Turn it off only if you explicitly want baseline shifts.
 
 ---
 
 ## 4) From embeddings to per‑ID mixtures
 
-Each series has a static embedding `e_n ∈ R^d` (category, location, menu, …).
-We predict mixture coefficients via a small head:
+Each series has a static embedding $\mathbf e_n\in\mathbb R^{d}$. We predict mixture coefficients via a small head:
 
-```
-w_n = Linear(e_n)  # shape: [R]
-```
+$$
+\mathbf w_n = \mathrm{Linear}(\mathbf e_n) \in \mathbb R^{R}.
+$$
 
 Minimal, fast, and expressive enough to map “who you are” → “how your context sounds.”
 
@@ -118,33 +102,27 @@ Minimal, fast, and expressive enough to map “who you are” → “how your co
 
 ## 5) Batched synthesis in PyTorch (shape‑safe)
 
-Let:
-
-* `basis ∈ R^{L×R}` (shared),
-* `coeff ∈ R^{B×N×R}` (from embeddings),
-* output `context ∈ R^{B×L×N}`.
-
-Compute:
+Let $\texttt{basis}\in\mathbb R^{L\times R}$ (shared), $\texttt{coeff}\in\mathbb R^{B\times N\times R}$ (from embeddings), and output $\texttt{context}\in\mathbb R^{B\times L\times N}$. We compute
 
 ```python
 # LowRankTemporalContext.forward (conceptual)
-context = torch.einsum("lr,bnr->bln", basis, coeff)  # S_{t,n} = Σ_r w_{n,r} * b_r(t)
+context = torch.einsum("lr,bnr->bln", basis, coeff)  # S_{t,n} = sum_r w_{n,r} * b_r(t)
 x_out   = x_in + context
 ```
 
-**Dims legend:** `l=L` (length), `r=R` (rank), `b=B` (batch), `n=N` (num series/channels).
+Dims: $l=L$ (length), $r=R$ (rank), $b=B$ (batch), $n=N$ (num series/channels).
 
 ---
 
 ## 6) Complexity & capacity
 
-* **Params:** `L×R` (basis, fixed or learnable) + affine `d×R` (coeff head).
-* **FLOPs:** `O(B·L·N·R)` (einsum), linear in rank `R`.
-* **Memory:** `B` is shared; `W` computed on the fly from embeddings.
+* **Params:** $L\times R$ (basis, fixed or learnable) + affine $d\times R$ (coeff head).
+* **FLOPs:** $\mathcal O(B,L,N,R)$ (einsum), linear in rank $R$.
+* **Memory:** $\mathbf B$ is shared; $\mathbf W$ computed on the fly from embeddings.
 
 | Knob       | Role                         | Rule of thumb                                             |
 | ---------- | ---------------------------- | --------------------------------------------------------- |
-| Rank `R`   | richness of temporal palette | start `R ∈ [4, 16]`; increase if underfitting             |
+| Rank $R$   | richness of temporal palette | start $R\in[4,16]$; increase if underfitting              |
 | Zero‑mean  | level‑stability              | on for pattern‑only; off to adjust baselines              |
 | Basis type | prior over shapes            | Cosine/DCT for smoothness; Spline/learned for flexibility |
 | Coeff head | ID→mix mapping               | Linear is robust; MLP if highly nonlinear IDs             |
@@ -157,14 +135,14 @@ x_out   = x_in + context
 
 ```mermaid
 flowchart LR
-  E[Static ID Embedding e_n] --> H[Coeff Head (Linear/MLP)]
-  H -->|R weights per ID| W((W ∈ R^{R×N}))
-  B[(Cosine Basis B ∈ R^{L×R})] --> S{{Einsum: "lr,bnr→bln"}}
+  E["ID Embedding (e_n)"] --> H["Coeff Head"]
+  H -- R weights per ID --> W["W (R x N)"]
+  B["Cosine Basis B (L x R)"] --> S{{"einsum lr,bnr->bln"}}
   W --> S
-  X[Original Series X ∈ R^{B×L×N}] --> A[Add]
+  X["Input X (B x L x N)"] --> A["Add"]
   S --> A
-  A --> C[TimesNet / CNN Blocks]
-  C --> Y[Forecast]
+  A --> C["TimesNet / CNN"]
+  C --> Y["Forecast"]
 ```
 
 * **Before** temporal blocks: inject smooth, ID‑specific rhythms that align with periodic convolutions/2D kernels.
@@ -172,27 +150,17 @@ flowchart LR
 
 ---
 
-## 8) Math summary (plain‑text, GitHub‑safe)
+## 8) Math summary (GitHub‑safe LaTeX)
 
-```
-Goal:
-  X'_{t,n} = X_{t,n} + S_{t,n}
-  S_{t,n} ≈ Σ_{r=1..R} w_{n,r} · b_r(t)
-
-Cosine basis (DCT‑II style):
-  b_r(t) = cos(π/L · (t + 0.5) · r)
-
-Zero‑mean stabilization:
-  B_tilde = B − mean_t(B)
-  S ≈ B_tilde · W  ⇒  mean_t(S) ≈ 0
-
-Embedding → mixtures:
-  w_n = Linear(e_n)  # shape [R]
-
-Matrix summary:
-  S [L×N] ≈ B_tilde [L×R] · W [R×N]
-  Equivalently, S_{t,n} ≈ Σ_r w_{n,r} · b_tilde_r(t)
-```
+$$
+\begin{aligned}
+&\textbf{Goal:}\quad X'*{t,n} = X*{t,n} + S_{t,n},\quad S_{t,n} \approx \sum_{r=1}^{R} w_{n,r}, b_r(t).[4pt]
+&\textbf{Cosine basis:}\quad b_r(t) = \cos!\Big(\tfrac{\pi}{L}(t+\tfrac{1}{2})r\Big).[4pt]
+&\textbf{Zero‑mean:}\quad \tilde{\mathbf B} = \mathbf B - \mathrm{mean}*{t}(\mathbf B),; \Rightarrow; \mathrm{mean}*{t}(\tilde{\mathbf B},\mathbf W) \approx \mathbf 0.[4pt]
+&\textbf{Embedding→mixture:}\quad \mathbf w_n = \mathrm{Linear}(\mathbf e_n) \in \mathbb R^{R}.[4pt]
+&\textbf{Matrix summary:}\quad \mathbf S \approx \tilde{\mathbf B},\mathbf W; \Longleftrightarrow; S_{t,n} \approx \sum_{r=1}^{R} w_{n,r}, \tilde b_r(t).
+\end{aligned}
+$$
 
 ---
 
@@ -234,22 +202,18 @@ class LowRankTemporalContext(nn.Module):
 ## 10) Practical guidance
 
 * **Initialization:** keep `learn_basis=False` first; let the linear head learn mixtures on a *fixed* palette.
-* **Regularization:** mild weight decay on the coeff head; optional L2 on coefficients to avoid over‑energetic contexts.
-* **Sanity checks:**
-
-  * Plot a few `{ b_r(t) }` and sampled `S_{t,n}`.
-  * Verify `mean_t(S_{t,n}) ≈ 0` when zero‑mean is on.
-  * Ablate `R`: look for diminishing returns.
-* **When to increase `R`:** multi‑scale seasonality (daily/weekly), heterogeneous venues/menus, long horizons.
-* **When to learn the basis:** if domain rhythms differ from cosines (e.g., holiday pulses, regime switches). Consider adding piecewise or spline bases.
+* **Regularization:** mild weight decay on the coeff head; optional $\ell_2$ on coefficients to avoid over‑energetic contexts.
+* **Sanity checks:** plot a few ${b_r(t)}$ and sampled $S_{t,n}$; verify $\mathrm{mean}*{t}(S*{t,n})\approx0$ when zero‑mean is on; ablate $R$ for diminishing returns.
+* **When to increase $R$:** multi‑scale seasonality (daily/weekly), heterogeneous venues/menus, long horizons.
+* **When to learn the basis:** if domain rhythms differ from cosines (e.g., holiday pulses, regime switches). Consider piecewise or spline bases.
 
 ---
 
 ## 11) Empirical playbook (repro‑friendly)
 
 1. **Baseline:** model w/o context.
-2. **+ Low‑rank context:** `R=8`, zero‑mean on, fixed DCT basis.
-3. **Rank sweep:** `R ∈ {4, 8, 12, 16}`.
+2. **+ Low‑rank context:** $R=8$, zero‑mean on, fixed DCT basis.
+3. **Rank sweep:** $R\in{4,8,12,16}$.
 4. **Basis ablation:** fixed DCT vs learnable basis.
 5. **Downstream impact:** check sMAPE/NLL deltas, especially on sparse/volatile IDs.
 
@@ -264,35 +228,10 @@ class LowRankTemporalContext(nn.Module):
 
 ## 12) Why this is *not* a hack but a principle
 
-1. **Parsimony:** replaces `O(L·N)` free knobs with `O(L·R + N·R)` structured ones.
+1. **Parsimony:** replaces $\mathcal O(LN)$ free knobs with $\mathcal O(LR+NR)$ structured ones.
 2. **Inductive bias:** smooth, near‑orthogonal atoms match the physics of seasonal/slow dynamics.
 3. **Composability:** cleanly adds to any sequence backbone (TimesNet, CNNs, Transformers).
 4. **Controllability:** zero‑mean switch separates *pattern* shaping from *level* shifting.
-
----
-
-## What’s New (Core Behavior Updates)
-- **Strict validation windowing.** The **validation holdout period must be at least `input_len + pred_len` days**. The trainer enforces this and raises a clear error otherwise.
-- **Experiment lineage.** Training emits a `artifacts/metadata.json` (**`meta_version=1`**) capturing window configuration, detected schema, time-feature settings, and static-feature names. The prediction CLI **validates metadata** to surface configuration drift between train and inference.
-- **Submission format.** Submissions now write **actual business dates** in the first column (no opaque row keys).
-- **Early stopping (optional).** Set `train.early_stopping_patience: <int>` to stop when **validation NB NLL** fails to improve for that many consecutive epochs. Leave unset or `null` to disable.
-- **Simple data augmentation.** Enable `data.augment`:
-  - `add_noise_std`: std-dev of Gaussian noise added to input windows.
-  - `time_shift`: maximum random shift (in steps) applied to window start.
-- **Normalization defaults.** `preprocess.normalize: "none"` by default — the model learns on the **original scale**. If disabled, the **saved scaler artifact stores `None`**.
-- **Probabilistic forecasts.** The head predicts **Negative Binomial (`rate`, `dispersion`)** and training optimizes **NB-NLL** with `train.min_sigma` (or a learned vector) supplying dispersion floors for stability. **Validation selects by mean NB-NLL** while still reporting **sMAPE** as a secondary diagnostic.
-- **Config renames & backward compatibility.**
-  - `model.inception_kernel_set` → **`model.kernel_set`** (old name still accepted; a deprecation warning is logged).
-  - `model.bottleneck_ratio` controls 1×1 → k×k → 1×1 bottlenecks in each Inception branch.  
-    *Ratio > 1* shrinks mid-channels; *Ratio < 1* expands; **1.0** recovers a single k×k convolution (no bottleneck).
-- **CUDA graphs & compilation.**
-  - Enabling **`train.cuda_graphs: true`** disables **dropout** (model placed in eval mode during capture) trading regularization for throughput.
-  - **`train.use_checkpoint`** toggles activation checkpointing (↓ memory, ↑ time) and is **auto-disabled under CUDA graphs**.
-  - **Mutual exclusivity:** manual CUDA graphs (`train.cuda_graphs`) and **`train.compile`** (TorchDynamo) are **mutually exclusive** — compiled modules cannot be safely re-captured.
-- **Determinism.** **`train.deterministic: true`** seeds all RNGs, disables cuDNN benchmarking, and enables `torch.use_deterministic_algorithms`, yielding reproducible metrics/weights suitable for CI.
-- **Window semantics.**
-  - Sliding windows are **fixed** to `model.input_len` with **no zero padding**. Both training and inference must provide at least `input_len` steps (temporal covariates may accompany the values tensor).
-  - The model **“telescopes”** inputs: `TimesNet.forward` always **crops to the first `input_len` steps** of the periodic canvas, so passing extra history at inference yields the **same `[B, pred_len, N]`** shape as in training.
 
 ---
 
