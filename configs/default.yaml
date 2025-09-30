@@ -85,7 +85,7 @@ model:
   use_zero_mean_context: true
   context_rank: 8
   context_scale: 0.05
-  use_constant_context_bias: true
+  use_constant_context_bias: false
 
 tuning:
   enabled: true
