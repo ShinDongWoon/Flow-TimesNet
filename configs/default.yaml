@@ -82,6 +82,10 @@ model:
   id_embed_dim: 32           # Per-series identifier embedding dimension (set to 0 to disable)
   static_proj_dim: 32        # Projection size for static covariates (set to null to keep input dim)
   static_layernorm: true     # Apply LayerNorm after projecting static covariates
+  use_zero_mean_context: true
+  context_rank: 8
+  context_scale: 0.05
+  use_constant_context_bias: true
 
 tuning:
   enabled: true

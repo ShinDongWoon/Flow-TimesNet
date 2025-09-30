@@ -965,6 +965,17 @@ def train_once(cfg: PipelineConfig | Dict[str, Any]) -> Tuple[float, Dict]:
     model_cfg["static_proj_dim"] = static_proj_dim
     model_cfg["static_layernorm"] = static_layernorm
 
+    use_zero_mean_context = bool(model_cfg.get("use_zero_mean_context", False))
+    context_rank = int(model_cfg.get("context_rank", 0))
+    if context_rank < 0:
+        context_rank = 0
+    context_scale = float(model_cfg.get("context_scale", 1e-2))
+    use_constant_context_bias = bool(model_cfg.get("use_constant_context_bias", False))
+    model_cfg["use_zero_mean_context"] = use_zero_mean_context
+    model_cfg["context_rank"] = context_rank
+    model_cfg["context_scale"] = context_scale
+    model_cfg["use_constant_context_bias"] = use_constant_context_bias
+
     model = TimesNet(
         input_len=input_len,
         pred_len=pred_len,
@@ -986,6 +997,10 @@ def train_once(cfg: PipelineConfig | Dict[str, Any]) -> Tuple[float, Dict]:
         id_embed_dim=id_embed_dim,
         static_proj_dim=static_proj_dim,
         static_layernorm=static_layernorm,
+        use_zero_mean_context=use_zero_mean_context,
+        context_rank=context_rank,
+        context_scale=context_scale,
+        use_constant_context_bias=use_constant_context_bias,
     ).to(device)
 
     # Lazily build model parameters so that downstream utilities see them
