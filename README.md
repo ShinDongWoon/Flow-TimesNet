@@ -258,6 +258,60 @@ class LowRankTemporalContext(nn.Module):
 ---
 ## Architecture Overview
 
+```mermaid
+flowchart TD
+    %% --- 1. Input Layer ---
+    subgraph "Input Data"
+        direction LR
+        X["<b>Time-Series Input</b><br>[Batch, Lookback, Channels]"]
+        Meta["<b>Series Metadata</b><br>IDs & Static Features"]
+    end
+
+    %% --- 2. Embedding & Context Injection ---
+    subgraph "A. Embedding & Context"
+        Embeddings["<b>DataEmbedding Block</b><br>Value, Positional, Time Features"]
+        LRTC["<b>Low-Rank Temporal Context (LRTC)</b><br><i>Generates ID-specific temporal signals</i>"]
+        FusedInput["(+) <b>Conditioned Input</b><br>Embeddings + LRTC"]
+    end
+
+    %% --- 3. TimesNet Core Backbone ---
+    subgraph "B. TimesNet Backbone"
+        FFT["<b>FFT-guided Period Selection</b><br>+ Robust PeriodGrouper"]
+        TimesBlock["<b>TimesBlock (2D Inception CNN)</b><br><i>Models intra- & inter-period variations</i>"]
+    end
+
+    %% --- 4. Forecasting Head ---
+    subgraph "C. Forecasting Head"
+        Projection["<b>Projection Layer</b><br>Maps to Prediction Horizon"]
+        ProbHead["<b>Adaptive Probabilistic Head</b><br><i>Outputs Negative Binomial parameters (rate, dispersion)</i>"]
+    end
+
+    %% --- 5. Output ---
+    Forecast["<b>Final Forecast</b><br>[Batch, Horizon, Channels]"]
+
+
+    %% --- Define Connections ---
+    X --> Embeddings
+    Meta --> Embeddings
+    Meta -- Controls signal shape --> LRTC
+
+    Embeddings --> FusedInput
+    LRTC -- Injects signal --> FusedInput
+
+    FusedInput -- Main data flow --> FFT
+    FusedInput -- Skip connection --> TimesBlock
+
+    FFT -- Selected periods --> TimesBlock
+    TimesBlock --> Projection
+    Projection --> ProbHead
+    ProbHead --> Forecast
+
+    %% --- Styling for emphasis ---
+    style LRTC fill:#e8f5e9,stroke:#388e3c
+    style FFT fill:#fffde7,stroke:#fbc02d
+    style ProbHead fill:#fce4ec,stroke:#c2185b
+```
+
 - **DataEmbedding**: value + positional + optional time features; integrates **ID & static** embeddings and **LRTC**.  
 - **FFTPeriodSelector**: channel-robust spectrum summary → top-k frequencies (DC removed, long-period damped) → period lengths (≥2 cycles).  
 - **PeriodGrouper**: merges close periods, yields logits for **softmax weighting**.  
