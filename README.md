@@ -264,52 +264,64 @@ flowchart TD
     subgraph "Input Data"
         direction LR
         X["<b>Time-Series Input</b><br>[Batch, Lookback, Channels]"]
-        Meta["<b>Series Metadata</b><br>IDs & Static Features"]
+        Meta["<b>Series Metadata</b><br><i>IDs & Static Features</i>"]
     end
 
-    %% --- 2. Embedding & Context Injection ---
-    subgraph "A. Embedding & Context"
-        Embeddings["<b>DataEmbedding Block</b><br>Value, Positional, Time Features"]
-        LRTC["<b>Low-Rank Temporal Context (LRTC)</b><br><i>Generates ID-specific temporal signals</i>"]
-        FusedInput["(+) <b>Conditioned Input</b><br>Embeddings + LRTC"]
+    %% --- 2. Context Generation (from Metadata) ---
+    subgraph "A. Context Generation"
+        direction TB
+        ContextEmbed["<b>Static/ID Embedding</b>"]
+        LRTC["<b>Low-Rank Temporal Context (LRTC)</b><br>Generates time-varying 'Shape' signal"]
+        LateBias["<b>Late Bias Head</b><br>Generates time-invariant 'Scale' signal"]
+        
+        Meta --> ContextEmbed
+        ContextEmbed --> LRTC
+        ContextEmbed --> LateBias
     end
 
-    %% --- 3. TimesNet Core Backbone ---
-    subgraph "B. TimesNet Backbone"
-        FFT["<b>FFT-guided Period Selection</b><br>+ Robust PeriodGrouper"]
-        TimesBlock["<b>TimesBlock (2D Inception CNN)</b><br><i>Models intra- & inter-period variations</i>"]
+    %% --- 3. Input Conditioning & Embedding ---
+    subgraph "B. Input Conditioning & Embedding"
+        ConditionedInput["(+) <b>Input Conditioning</b>"]
+        DataEmbed["<b>DataEmbedding Block</b><br>Value, Positional, Time Features"]
+        
+        X --> ConditionedInput
+        LRTC -- Injects 'Shape' Signal --> ConditionedInput
+        ConditionedInput --> DataEmbed
     end
 
-    %% --- 4. Forecasting Head ---
-    subgraph "C. Forecasting Head"
-        Projection["<b>Projection Layer</b><br>Maps to Prediction Horizon"]
-        ProbHead["<b>Adaptive Probabilistic Head</b><br><i>Outputs Negative Binomial parameters (rate, dispersion)</i>"]
+    %% --- 4. TimesNet Core Backbone ---
+    subgraph "C. TimesNet Backbone"
+        direction LR
+        FFT["<b>FFT-guided Period Selection</b>"]
+        Loop["TimesBlock Loop (N layers)"]
+        
+        DataEmbed --> FFT
+        FFT -- Guides --> Loop
+        DataEmbed -- Residual Link --> Loop
     end
 
-    %% --- 5. Output ---
-    Forecast["<b>Final Forecast</b><br>[Batch, Horizon, Channels]"]
+    %% --- 5. Probabilistic Forecasting Head ---
+    subgraph "D. Forecasting Head"
+        direction TB
+        Projection["<b>Temporal Projection</b><br>Maps to Prediction Horizon"]
+        BiasInjection["(+) <b>Bias Injection</b>"]
+        ProbHead["<b>Probabilistic Head</b><br>Outputs NegBinomial params (μ, α)"]
+        
+        Loop --> Projection
+        Projection --> BiasInjection
+        LateBias -- Injects 'Scale' Signal --> BiasInjection
+        BiasInjection --> ProbHead
+    end
 
-
-    %% --- Define Connections ---
-    X --> Embeddings
-    Meta --> Embeddings
-    Meta -- Controls signal shape --> LRTC
-
-    Embeddings --> FusedInput
-    LRTC -- Injects signal --> FusedInput
-
-    FusedInput -- Main data flow --> FFT
-    FusedInput -- Skip connection --> TimesBlock
-
-    FFT -- Selected periods --> TimesBlock
-    TimesBlock --> Projection
-    Projection --> ProbHead
+    %% --- 6. Output ---
+    Forecast["<b>Final Forecast Distribution</b><br>[Batch, Horizon, Channels]"]
     ProbHead --> Forecast
 
     %% --- Styling for emphasis ---
     style LRTC fill:#e8f5e9,stroke:#388e3c
+    style LateBias fill:#e8f5e9,stroke:#388e3c
     style FFT fill:#fffde7,stroke:#fbc02d
-    style ProbHead fill:#fce4ec,stroke:#c2185b
+    style BiasInjection fill:#fce4ec,stroke:#c2185b
 ```
 
 - **DataEmbedding**: value + positional + optional time features; integrates **ID & static** embeddings and **LRTC**.  
