@@ -304,46 +304,31 @@ flowchart TD
     subgraph "D. Forecasting Head"
         direction TB
         Projection["<b>Temporal Projection</b><br>Maps to Prediction Horizon"]
-
-        subgraph "Rate Path (μ)"
-            direction TB
-            RateBias["(+) <b>Bias Injection</b>"]
-            RateHead["<b>Rate Head</b><br>Negative Binomial μ"]
-        end
-
-        subgraph "Dispersion Path (α)"
-            direction TB
-            DispersionHead["<b>Dispersion Head</b><br>Negative Binomial α"]
-        end
-
+        BiasInjection["(+) <b>Bias Injection</b>"]
+        ProbHead["<b>Probabilistic Head</b><br>Outputs NegBinomial params (μ, α)"]
+        
         Loop --> Projection
-        note right of Projection
-            Shared temporal context (from LRTC via DataEmbedding)
-            feeds both heads
-        end note
-        Projection --> RateBias
-        Projection --> DispersionHead
-        LateBias -- Injects 'Scale' Signal --> RateBias
-        RateBias --> RateHead
+        Projection --> BiasInjection
+        LateBias -- Injects 'Scale' Signal --> BiasInjection
+        BiasInjection --> ProbHead
     end
 
     %% --- 6. Output ---
     Forecast["<b>Final Forecast Distribution</b><br>[Batch, Horizon, Channels]"]
-    RateHead --> Forecast
-    DispersionHead --> Forecast
+    ProbHead --> Forecast
 
     %% --- Styling for emphasis ---
     style LRTC fill:#e8f5e9,stroke:#388e3c
     style LateBias fill:#e8f5e9,stroke:#388e3c
     style FFT fill:#fffde7,stroke:#fbc02d
-    style RateBias fill:#fce4ec,stroke:#c2185b
+    style BiasInjection fill:#fce4ec,stroke:#c2185b
 ```
 
 - **DataEmbedding**: value + positional + optional time features; integrates **ID & static** embeddings and **LRTC**.  
 - **FFTPeriodSelector**: channel-robust spectrum summary → top-k frequencies (DC removed, long-period damped) → period lengths (≥2 cycles).  
 - **PeriodGrouper**: merges close periods, yields logits for **softmax weighting**.  
 - **TimesBlock (2D Inception CNN)**: reshape `[B,T,N]` to period grids, apply **multi-kernel Inception** with bottlenecks, compute residuals, then **weighted sum across periods**.  
-- **Forecast head**: time projection to horizon `H`, yielding separate **Negative Binomial** rate (with late-bias scale injection) and dispersion heads with stability floors.
+- **Forecast head**: time projection to horizon `H`, plus **Negative Binomial** rate/dispersion heads with stability floors.
 - **Training**: NB-NLL (**default**) with AMP-safe masking; supports **direct** and **recursive** decoding; logs **sMAPE/NLL** and coverage.
 
 ---
