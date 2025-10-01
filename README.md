@@ -304,24 +304,40 @@ flowchart TD
     subgraph "D. Forecasting Head"
         direction TB
         Projection["<b>Temporal Projection</b><br>Maps to Prediction Horizon"]
-        BiasInjection["(+) <b>Bias Injection</b>"]
-        ProbHead["<b>Probabilistic Head</b><br>Outputs NegBinomial params (μ, α)"]
-        
+        ContextNote["<i>Shared temporal context from LRTC<br>via DataEmbedding feeds both heads</i>"]
+
+        subgraph "Rate Path (μ)"
+            direction TB
+            RateBias["(+) <b>Bias Injection</b>"]
+            RateHead["<b>Rate Head</b><br>Negative Binomial μ"]
+        end
+
+        subgraph "Dispersion Path (α)"
+            direction TB
+            DispersionHead["<b>Dispersion Head</b><br>Negative Binomial α"]
+        end
+
         Loop --> Projection
-        Projection --> BiasInjection
-        LateBias -- Injects 'Scale' Signal --> BiasInjection
-        BiasInjection --> ProbHead
+        Projection --> ContextNote
+        ContextNote -.-> RateBias
+        ContextNote -.-> DispersionHead
+        Projection --> RateBias
+        Projection --> DispersionHead
+        LateBias -- Injects 'Scale' Signal --> RateBias
+        RateBias --> RateHead
     end
 
     %% --- 6. Output ---
     Forecast["<b>Final Forecast Distribution</b><br>[Batch, Horizon, Channels]"]
-    ProbHead --> Forecast
+    RateHead --> Forecast
+    DispersionHead --> Forecast
 
     %% --- Styling for emphasis ---
     style LRTC fill:#e8f5e9,stroke:#388e3c
     style LateBias fill:#e8f5e9,stroke:#388e3c
     style FFT fill:#fffde7,stroke:#fbc02d
-    style BiasInjection fill:#fce4ec,stroke:#c2185b
+    style RateBias fill:#fce4ec,stroke:#c2185b
+    style ContextNote fill:#e3f2fd,stroke:#1976d2,stroke-dasharray: 5 5
 ```
 
 - **DataEmbedding**: value + positional + optional time features; integrates **ID & static** embeddings and **LRTC**.  
