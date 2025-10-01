@@ -35,6 +35,75 @@ from .predict import forecast_recursive_batch
 LOG_2PI = math.log(2.0 * math.pi)
 
 
+class WarmupThenCosineScheduler:
+    """Lightweight SequentialLR replacement for Linear warmup then cosine decay.
+
+    This wrapper keeps both sub-schedulers sharing the same optimizer and switches
+    from the warmup ``LinearLR`` to the main ``CosineAnnealingLR`` while
+    re-synchronising learning rate metadata at the transition boundary.
+    """
+
+    def __init__(
+        self,
+        warmup_scheduler: torch.optim.lr_scheduler.LinearLR,
+        main_scheduler: CosineAnnealingLR,
+        warmup_steps: int,
+    ) -> None:
+        if warmup_scheduler.optimizer is not main_scheduler.optimizer:
+            raise ValueError("Schedulers must share the same optimizer instance")
+
+        self.optimizer = warmup_scheduler.optimizer
+        self.warmup_scheduler = warmup_scheduler
+        self.main_scheduler = main_scheduler
+        self.warmup_steps = max(0, int(warmup_steps))
+        self._step_count = 0
+        self._synced = self.warmup_steps == 0
+        self._last_lr = [group["lr"] for group in self.optimizer.param_groups]
+
+    def _sync_main_scheduler(self) -> None:
+        current_lrs = [group["lr"] for group in self.optimizer.param_groups]
+        self.main_scheduler.base_lrs = list(current_lrs)
+        self.main_scheduler.last_epoch = 0
+        if hasattr(self.main_scheduler, "_last_lr"):
+            self.main_scheduler._last_lr = list(current_lrs)
+        self._synced = True
+
+    def step(self) -> None:
+        self._step_count += 1
+        if self.warmup_steps > 0 and self._step_count <= self.warmup_steps:
+            self.warmup_scheduler.step()
+            self._last_lr = list(self.warmup_scheduler.get_last_lr())
+            if self._step_count == self.warmup_steps:
+                self._sync_main_scheduler()
+            return
+
+        if not self._synced:
+            self._sync_main_scheduler()
+
+        self.main_scheduler.step()
+        self._last_lr = list(self.main_scheduler.get_last_lr())
+
+    def get_last_lr(self) -> List[float]:
+        return list(self._last_lr)
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "step_count": self._step_count,
+            "last_lr": list(self._last_lr),
+            "synced": self._synced,
+            "warmup_state": self.warmup_scheduler.state_dict(),
+            "main_state": self.main_scheduler.state_dict(),
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        self._step_count = int(state_dict.get("step_count", 0))
+        self._last_lr = list(state_dict.get("last_lr", self._last_lr))
+        self._synced = bool(state_dict.get("synced", self._step_count >= self.warmup_steps))
+        self.warmup_scheduler.load_state_dict(state_dict["warmup_state"])
+        self.main_scheduler.load_state_dict(state_dict["main_state"])
+
+
+
 def gaussian_nll_loss(
     mu: torch.Tensor,
     sigma: torch.Tensor,
@@ -1133,10 +1202,10 @@ def train_once(cfg: PipelineConfig | Dict[str, Any]) -> Tuple[float, Dict]:
                 end_factor=1.0,
                 total_iters=warmup_epochs,
             )
-            scheduler = torch.optim.lr_scheduler.SequentialLR(
-                optim,
-                schedulers=[warmup_scheduler, cosine_sched],
-                milestones=[warmup_epochs],
+            scheduler = WarmupThenCosineScheduler(
+                warmup_scheduler=warmup_scheduler,
+                main_scheduler=cosine_sched,
+                warmup_steps=warmup_epochs,
             )
     elif warmup_epochs > 0:
         warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
@@ -1160,10 +1229,15 @@ def train_once(cfg: PipelineConfig | Dict[str, Any]) -> Tuple[float, Dict]:
             param_group["lr"] = warmup_lr
         if scheduler is not None and hasattr(scheduler, "_last_lr"):
             scheduler._last_lr = [warmup_lr for _ in scheduler._last_lr]
-        if isinstance(scheduler, torch.optim.lr_scheduler.SequentialLR):
-            for sub_scheduler in scheduler._schedulers:
-                if hasattr(sub_scheduler, "_last_lr"):
-                    sub_scheduler._last_lr = [warmup_lr for _ in sub_scheduler._last_lr]
+        if isinstance(scheduler, WarmupThenCosineScheduler):
+            if hasattr(scheduler.warmup_scheduler, "_last_lr"):
+                scheduler.warmup_scheduler._last_lr = [
+                    warmup_lr for _ in scheduler.warmup_scheduler._last_lr
+                ]
+            if hasattr(scheduler.main_scheduler, "_last_lr"):
+                scheduler.main_scheduler._last_lr = [
+                    warmup_lr for _ in scheduler.main_scheduler._last_lr
+                ]
 
     try:
         grad_scaler = torch.amp.GradScaler(
