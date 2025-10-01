@@ -58,9 +58,9 @@ train:
   use_loss_masking: true
   val:
     strategy: "rolling"       # "holdout"|"rolling"
-    holdout_days: 35          # must be >= model.input_len + model.pred_len
-    rolling_folds: 3
-    rolling_step_days: 14
+    holdout_days: 56          # must be >= model.input_len + model.pred_len
+    rolling_folds: 8
+    rolling_step_days: 7
 
 model:
   mode: "direct"              # "direct"|"recursive"
