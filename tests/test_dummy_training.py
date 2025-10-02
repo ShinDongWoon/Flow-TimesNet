@@ -57,10 +57,10 @@ def test_dummy_training_smape_wsmape():
 
     modules_to_check = {
         "embedding": model.embedding,
-        "output_proj": model.output_proj,
-        "sigma_proj": model.sigma_proj,
         "static_proj": model.static_proj,
         "pre_embedding_norm": model.pre_embedding_norm,
+        "mu_head": model.mu_head,
+        "sigma_head": model.sigma_head,
     }
     if model.series_embedding is not None:
         modules_to_check["series_embedding"] = model.series_embedding
@@ -76,6 +76,15 @@ def test_dummy_training_smape_wsmape():
             assert all(id(param) in group for param in params), (
                 f"{name} parameters must be present in every optimizer param group"
             )
+
+    # The heads remain zero-initialised so that the first forward pass relies on
+    # the history tail and dispersion floor before learning takes place.
+    assert torch.allclose(model.mu_head.weight, torch.zeros_like(model.mu_head.weight))
+    assert torch.allclose(model.mu_head.bias, torch.zeros_like(model.mu_head.bias))
+    assert torch.allclose(
+        model.sigma_head.weight, torch.zeros_like(model.sigma_head.weight)
+    )
+    assert torch.allclose(model.sigma_head.bias, torch.zeros_like(model.sigma_head.bias))
     for _ in range(30):
         idx = torch.randperm(X.size(0))
         for j in range(0, len(idx), 4):
