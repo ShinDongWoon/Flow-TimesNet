@@ -1466,8 +1466,6 @@ class TimesNet(nn.Module):
                 self.forecast_time_proj.bias.zero_()
         self.embedding: DataEmbedding | None = None
         self.embedding_time_features: int | None = None
-        self.output_proj: nn.Conv1d | None = None
-        self.sigma_proj: nn.Conv1d | None = None
         self.mu_head: nn.Linear | None = None
         self.sigma_head: nn.Linear | None = None
         self.output_dim: int | None = None
@@ -1816,25 +1814,6 @@ class TimesNet(nn.Module):
         else:
             self.layer_norm = _module_to_reference(self.layer_norm, x)
 
-        if self.output_proj is None or self.output_proj.in_channels != self.d_model:
-            self.output_proj = _module_to_reference(
-                nn.Conv1d(self.d_model, self.d_model, kernel_size=1), x
-            )
-            with torch.no_grad():
-                self.output_proj.weight.zero_()
-                self.output_proj.bias.zero_()
-        else:
-            self.output_proj = _module_to_reference(self.output_proj, x)
-        if self.sigma_proj is None or self.sigma_proj.in_channels != self.d_model:
-            self.sigma_proj = _module_to_reference(
-                nn.Conv1d(self.d_model, self.d_model, kernel_size=1), x
-            )
-            with torch.no_grad():
-                self.sigma_proj.weight.zero_()
-                self.sigma_proj.bias.zero_()
-        else:
-            self.sigma_proj = _module_to_reference(self.sigma_proj, x)
-
         if self.mu_head is None or (
             self.mu_head.in_features != self.d_model
             or self.mu_head.out_features != c_in
@@ -1845,6 +1824,9 @@ class TimesNet(nn.Module):
             with torch.no_grad():
                 self.mu_head.weight.zero_()
                 self.mu_head.bias.zero_()
+            # Keep the forecasting head zero-initialised so that the initial
+            # forward pass uses ``history_tail`` and the softplus activation to
+            # reproduce the original baseline behaviour.
         else:
             self.mu_head = _module_to_reference(self.mu_head, x)
 
@@ -1858,6 +1840,9 @@ class TimesNet(nn.Module):
             with torch.no_grad():
                 self.sigma_head.weight.zero_()
                 self.sigma_head.bias.zero_()
+            # Matching zero initialisation keeps the dispersion head in the
+            # same state as before the projection removal, relying on the
+            # dispersion floor added after the softplus.
         else:
             self.sigma_head = _module_to_reference(self.sigma_head, x)
 
@@ -2088,10 +2073,9 @@ class TimesNet(nn.Module):
             baseline_bn = baseline_bn_full[:, :, -target_steps:].contiguous()
         else:
             baseline_bn = baseline_bn_full.contiguous()
-        assert self.output_proj is not None  # for type checkers
         assert self.mu_head is not None  # for type checkers
-        mu_delta_bn = self.output_proj(baseline_bn)
-        mu_hidden = (baseline_bn + mu_delta_bn).permute(0, 2, 1).contiguous()
+        baseline_hidden = baseline_bn.permute(0, 2, 1).contiguous()
+        mu_hidden = baseline_hidden
         rate_preact = self.mu_head(mu_hidden) + history_tail
         rate_preact = _apply_late_bias(rate_preact)
         rate = (
@@ -2099,11 +2083,8 @@ class TimesNet(nn.Module):
             .to(rate_preact.dtype)
             + 1e-6
         )
-        assert self.sigma_proj is not None  # for type checkers
-        sigma_bn = self.sigma_proj(baseline_bn)
-        sigma_hidden = sigma_bn.permute(0, 2, 1).contiguous()
         assert self.sigma_head is not None  # for type checkers
-        sigma_head = self.sigma_head(sigma_hidden)
+        sigma_head = self.sigma_head(baseline_hidden)
         sigma_sp = (
             F.softplus(sigma_head.to(torch.float32), beta=1.0, threshold=20)
             .to(sigma_head.dtype)
