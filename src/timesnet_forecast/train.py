@@ -927,7 +927,7 @@ def train_once(cfg: PipelineConfig | Dict[str, Any]) -> Tuple[float, Dict]:
                 )
             if va_df.index.empty:
                 raise ValueError("Rolling validation slice is empty")
-            if va_df.index[0] < train_df.index[-1]:
+            if va_df.index[0] =< train_df.index[-1]:
                 raise ValueError(
                     "Rolling validation slice starts before earliest train cutoff"
                 )
