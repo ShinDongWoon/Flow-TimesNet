@@ -830,7 +830,6 @@ def train_once(cfg: PipelineConfig | Dict[str, Any]) -> Tuple[float, Dict]:
     )
     mask_wide = (~wide_raw.isna()).astype(np.float32)
     wide = wide_raw.fillna(0.0)
-    series_static_np, static_feature_names = compute_series_features(wide, mask_wide)
     if cfg.get("preprocess", {}).get("clip_negative", False):
         wide = wide.clip(lower=0.0)
     ids = list(wide.columns)
@@ -846,6 +845,9 @@ def train_once(cfg: PipelineConfig | Dict[str, Any]) -> Tuple[float, Dict]:
     if cfg["train"]["val"]["strategy"] == "holdout":
         trn_df, val_df = make_holdout_slices(wide, cfg["train"]["val"]["holdout_days"])
         trn_mask_df, val_mask_df = make_holdout_slices(mask_wide, cfg["train"]["val"]["holdout_days"])
+        series_static_np, static_feature_names = compute_series_features(
+            trn_df, trn_mask_df
+        )
         if norm_method == "none":
             scaler = None
             trn_norm = trn_df.copy()
@@ -867,49 +869,77 @@ def train_once(cfg: PipelineConfig | Dict[str, Any]) -> Tuple[float, Dict]:
             val_time_indices = None
     else:
         val_cfg = cfg["train"]["val"]
-        fold_iter = make_rolling_slices(
-            wide, val_cfg["rolling_folds"], val_cfg["rolling_step_days"], val_cfg["holdout_days"]
+        value_folds = list(
+            make_rolling_slices(
+                wide,
+                val_cfg["rolling_folds"],
+                val_cfg["rolling_step_days"],
+                val_cfg["holdout_days"],
+            )
         )
-        try:
-            first_tr, _ = next(fold_iter)
-        except StopIteration:
+        mask_folds = list(
+            make_rolling_slices(
+                mask_wide,
+                val_cfg["rolling_folds"],
+                val_cfg["rolling_step_days"],
+                val_cfg["holdout_days"],
+            )
+        )
+        if not value_folds or not mask_folds:
             raise ValueError("No folds produced; check rolling validation configuration")
+        if len(value_folds) != len(mask_folds):
+            raise ValueError("Value and mask rolling folds must have the same length")
+
+        min_train_len = min(len(tr_df) for tr_df, _ in value_folds)
+        # Use the earliest train cutoff across folds so no validation window from
+        # any fold can be included in the training data.
+        train_df = wide.iloc[:min_train_len].copy()
+        train_mask_df = mask_wide.iloc[:min_train_len].copy()
+        series_static_np, static_feature_names = compute_series_features(
+            train_df, train_mask_df
+        )
 
         if norm_method == "none":
             scaler = None
-            wide_norm = wide.copy()
+            train_norm = train_df.copy()
         else:
-            scaler, _ = io_utils.fit_series_scaler(
-                first_tr, norm_method, norm_per_series, eps
+            scaler, train_norm = io_utils.fit_series_scaler(
+                train_df, norm_method, norm_per_series, eps
             )
-
-            wide_norm = _transform_dataframe(wide, ids, scaler, norm_method)
-        train_arrays: List[np.ndarray] = []
+        train_arrays: List[np.ndarray] = [
+            train_norm.to_numpy(dtype=np.float32, copy=False)
+        ]
         val_arrays: List[np.ndarray] = []
-        train_mask_arrays: List[np.ndarray] = []
+        train_mask_arrays: List[np.ndarray] = [
+            train_mask_df.to_numpy(dtype=np.float32, copy=False)
+        ]
         val_mask_arrays: List[np.ndarray] = []
         if time_features_enabled:
-            train_time_indices = []
+            train_time_indices = [pd.DatetimeIndex(train_norm.index)]
             val_time_indices = []
         else:
             train_time_indices = None
             val_time_indices = None
-        for (tr_df, va_df), (tr_mask_df, va_mask_df) in zip(
-            make_rolling_slices(
-                wide_norm, val_cfg["rolling_folds"], val_cfg["rolling_step_days"], val_cfg["holdout_days"]
-            ),
-            make_rolling_slices(
-                mask_wide, val_cfg["rolling_folds"], val_cfg["rolling_step_days"], val_cfg["holdout_days"]
-            ),
-        ):
-            train_arrays.append(tr_df.to_numpy(dtype=np.float32, copy=False))
-            val_arrays.append(va_df.to_numpy(dtype=np.float32, copy=False))
-            train_mask_arrays.append(tr_mask_df.to_numpy(dtype=np.float32, copy=False))
+        for (tr_df, va_df), (_, va_mask_df) in zip(value_folds, mask_folds):
+            if len(tr_df) < min_train_len:
+                raise ValueError(
+                    "Rolling fold training prefix is shorter than earliest cutoff"
+                )
+            if va_df.index.empty:
+                raise ValueError("Rolling validation slice is empty")
+            if va_df.index[0] < train_df.index[-1]:
+                raise ValueError(
+                    "Rolling validation slice starts before earliest train cutoff"
+                )
+            if norm_method == "none":
+                va_norm = va_df.copy()
+            else:
+                va_norm = _transform_dataframe(va_df, ids, scaler, norm_method)
+            val_arrays.append(va_norm.to_numpy(dtype=np.float32, copy=False))
             val_mask_arrays.append(va_mask_df.to_numpy(dtype=np.float32, copy=False))
             if time_features_enabled:
                 assert train_time_indices is not None and val_time_indices is not None
-                train_time_indices.append(pd.DatetimeIndex(tr_df.index))
-                val_time_indices.append(pd.DatetimeIndex(va_df.index))
+                val_time_indices.append(pd.DatetimeIndex(va_norm.index))
 
     # --- model hyper-parameters derived from config
     cfg.setdefault("model", {})
